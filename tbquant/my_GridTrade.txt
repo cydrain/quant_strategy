@@ -1,0 +1,111 @@
+Params
+	Numeric gridStartPrice(-1);	// 网络起始价格
+	Integer gridLen(5);		// 网格间隔大小
+	Integer gridNum(5);		// 网格数量
+	Bool gridDir(True);		// 交易方向，True-多网格，False-空网格
+	
+Vars
+	Global Bool GRID_LONG(True);
+	Global Bool GRID_SHORT(False);
+	Global Bool initDone(False);
+
+Defs
+	Bool LogFile(StringRef str) {
+		//FileAppend(FormulaName() + ".txt", "[" + Text(SystemDateTime()) + "] " + str);
+		Print("[" + DateTimeToString(SystemDateTime) + " " + TimeToString(SystemDateTime()) + "] " + str);
+		return True;
+	}
+
+	// 计算一个网格的价差
+	Numeric GetGridDeltaPrice(Integer steps) {
+		return steps * MinMove() * PriceScale();
+	}
+	
+	String GetOrderStr(Integer buyOrSell, Integer entryOrExit, Numeric price) {
+		String side("");
+		String combOffset("");
+		
+		IF(buyOrSell == Enum_Buy) {
+			side = "多";
+		} Else {
+			side = "空";
+		}
+		IF(entryOrExit == Enum_Entry) {
+			combOffset = "开";
+		} Else If(entryOrExit == Enum_Exit) {
+			combOffset = "平";
+		} Else {
+			combOffset = "平今";
+		}
+		
+		return symbol + " " + side + combOffset + " " + Text(price);
+	}
+	
+	Bool SendOrder(Bool gridDir, Integer entryOrExit, Numeric lot, Numeric price) {
+		Integer buyOrSell;
+		Array<Integer> orderIds;
+		If(entryOrExit == Enum_Entry) {
+			// 挂开仓单
+			buyOrSell = IIF(gridDir==GRID_LONG, Enum_Buy, Enum_Sell);
+			LogFile(symbol + ", buyOrSell = " + Text(buyOrSell) + ", entryOrExit = " + Text(entryOrExit) + ", price = " + Text(price));
+			If(A_SendOrderEx(buyOrSell, entryOrExit, lot, price, orderIds)) {
+				LogFile("网格布单成功：" + GetOrderStr(buyOrSell, Enum_Entry, price));
+				return True;
+			} Else {
+				LogFile("网格布单失败：" + GetOrderStr(buyOrSell, Enum_Entry, price));
+				return False;
+			}
+		} Else {
+			// 挂平仓单
+			buyOrSell = IIF(gridDir==GRID_LONG, Enum_Sell, Enum_Buy);
+			If(A_SendOrderEx(buyOrSell, entryOrExit, lot, price, orderIds)) {
+				LogFile("布止盈单成功：" + GetOrderStr(buyOrSell, Enum_Exit, price));
+				return True;
+			} Else {
+				LogFile("布止盈单失败：" + GetOrderStr(buyOrSell, Enum_Exit, price));
+				return False;
+			}
+		}
+	}
+
+Events
+	//Bar更新事件函数，参数indexs表示变化的数据源图层ID数组
+	OnBar(ArrayRef<Integer> indexs) {
+		if (!AccountDataExist()) {
+			LogFile("account data not exist!");
+		}
+		If(!initDone and BarStatus==2 and AccountDataExist() and IsTradingTime(SystemDateTime)) {
+			LogFile("---------------------------");
+			LogFile(TimeToString(SystemDateTime));
+			LogFile("网格交易启动， BarStatus=" + Text(BarStatus));
+			
+			// 风格布单
+			Integer i;
+			Array<Integer> orderIds;
+			for i = 1 to gridNum {
+				Numeric currGridPrice;
+				currGridPrice = gridStartPrice - i * IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
+				If(SendOrder(gridDir, Enum_Entry, 1, currGridPrice)) {
+					initDone = True;
+				}
+			}
+		}
+	}
+
+	//成交更新事件函数，参数ordFill表示更新的成交结构体
+	OnFill(FillRef ordFill) {
+		LogFile(" => 委托成交！" + GetOrderStr(ordFill.side, ordFill.combOffset, ordFill.fillPrice));
+		
+		// 如果开仓挂单成交，则挂止盈单
+		If (ordFill.combOffset == Enum_Entry) {
+			Numeric tpPrice;
+			tpPrice = ordFill.price + IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
+			SendOrder(gridDir, Enum_Exit, 1, tpPrice);
+		} Else {
+			Numeric rePrice;
+			rePrice = ordFill.price - IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
+			SendOrder(gridDir, Enum_Entry, 1, rePrice);
+		}
+	}
+
+
