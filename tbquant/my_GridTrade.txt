@@ -1,111 +1,139 @@
 Params
-	Numeric gridStartPrice(-1);	// 网络起始价格
-	Integer gridLen(5);		// 网格间隔大小
-	Integer gridNum(5);		// 网格数量
-	Bool gridDir(True);		// 交易方向，True-多网格，False-空网格
-	
+    Numeric gridStartPrice(8620);   // 网格起始价格
+    Integer gridLen(5);             // 网格间隔（最小变动单位数）
+    Integer gridNum(5);             // 网格数量
+    Bool gridDir(True);             // 交易方向，True-多网格，False-空网格
+
 Vars
-	Global Bool GRID_LONG(True);
-	Global Bool GRID_SHORT(False);
-	Global Bool initDone(False);
+    Global Bool GRID_LONG;
+    Global Bool GRID_SHORT;
+    Global Bool initDone;
+    Global Integer currGridCount;   // 当前已挂网格单数量
 
 Defs
-	Bool LogFile(StringRef str) {
-		//FileAppend(FormulaName() + ".txt", "[" + Text(SystemDateTime()) + "] " + str);
-		Print("[" + DateTimeToString(SystemDateTime) + " " + TimeToString(SystemDateTime()) + "] " + str);
-		return True;
-	}
+    Bool LogFile(StringRef str) {
+        String logContent = "[" + Text(SystemDateTime()) + "] " + str + "\n";
+        Print(logContent);
+        FileAppend(FormulaName() + "_GridLog.txt", logContent);
+        return True;
+    }
 
-	// 计算一个网格的价差
-	Numeric GetGridDeltaPrice(Integer steps) {
-		return steps * MinMove() * PriceScale();
-	}
-	
-	String GetOrderStr(Integer buyOrSell, Integer entryOrExit, Numeric price) {
-		String side("");
-		String combOffset("");
-		
-		IF(buyOrSell == Enum_Buy) {
-			side = "多";
-		} Else {
-			side = "空";
-		}
-		IF(entryOrExit == Enum_Entry) {
-			combOffset = "开";
-		} Else If(entryOrExit == Enum_Exit) {
-			combOffset = "平";
-		} Else {
-			combOffset = "平今";
-		}
-		
-		return symbol + " " + side + combOffset + " " + Text(price);
-	}
-	
-	Bool SendOrder(Bool gridDir, Integer entryOrExit, Numeric lot, Numeric price) {
-		Integer buyOrSell;
-		Array<Integer> orderIds;
-		If(entryOrExit == Enum_Entry) {
-			// 挂开仓单
-			buyOrSell = IIF(gridDir==GRID_LONG, Enum_Buy, Enum_Sell);
-			LogFile(symbol + ", buyOrSell = " + Text(buyOrSell) + ", entryOrExit = " + Text(entryOrExit) + ", price = " + Text(price));
-			If(A_SendOrderEx(buyOrSell, entryOrExit, lot, price, orderIds)) {
-				LogFile("网格布单成功：" + GetOrderStr(buyOrSell, Enum_Entry, price));
-				return True;
-			} Else {
-				LogFile("网格布单失败：" + GetOrderStr(buyOrSell, Enum_Entry, price));
-				return False;
-			}
-		} Else {
-			// 挂平仓单
-			buyOrSell = IIF(gridDir==GRID_LONG, Enum_Sell, Enum_Buy);
-			If(A_SendOrderEx(buyOrSell, entryOrExit, lot, price, orderIds)) {
-				LogFile("布止盈单成功：" + GetOrderStr(buyOrSell, Enum_Exit, price));
-				return True;
-			} Else {
-				LogFile("布止盈单失败：" + GetOrderStr(buyOrSell, Enum_Exit, price));
-				return False;
-			}
-		}
-	}
+    Bool CheckValid() {
+        If(!AccountDataExist()) {
+            LogFile("账户数据不存在！");
+            Return False;
+        }
+        // BarStatus=2表示已收盘K线
+        If(BarStatus != 2) {
+        	//LogFile("无效 BarStatus=" + Text(BarStatus));
+        	Return False;
+        }
+        // IsTradingTime判断是否在交易时间
+        If(!IsTradingTime(SystemDateTime)) {
+        	LogFile("非交易时间");
+        	Return False;
+        }
+        return True;
+    }
+       
+    // 获取最小变动价位（如豆粕1元/吨）
+    Numeric GetMinTick() {
+        return MinMove() * PriceScale();
+    }
+    
+    // 计算网格价格
+    Numeric GetGridPrice(Integer step) {
+        Numeric minTick = GetMinTick();
+        If(gridDir == GRID_LONG) {
+            // 多网格：起始价向下step个网格
+            Return gridStartPrice - step * gridLen * minTick;
+        } Else {
+            // 空网格：起始价向上step个网格
+            Return gridStartPrice + step * gridLen * minTick;
+        }
+    }
+    
+    String GetOrderStr(Integer side, Integer offset, Numeric price) {
+        String sideStr = IIFString(side == Enum_Buy, "多", "空");
+        String offsetStr = IIFString(offset == Enum_Entry, "开", IIFString(offset == Enum_Exit, "平", "平今"));
+        Return symbol + " " + sideStr + offsetStr + " " + Text(price);
+    }
+    String GetOrderFillStr(FillRef ordFill) {
+    	String sideStr = IIFString(ordFill.side == Enum_Buy, "多", "空");
+        String offsetStr = IIFString(ordFill.combOffset == Enum_Entry, "开", IIFString(ordFill.combOffset == Enum_Exit, "平", "平今"));
+        Return symbol + " " + sideStr + offsetStr + " 委托价" + Text(ordFill.price) + " 成交价" + Text(ordFill.fillPrice);
+    }
+    
+    // 下单函数（封装A_SendOrderEx）
+    Bool SendGridOrder(Integer side, Integer offset, Numeric lot, Numeric price) {
+        If(lot <= 0 Or price <= 0) {
+            LogFile("下单失败：数量/价格非法，lot=" + Text(lot) + " price=" + Text(price));
+            Return False;
+        }
+
+        Array<Integer> orderIds;
+        // 订单标签，用于OnFill过滤
+        If(A_SendOrderEx(side, offset, lot, price, orderIds)) {
+        	currGridCount = currGridCount + 1;
+            LogFile("下单成功：" + GetOrderStr(side, offset, price) + " 委托ID=" + Text(orderIds[0]));
+            Return True;
+        }
+        Return False;
+    }
 
 Events
-	//Bar更新事件函数，参数indexs表示变化的数据源图层ID数组
-	OnBar(ArrayRef<Integer> indexs) {
-		if (!AccountDataExist()) {
-			LogFile("account data not exist!");
-		}
-		If(!initDone and BarStatus==2 and AccountDataExist() and IsTradingTime(SystemDateTime)) {
-			LogFile("---------------------------");
-			LogFile(TimeToString(SystemDateTime));
-			LogFile("网格交易启动， BarStatus=" + Text(BarStatus));
-			
-			// 风格布单
-			Integer i;
-			Array<Integer> orderIds;
-			for i = 1 to gridNum {
-				Numeric currGridPrice;
-				currGridPrice = gridStartPrice - i * IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
-				If(SendOrder(gridDir, Enum_Entry, 1, currGridPrice)) {
-					initDone = True;
-				}
-			}
-		}
-	}
+    // 策略启动初始化
+    OnInit() {
+        GRID_LONG = True;
+        GRID_SHORT = False;
+        initDone = False;
+        currGridCount = 0;
+        LogFile("策略启动，参数：品种=" + symbol + " 起始价=" + Text(gridStartPrice) + " 网格间隔=" + Text(gridLen) + " 网格数=" + Text(gridNum) + " 方向=" + IIFString(gridDir, "多", "空"));
+    }
 
-	//成交更新事件函数，参数ordFill表示更新的成交结构体
-	OnFill(FillRef ordFill) {
-		LogFile(" => 委托成交！" + GetOrderStr(ordFill.side, ordFill.combOffset, ordFill.fillPrice));
-		
-		// 如果开仓挂单成交，则挂止盈单
-		If (ordFill.combOffset == Enum_Entry) {
-			Numeric tpPrice;
-			tpPrice = ordFill.price + IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
-			SendOrder(gridDir, Enum_Exit, 1, tpPrice);
-		} Else {
-			Numeric rePrice;
-			rePrice = ordFill.price - IIF(gridDir==GRID_LONG, 1, -1) * GetGridDeltaPrice(gridLen);
-			SendOrder(gridDir, Enum_Entry, 1, rePrice);
-		}
-	}
+    // Bar更新事件（初始化网格单）
+    OnBar(ArrayRef<Integer> indexs) {
+        If(!CheckValid()) {
+            Return;
+        }
+        
+        If(!initDone) {
+            LogFile("开始初始化网格单...");
+            Integer i;
+            for i = 1 to gridNum {
+                Numeric gridPrice = GetGridPrice(i);
+                // 多网格开多，空网格开空
+                Integer side = IIF(gridDir == GRID_LONG, Enum_Buy, Enum_Sell);
+                If(SendGridOrder(side, Enum_Entry, 1, gridPrice)) {
+                    initDone = True;
+                }
+            }
+            // 所有网格单下单完成（无论成功失败），标记初始化完成
+            If(initDone) {
+				LogFile("网格初始化完成，已挂单数量=" + Text(currGridCount));
+            }
+        }
+    }
 
-
+    // 成交事件（核心逻辑：开仓成交挂止盈，止盈成交补网格）
+    OnFill(FillRef ordFill) {
+        LogFile("成交触发：" + GetOrderFillStr(ordFill));
+        
+        Numeric minTick = GetMinTick();
+        // 开仓成交：挂止盈单
+        If(ordFill.combOffset == Enum_Entry) {
+            Integer tpSide = IIF(gridDir == GRID_LONG, Enum_Sell, Enum_Buy);
+            Numeric tpPrice = IIF(gridDir == GRID_LONG, 
+                                  ordFill.price + gridLen * minTick,  // 多单止盈：成交价+网格间隔
+                                  ordFill.price - gridLen * minTick); // 空单止盈：成交价-网格间隔
+            SendGridOrder(tpSide, Enum_Exit, 1, tpPrice);
+        } 
+        // 止盈成交：补网格单
+        Else If(ordFill.combOffset == Enum_Exit) {
+            Integer reSide = IIF(gridDir == GRID_LONG, Enum_Buy, Enum_Sell);
+            Numeric rePrice = IIF(gridDir == GRID_LONG, 
+                                  ordFill.price - gridLen * minTick,  // 多单补网格：成交价-网格间隔
+                                  ordFill.price + gridLen * minTick); // 空单补网格：成交价+网格间隔
+            SendGridOrder(reSide, Enum_Entry, 1, rePrice);
+        }
+    }
