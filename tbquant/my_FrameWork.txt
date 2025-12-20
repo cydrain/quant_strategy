@@ -1,0 +1,369 @@
+Params
+	// 周期参数
+    Integer iBarPeriod(5);           // K线周期（分钟）
+    // 仓位参数
+    Integer iMinLots(1);             // 最小交易手数
+    Integer iMaxLots(10);            // 最大交易手数
+    Numeric nMaxPositionRatio(0.2);  // 最大仓位占比（总资金）
+    Numeric nRiskCapitalRatio(0.02); // 单笔风险资金占比（2%）
+    // 风控参数
+    Numeric nStopLossRatio(0.02);    // 止损比例（2%）
+    Numeric nTakeProfitRatio(0.05);  // 止盈比例（5%）
+    Numeric nMaxDrawdownRatio(0.1);  // 最大回撤比例（10%）
+    // 梯度加仓参数
+    Numeric nAddProfitRatio(0.05);   // 盈利加仓比例（5%）
+    Integer iAddLots(1);             // 每次加仓手数
+    Integer iMaxTotalLots(5);        // 单方向最大持仓手数
+    
+Vars
+    // 账户/仓位相关
+    global Numeric nTotalCapital(0);       // 初始总资金
+    global Numeric nCurrentCapital(0);     // 当前总权益
+    global Numeric nCurrentPosition(0);    // 当前持仓（多=正，空=负）
+    global Numeric nMaxDrawdown(0);        // 累计最大回撤
+    // 信号相关
+    global Bool bLongSignal(False);        // 开多信号
+    global Bool bShortSignal(False);       // 开空信号
+    global Bool bCloseLongSignal(False);   // 平多信号
+    global Bool bCloseShortSignal(False);  // 平空信号
+    global Numeric nLastSignalBar(0);      // 上一次信号K线编号
+    // 风控相关
+    global Numeric nStopLossPrice(0);      // 止损价格
+    global Numeric nTakeProfitPrice(0);    // 止盈价格
+    // 初始化标记
+    global Bool bIsInit(False);            // 初始化完成标记
+    
+    // 交易相关
+    Series<Numeric> ma5; 
+	Series<Numeric> ma20;
+	
+Defs
+    Bool WriteLog(StringRef s) {
+        String str = "[" + DateTimeToString(SystemDateTime()) + "] " + s + "\n";
+        Print(str);
+        FileAppend(FormulaName() + Text(DayFromDateTime(SystemDateTime())) + ".txt", str);
+        return True;
+    }
+    
+    //--------------------------------------------------------------------------------------
+    // 1. 自定义函数：初始化（仅首次执行）
+    //--------------------------------------------------------------------------------------
+    Bool Init()
+    {
+    	WriteLog("【策略初始化开始】");
+    	String accId = A_AccountID(0);
+        WriteLog("【帐户ID】" + accId);
+        WriteLog("========");
+        
+        Account acc;
+        If(A_GetAccount(acc)) {
+        	WriteLog(Text(acc));
+            WriteLog("【帐户当前动态权益】" + Text(acc.dynamicAmount));
+            WriteLog("【帐户当前持仓盈亏】" + Text(acc.positionProfitO));
+            WriteLog("【帐户当前可用资金】" + Text(acc.available));
+        } Else {
+        	WriteLog("获取帐户资金信息失败");
+        }
+        WriteLog("========");
+        
+        Position pos;
+        If(A_GetPosition(pos)) {
+        	If(pos.longCurrentVolume > 0) {
+                WriteLog("【多头当前持仓】" + Text(pos.longCurrentVolume));
+                WriteLog("【多头均价】" + Text(pos.longAvgPriceO));
+                WriteLog("【多头浮动盈亏】" + Text(pos.longFloatProfitO));
+            }
+            If(pos.shortCurrentVolume > 0) {
+                WriteLog("【空头当前持仓】" + Text(pos.shortCurrentVolume));
+                WriteLog("【空头均价】    " + Text(pos.shortAvgPriceO));
+                WriteLog("【空头浮动盈亏】" + Text(pos.shortFloatProfitO));
+            }
+        } Else {
+        	WriteLog("获取帐户持仓信息失败");
+        }
+        WriteLog("========");
+        
+        nTotalCapital = acc.dynamicAmount - acc.positionProfitO;
+        WriteLog("【帐户初始总资金】" + Text(nTotalCapital));
+        nCurrentCapital = A_CurrentEquity();
+        WriteLog("【帐户当前总权益】" + Text(nCurrentCapital));
+        nCurrentPosition = A_TotalPosition();
+        WriteLog("【帐户当前总持仓】" + Text(nCurrentPosition));
+        
+        // 参数合法性校验
+        If (iMinLots > 0 && iMaxLots > 0 && iMinLots < iMaxLots) {
+            WriteLog("【最小手数】" + Text(iMinLots));
+            WriteLog("【最大手数】" + Text(iMaxLots));
+        } Else {
+            WriteLog("【初始化错误】最小手数需>0，且最大手数≥最小手数");
+            Return False;
+        }
+    
+        // 标记初始化完成
+        bIsInit = True;
+        WriteLog("【策略初始化完成】K线周期：" + Text(iBarPeriod) + "分钟");
+        WriteLog("====================");
+        
+        return True;
+    }
+    
+    //--------------------------------------------------------------------------------------
+    // 2. 自定义函数：动态手数计算
+    //--------------------------------------------------------------------------------------
+    Numeric CalculateDynamicLots(Numeric nTargetPrice)
+    {
+    	WriteLog("【动态手数计算】");
+        Numeric nLots = iMinLots;
+        Numeric nContractUnit = ContractUnit(); // 合约乘数（期货：吨/手）
+        Numeric nMarginRatio = MarginRatio();
+    
+        // 资金百分比手数（核心逻辑）
+        Numeric nRiskCapital = nTotalCapital * nRiskCapitalRatio;
+        nLots = IntPart(nRiskCapital / (nTargetPrice * nContractUnit * nMarginRatio));
+    
+        WriteLog("【当前总权益】" + Text(nTotalCapital));
+        WriteLog("【单笔风险资金占比】" + Text(nRiskCapitalRatio));
+        WriteLog("【当前价格】" + Text(nTargetPrice));
+		WriteLog("【合约乘数】" + Text(nContractUnit) + "吨/手");
+		WriteLog("【默认保证金比率】" + Text(nMarginRatio));
+		WriteLog("【动态单笔交易手数】" + Text(nLots));
+		
+        // 手数边界校验
+        nLots = Max(nLots, iMinLots);
+        nLots = Min(nLots, iMaxLots);
+        WriteLog("【动态交易手数合法区间】" + Text(iMinLots) + ", " + Text(iMaxLots));
+        WriteLog("【最终动态单笔交易手数】" + Text(nLots));
+        WriteLog("====================");
+    
+        Return nLots;
+    }
+
+    //--------------------------------------------------------------------------------------
+    // 3. 自定义函数：风控校验
+    //--------------------------------------------------------------------------------------
+    Bool CheckRiskControl(Bool bIsLong, Numeric nTargetPrice, Numeric nLots)
+    {
+    	WriteLog("【风险控制】");
+        // 1. 最大仓位校验
+        Numeric nPositionValue = nLots * nTargetPrice * ContractUnit();
+        Numeric nPositionRatio = nPositionValue / nCurrentCapital;
+        WriteLog("【持仓金额】" + Text(nPositionValue));
+        WriteLog("【持仓仓位】" + Text(nPositionRatio));
+        If (nPositionRatio > nMaxPositionRatio) {
+            WriteLog("【风控拦截】仓位超限：" + Text(nPositionRatio));
+            Return False;
+        }
+    
+        // 2. 最大回撤校验
+        Numeric nCurrentDrawdown = (nTotalCapital - nCurrentCapital) / nTotalCapital;
+        nMaxDrawdown = Max(nMaxDrawdown, nCurrentDrawdown);
+        WriteLog("【最大回撤】" + Text(nMaxDrawdown));
+        If (nMaxDrawdown > nMaxDrawdownRatio) {
+            WriteLog("【风控拦截】最大回撤超限：" + Text(nMaxDrawdown));
+            Return False;
+        }
+        
+        // 3. 计算止损/止盈价格
+        If (bIsLong) {
+            nStopLossPrice = nTargetPrice * (1 - nStopLossRatio);
+            nTakeProfitPrice = nTargetPrice * (1 + nTakeProfitRatio);
+        } Else {
+            nStopLossPrice = nTargetPrice * (1 + nStopLossRatio);
+            nTakeProfitPrice = nTargetPrice * (1 - nTakeProfitRatio);
+        }
+        WriteLog("【止损价】" + Text(nStopLossPrice));
+        WriteLog("【止盈价】" + Text(nTakeProfitPrice));
+        WriteLog("====================");
+        
+        Return True;
+    }
+
+    //--------------------------------------------------------------------------------------
+    // 4. 自定义函数：交易信号生成
+    //--------------------------------------------------------------------------------------
+    Bool GenerateTradingSignal()
+    {
+    	WriteLog("【交易信号生成】");
+        // 重置信号
+        bLongSignal = False;
+        bShortSignal = False;
+        bCloseLongSignal = False;
+        bCloseShortSignal = False;
+    
+        // 信号过滤：避免同周期重复触发
+        If (CurrentBar() == nLastSignalBar) {
+            Return True;
+        }
+    
+        // --------------------------
+        // 核心策略逻辑
+        // --------------------------
+        ma5 = AverageFC(Close, 5);
+        ma20 = AverageFC(Close, 20);
+        PlotNumeric("MA5", ma5);
+		PlotNumeric("MA20", ma20);	
+    
+        // 开多信号：5日均线金叉20日均线
+        If (ma5[0] > ma20[0] && ma5[1] <= ma20[1]) { bLongSignal = True; }
+        // 平多信号：5日均线死叉20日均线
+        If (ma5[0] < ma20[0] && ma5[1] >= ma20[1]) { bCloseLongSignal = True; }
+        // 开空信号
+        If (ma5[0] < ma20[0] && ma5[1] >= ma20[1]) { bShortSignal = True; }
+        // 平空信号
+        If (ma5[0] > ma20[0] && ma5[1] <= ma20[1]) { bCloseShortSignal = True; }
+    
+        // 记录信号触发K线
+        If (bLongSignal || bShortSignal || bCloseLongSignal || bCloseShortSignal) {
+            nLastSignalBar = CurrentBar();
+        }
+        WriteLog("====================");
+        
+        return True;
+    }
+
+    //--------------------------------------------------------------------------------------
+    // 5. 自定义函数：梯度加仓
+    //--------------------------------------------------------------------------------------
+    Bool GradientAddPosition()
+    {
+    	WriteLog("【梯度加仓】");
+        // 多仓加仓
+        If (nCurrentPosition > 0 && nCurrentPosition < iMaxTotalLots) {
+            Numeric nAvgCost = AvgEntryPrice();
+            Numeric nProfitRatio = (Close - nAvgCost) / nAvgCost;
+            If (nProfitRatio >= nAddProfitRatio) {
+                Numeric nAddLots = Min(iAddLots, iMaxTotalLots - nCurrentPosition);
+                Numeric nTargetPrice = Q_AskPrice();
+                If (CheckRiskControl(True, nTargetPrice, nAddLots)) {
+                    Buy(nAddLots, nTargetPrice);
+                    WriteLog("【梯度加仓】多仓盈利" + Text(nProfitRatio*100) + "%，加仓" + Text(nAddLots) + "手");
+                }
+            }
+        }
+    
+        // 空仓加仓（同理）
+        If (nCurrentPosition < 0 && Abs(nCurrentPosition) < iMaxTotalLots) {
+            Numeric nAvgCost = AvgEntryPrice();
+            Numeric nProfitRatio = (nAvgCost - Close) / nAvgCost;
+            If (nProfitRatio >= nAddProfitRatio) {
+                Numeric nAddLots = Min(iAddLots, iMaxTotalLots - Abs(nCurrentPosition));
+                Numeric nTargetPrice = Q_BidPrice();
+                If (CheckRiskControl(False, nTargetPrice, nAddLots)) {
+                    SellShort(nAddLots, nTargetPrice);
+                    WriteLog("【梯度加仓】空仓盈利" + Text(nProfitRatio*100) + "%，加仓" + Text(nAddLots) + "手");
+                }
+            }
+        }
+        
+        WriteLog("====================");
+        return True;
+    }
+    
+    //--------------------------------------------------------------------------------------
+    // 6. 自定义函数：委托执行
+    //--------------------------------------------------------------------------------------
+    Bool ExecuteOrder()
+    {
+    	WriteLog("【委托执行】");
+        // 更新持仓/资金
+        nCurrentPosition = A_CurrentEquity();
+    
+        // --------------------------
+        // 开多逻辑
+        // --------------------------
+        If (bLongSignal && nCurrentPosition >= 0) {
+            Numeric nTargetPrice = Q_AskPrice();
+            Numeric nLots = CalculateDynamicLots(nTargetPrice);
+            If (CheckRiskControl(True, nTargetPrice, nLots)) {
+                Buy(nLots, nTargetPrice);
+                WriteLog("【开多委托】手数：" + Text(nLots) + " | 委托价：" + Text(nTargetPrice));
+                WriteLog("止损价：" + Text(nStopLossPrice) + " | 止盈价：" + Text(nTakeProfitPrice));
+            }
+        }
+    
+        // --------------------------
+        // 开空逻辑
+        // --------------------------
+        If (bShortSignal && nCurrentPosition <= 0) {
+            Numeric nTargetPrice = Q_BidPrice();
+            Numeric nLots = CalculateDynamicLots(nTargetPrice);
+            If (CheckRiskControl(False, nTargetPrice, nLots)) {
+                SellShort(nLots, nTargetPrice);
+                WriteLog("【开空委托】手数：" + Text(nLots) + " | 委托价：" + Text(nTargetPrice));
+                WriteLog("止损价：" + Text(nStopLossPrice) + " | 止盈价：" + Text(nTakeProfitPrice));
+            }
+        }
+    
+        // --------------------------
+        // 平多逻辑
+        // --------------------------
+        If (bCloseLongSignal && nCurrentPosition > 0) {
+            Numeric nTargetPrice = Q_BidPrice();
+            Sell(nCurrentPosition, nTargetPrice);
+            WriteLog("【平多委托】手数：" + Text(nCurrentPosition) + " | 委托价：" + Text(nTargetPrice));
+        }
+    
+        // --------------------------
+        // 平空逻辑
+        // --------------------------
+        If (bCloseShortSignal && nCurrentPosition < 0) {
+            Numeric nTargetPrice = Q_AskPrice();
+            BuyToCover(Abs(nCurrentPosition), nTargetPrice);
+            WriteLog("【平空委托】手数：" + Text(Abs(nCurrentPosition)) + " | 委托价：" + Text(nTargetPrice));
+        }
+    
+        // --------------------------
+        // 止损/止盈执行
+        // --------------------------
+        // 多仓止损止盈
+        If (nCurrentPosition > 0) {
+            If (Close <= nStopLossPrice) {
+                Sell(nCurrentPosition, Q_BidPrice());
+                WriteLog("【多仓止损】当前价：" + Text(Close) + " | 止损价：" + Text(nStopLossPrice));
+            }
+            If (Close >= nTakeProfitPrice) {
+                Sell(nCurrentPosition, Q_BidPrice());
+                WriteLog("【多仓止盈】当前价：" + Text(Close) + " | 止盈价：" + Text(nTakeProfitPrice));
+            }
+        }
+    
+        // 空仓止损止盈
+        If (nCurrentPosition < 0) {
+            If (Close >= nStopLossPrice) {
+                BuyToCover(Abs(nCurrentPosition), Q_AskPrice());
+                WriteLog("【空仓止损】当前价：" + Text(Close) + " | 止损价：" + Text(nStopLossPrice));
+            }
+            If (Close <= nTakeProfitPrice) {
+                BuyToCover(Abs(nCurrentPosition), Q_AskPrice());
+                WriteLog("【空仓止盈】当前价：" + Text(Close) + " | 止盈价：" + Text(nTakeProfitPrice));
+            }
+        }
+        
+        WriteLog("====================");
+        return True;
+    }
+
+Events
+    //Bar更新事件函数，参数indexs表示变化的数据源图层ID数组
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        // 第一步：初始化（仅第一根K线执行）
+        If (CurrentBar() == 1 && !bIsInit) {
+            Init();
+        }
+
+        // 第三步：生成交易信号
+        GenerateTradingSignal();
+
+        // 第四步：执行委托
+        ExecuteOrder();
+
+        // 第五步：梯度加仓（可选）
+        GradientAddPosition();
+
+        // 第六步：运行日志（每根K线记录关键信息）
+        If (Mod(CurrentBar(), 10) == 0) { // 每10根K线记录一次，减少日志量
+            WriteLog("【运行日志】Bar：" + Text(CurrentBar()) + " | 收盘价：" + Text(Close) + " | 持仓：" + Text(nCurrentPosition));
+        }
+    }
+
