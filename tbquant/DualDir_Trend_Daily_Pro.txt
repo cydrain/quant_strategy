@@ -1,0 +1,1121 @@
+//------------------------------------------------------------------------
+// 简称：DualDir_Trend_Daily_Pro_V11
+// 名称：多空双向趋势跟踪策略（回调突破开仓版）
+// 类别：趋势跟踪
+// 作者：松鼠 Quant AI 助手
+// 版本：11.0
+// 说明：
+//   1. 【方向控制】通过 AllowLong/AllowShort 参数单向控制 (启动时只设一个为 True)
+//   2. 【开仓优化】启动后观察 N 根 K 线，突破观察期高低点开仓 (过滤回调)
+//   3. 【状态持久】使用 GlobalVariable 实现断电/重启恢复
+//   4. 【资金管理】金字塔加仓 + 分层减仓 + 防抖机制
+//   5. 【风控系统】账户级回撤控制 + 完整日志
+//------------------------------------------------------------------------
+
+//========================================================================
+// 参数区
+//========================================================================
+Params
+    // ========== 1. 交易方向控制 ==========
+    // 【重要】启动策略时只允许一个为 True，用于控制交易方向
+    Bool AllowLong(True);               // True=允许做多，False=不允许做多
+    Bool AllowShort(True);              // True=允许做空，False=不允许做空
+    
+    // ========== 2. 核心信号周期 (用于出场和加仓确认) ==========
+    Numeric FastLength(10);             // 快线周期
+    Numeric SlowLength(20);             // 慢线周期
+    
+    // ========== 3. 开仓优化参数 (V11 新增) ==========
+    Numeric LookbackBars(5);            // 观察期 K 线数量 (启动后等待 N 根 K 线再突破)
+    
+    // ========== 4. 交易级风控 ==========
+    Numeric InitialStopATR(2.0);        // 初始止损 ATR 倍数
+    Numeric TrailStopATR(1.5);          // 跟踪止损 ATR 倍数
+    
+    // ========== 5. 账户级风控 ==========
+    Bool EnableAccountGuard(False);     // 是否启用账户级风控
+    Numeric MaxTotalDrawdown(15.0);     // 最大总回撤 (%)
+    Numeric MaxDailyDrawdown(5.0);      // 最大日回撤 (%)
+    Numeric Max10DayDrawdown(10.0);     // 最大 10 日回撤 (%)
+    
+    // ========== 6. 资金管理（金字塔优化） ==========
+    Numeric PositionRatio(10.0);        // 总仓位上限 (%)
+    Bool PyramidEnable(True);           // 是否启用金字塔加仓
+    Numeric PyramidInterval(1.0);       // 加仓间隔 (ATR 倍数)
+    
+    Numeric InitialPositionRatio(5.0);  // 初始仓位比例 (%)
+    Numeric AddOn1Ratio(3.0);           // 第 1 次加仓比例 (%)
+    Numeric AddOn2Ratio(2.0);           // 第 2 次加仓比例 (%)
+    
+    // ========== 7. 日志配置 ==========
+    Bool EnableFileLog(True);           // 是否启用文件日志
+    String LogFileName("StrategyLog_V11");  // 日志文件名前缀
+
+//========================================================================
+// 变量区
+//========================================================================
+Vars
+    // ---------- 策略状态 ----------
+    Numeric State;
+    Numeric STATE_IDLE;
+    Numeric STATE_LONG;
+    Numeric STATE_SHORT;
+    Numeric STATE_DISABLED;
+    
+    // ---------- 技术指标 ----------
+    Series<Numeric> FastMA;
+    Series<Numeric> SlowMA;
+    Series<Numeric> ATRVal;
+    Numeric ATRLength(14);
+    
+    // ---------- 信号 ----------
+    Bool LongSignalPrev;
+    Bool ShortSignalPrev;
+    Bool LongExitSignalPrev;
+    Bool ShortExitSignalPrev;
+    
+    // ---------- V11 观察期变量 ----------
+    Numeric BarsSinceStart;             // 启动后经过的 K 线数
+    Numeric EntryHigh;                  // 观察期最高价
+    Numeric EntryLow;                   // 观察期最低价
+    
+    // ---------- 账户风控变量 ----------
+    Numeric PeakEquity;
+    Numeric DailyStartEquity;
+    Numeric Equity10DaysAgo;
+    Numeric CurrentDrawdown;
+    Numeric DailyDrawdown;
+    Numeric Drawdown10Days;
+    Bool TradingEnabled;
+    
+    // ---------- 日期追踪 ----------
+    Numeric LastTradeDate;
+    Numeric CurrentDate;
+    Numeric DaysCount;
+    Array<Numeric> EquityHistory(15);
+    Numeric HistoryIndex;
+    
+    // ---------- 持仓追踪 (关键状态 - 需持久化) ----------
+    Numeric HighestSinceEntry;
+    Numeric LowestSinceEntry;
+    Numeric AddOnCount;
+    Numeric MaxAddOnLevels(2);
+    
+    // 【防抖变量 - 需持久化】
+    Bool AddOnReduced;                  
+    Numeric PeakPriceBeforeReduce;      
+    
+    // ---------- 加仓成本追踪 (需持久化) ----------
+    Numeric AddOn1Price;
+    Numeric AddOn2Price;
+    Bool HasAddOn1;
+    Bool HasAddOn2;
+    
+    // ---------- 仓位计算 ----------
+    Numeric PositionValue;
+    Numeric TradeLots;
+    Numeric CurrentPositionValue;
+    Numeric AvailablePositionValue;
+    Numeric AvailableLots;
+    Numeric CurrentPositionRatio;
+    
+    // ---------- 止损止盈 ----------
+    Numeric StopPrice;
+    Numeric TrailPrice;
+    Numeric PositionProfit;
+    
+    // ---------- 日志文件 ----------
+    Numeric FileHandle;
+    String FullLogPath;
+    Bool LogFileInitialized;
+    
+    // ---------- 全局变量键名前缀 ----------
+    String GV_Prefix;
+
+//========================================================================
+// 函数定义区
+//========================================================================
+Defs
+
+    // ----------------------------------------------------------------------
+    // 函数：WriteLog
+    // 说明：写入日志（控制台 + 文件）
+    // ----------------------------------------------------------------------
+    Integer WriteLog(String message)
+    {
+        Print(message);
+        If(EnableFileLog And LogFileInitialized And FileHandle > 0)
+        {
+            String timeStamp = Text(Date) + " " + Text(Time);
+            String logLine = timeStamp + " | " + message;
+            FileWrite(FileHandle, logLine);
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：InitializeLogFile
+    // 说明：初始化日志文件
+    // ----------------------------------------------------------------------
+    Integer InitializeLogFile()
+    {
+        If(EnableFileLog == False)
+        {
+            LogFileInitialized = False;
+            Return 0;
+        }
+        
+        String dateStr = Text(Date);
+        FullLogPath = LogFileName + "_" + dateStr + ".txt";
+        FileHandle = FileOpen(FullLogPath, 1);
+        
+        If(FileHandle > 0)
+        {
+            LogFileInitialized = True;
+            WriteLog("========================================");
+            WriteLog("📁 日志文件已创建：" + FullLogPath);
+            WriteLog("========================================");
+        }
+        Else
+        {
+            LogFileInitialized = False;
+            Print("⚠️ 警告：日志文件创建失败，仅使用控制台输出");
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CloseLogFile
+    // 说明：关闭日志文件
+    // ----------------------------------------------------------------------
+    Integer CloseLogFile()
+    {
+        If(EnableFileLog And LogFileInitialized And FileHandle > 0)
+        {
+            WriteLog("========================================");
+            WriteLog("🛑 策略运行结束，日志文件已关闭");
+            WriteLog("========================================");
+            FileClose(FileHandle);
+            FileHandle = 0;
+            LogFileInitialized = False;
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：PrintAccountInfo
+    // 说明：打印账户资金信息
+    // ----------------------------------------------------------------------
+    Integer PrintAccountInfo()
+    {
+        WriteLog("========================================");
+        WriteLog("📊 账户资金信息");
+        WriteLog("========================================");
+        WriteLog("💰 账户总权益：" + Text(AccountEquity, 2));
+        WriteLog("💵 可用资金：" + Text(AccountAvailable, 2));
+        WriteLog("📈 持仓占用保证金：" + Text(AccountMargin, 2));
+        WriteLog("📉 持仓浮动盈亏：" + Text(AccountPositionProfit, 2));
+        WriteLog("✅ 平仓盈亏：" + Text(AccountCloseProfit, 2));
+        WriteLog("💸 当日手续费：" + Text(AccountCommission, 2));
+        WriteLog("📊 当前持仓：" + Text(MarketPosition) + "手");
+        WriteLog("========================================");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：PrintStrategyParams
+    // 说明：打印策略参数配置
+    // ----------------------------------------------------------------------
+    Integer PrintStrategyParams()
+    {
+        WriteLog("========================================");
+        WriteLog("⚙️ 策略参数配置 (V11 - 回调突破开仓)");
+        WriteLog("========================================");
+        WriteLog("交易方向：AllowLong=" + Text(AllowLong) + " | AllowShort=" + Text(AllowShort));
+        WriteLog("观察期 K 线数：" + Text(LookbackBars));
+        WriteLog("快线周期：" + Text(FastLength));
+        WriteLog("慢线周期：" + Text(SlowLength));
+        WriteLog("初始止损：" + Text(InitialStopATR) + " ATR");
+        WriteLog("跟踪止损：" + Text(TrailStopATR) + " ATR");
+        WriteLog("最大仓位比例：" + Text(PositionRatio) + "%");
+        WriteLog("└─ 初始仓位：" + Text(InitialPositionRatio) + "%");
+        WriteLog("└─ 第 1 次加仓：" + Text(AddOn1Ratio) + "%");
+        WriteLog("└─ 第 2 次加仓：" + Text(AddOn2Ratio) + "%");
+        WriteLog("金字塔加仓：" + Text(PyramidEnable));
+        WriteLog("最大加仓次数：" + Text(MaxAddOnLevels));
+        WriteLog("启用账户级风控：" + Text(EnableAccountGuard));
+        WriteLog("持久化机制：全局变量 (GV)");
+        WriteLog("========================================");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CalculateIndicators (V11 修改版)
+    // 说明：计算技术指标和开仓信号
+    // ----------------------------------------------------------------------
+    Integer CalculateIndicators()
+    {
+        FastMA = AverageFC(Close, FastLength);
+        SlowMA = AverageFC(Close, SlowLength);
+        ATRVal = AvgTrueRange(ATRLength);
+        
+        // --- V11 核心逻辑：计算观察期高低点 ---
+        Numeric BarsToUse = Min(BarsSinceStart + 1, LookbackBars);
+        If(BarsToUse < 1) BarsToUse = 1;
+        
+        EntryHigh = Highest(High, BarsToUse);
+        EntryLow = Lowest(Low, BarsToUse);
+        
+        // --- V11 核心逻辑：突破观察期高低点生成信号 ---
+        // 多头：AllowLong=True 且 收盘价突破观察期最高价
+        LongSignalPrev = (AllowLong == True And Close[1] > EntryHigh);
+        
+        // 空头：AllowShort=True 且 收盘价跌破观察期最低价
+        ShortSignalPrev = (AllowShort == True And Close[1] < EntryLow);
+        
+        // 出场信号仍使用均线交叉
+        LongExitSignalPrev = CrossUnder(FastMA[1], SlowMA[1]);
+        ShortExitSignalPrev = CrossOver(FastMA[1], SlowMA[1]);
+        
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：UpdateDateTracking
+    // 说明：更新日期追踪和权益记录
+    // ----------------------------------------------------------------------
+    Integer UpdateDateTracking()
+    {
+        CurrentDate = Date;
+        
+        If(CurrentDate != LastTradeDate And CurrentDate > 0)
+        {
+            DailyStartEquity = AccountEquity;
+            DaysCount = DaysCount + 1;
+            
+            EquityHistory[HistoryIndex] = AccountEquity;
+            HistoryIndex = HistoryIndex + 1;
+            If(HistoryIndex >= 15) HistoryIndex = 0;
+            
+            Numeric LookbackIndex = HistoryIndex - 10;
+            If(LookbackIndex < 0) LookbackIndex = LookbackIndex + 15;
+            Equity10DaysAgo = EquityHistory[LookbackIndex];
+            
+            LastTradeDate = CurrentDate;
+            
+            WriteLog("📅 新交易日：" + Text(CurrentDate) + " | 日初权益：" + Text(DailyStartEquity, 2));
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CheckRiskControl
+    // 说明：检查账户级风控限制
+    // ----------------------------------------------------------------------
+    Bool CheckRiskControl()
+    {
+        If(TradingEnabled == False)
+        {
+            WriteLog("⛔ 交易已禁用（触及风控限制）");
+            Return False;
+        }
+        
+        If(PeakEquity > 0)
+        {
+            CurrentDrawdown = (PeakEquity - AccountEquity) / PeakEquity * 100;
+        }
+        Else
+        {
+            CurrentDrawdown = 0;
+        }
+        
+        If(CurrentDrawdown >= MaxTotalDrawdown)
+        {
+            TradingEnabled = False;
+            State = STATE_DISABLED;
+            CloseAllPositions("总回撤触及最终防线");
+            WriteLog("🚨 风控触发：总回撤达到" + Text(MaxTotalDrawdown) + "%，强制停止！");
+            Return False;
+        }
+        
+        If(EnableAccountGuard)
+        {
+            If(DailyStartEquity > 0)
+            {
+                DailyDrawdown = (DailyStartEquity - AccountEquity) / DailyStartEquity * 100;
+            }
+            Else
+            {
+                DailyDrawdown = 0;
+            }
+            
+            If(DailyDrawdown >= MaxDailyDrawdown)
+            {
+                TradingEnabled = False;
+                State = STATE_DISABLED;
+                CloseAllPositions("当日回撤触及限制");
+                WriteLog("🚨 风控触发：当日回撤达到" + Text(MaxDailyDrawdown) + "%，强制停止！");
+                Return False;
+            }
+            
+            If(Equity10DaysAgo > 0 And DaysCount >= 10)
+            {
+                Drawdown10Days = (Equity10DaysAgo - AccountEquity) / Equity10DaysAgo * 100;
+            }
+            Else
+            {
+                Drawdown10Days = 0;
+            }
+            
+            If(Drawdown10Days >= Max10DayDrawdown And DaysCount >= 10)
+            {
+                TradingEnabled = False;
+                State = STATE_DISABLED;
+                CloseAllPositions("10 日回撤触及限制");
+                WriteLog("🚨 风控触发：10 日回撤达到" + Text(Max10DayDrawdown) + "%，强制停止！");
+                Return False;
+            }
+        }
+        Else
+        {
+            DailyDrawdown = 0;
+            Drawdown10Days = 0;
+        }
+        
+        Return True;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CalculatePositionSize
+    // 说明：计算仓位大小（初始开仓或加仓）
+    // ----------------------------------------------------------------------
+    Numeric CalculatePositionSize(Bool IsAddOn = False)
+    {
+        Numeric CurrentPrice = Open;
+        Numeric TargetRatio = 0;
+        
+        If(IsAddOn == False)
+        {
+            TargetRatio = InitialPositionRatio;
+            WriteLog("📊 仓位计算 | 阶段：初始开仓 | 目标比例：" + Text(TargetRatio) + "%");
+        }
+        Else If(AddOnCount == 0)
+        {
+            TargetRatio = AddOn1Ratio;
+            WriteLog("📊 仓位计算 | 阶段：第 1 次加仓 | 目标比例：" + Text(TargetRatio) + "%");
+        }
+        Else If(AddOnCount == 1)
+        {
+            TargetRatio = AddOn2Ratio;
+            WriteLog("📊 仓位计算 | 阶段：第 2 次加仓 | 目标比例：" + Text(TargetRatio) + "%");
+        }
+        Else
+        {
+            WriteLog("⚠️ 仓位计算 | 已达最大加仓次数，返回 0");
+            Return 0;
+        }
+        
+        PositionValue = AccountEquity * TargetRatio / 100;
+        
+        If(CurrentPrice > 0 And ContractUnit > 0)
+        {
+            TradeLots = IntPart(PositionValue / (CurrentPrice * ContractUnit));
+        }
+        Else
+        {
+            TradeLots = 1;
+        }
+        
+        If(IsAddOn And MarketPosition != 0)
+        {
+            CurrentPositionValue = Abs(MarketPosition) * CurrentPrice * ContractUnit;
+            Numeric MaxPositionValue = AccountEquity * PositionRatio / 100;
+            AvailablePositionValue = MaxPositionValue - CurrentPositionValue;
+            
+            If(CurrentPrice > 0 And ContractUnit > 0)
+            {
+                AvailableLots = IntPart(AvailablePositionValue / (CurrentPrice * ContractUnit));
+            }
+            Else
+            {
+                AvailableLots = 0;
+            }
+            
+            If(AvailableLots < TradeLots)
+            {
+                TradeLots = AvailableLots;
+                WriteLog("⚠️ 仓位限制 | 目标：" + Text(TradeLots) + "手 | 可用：" + Text(AvailableLots) + "手 | 采用可用值");
+            }
+            
+            If(TradeLots < 0) TradeLots = 0;
+        }
+        
+        If(TradeLots < 1) TradeLots = 1;
+        
+        Return TradeLots;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：GetCurrentPositionRatio
+    // 说明：获取当前仓位比例
+    // ----------------------------------------------------------------------
+    Numeric GetCurrentPositionRatio()
+    {
+        If(AccountEquity > 0 And ContractUnit > 0 And Open > 0)
+        {
+            CurrentPositionRatio = (Abs(MarketPosition) * Open * ContractUnit) / AccountEquity * 100;
+        }
+        Else
+        {
+            CurrentPositionRatio = 0;
+        }
+        Return CurrentPositionRatio;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：SaveStateToGV
+    // 说明：保存策略状态到全局变量（用于断电恢复）
+    // ----------------------------------------------------------------------
+    Integer SaveStateToGV()
+    {
+        SetGlobalVariable(GV_Prefix + "_AddOnReduced", AddOnReduced ? 1 : 0);
+        SetGlobalVariable(GV_Prefix + "_AddOnCount", AddOnCount);
+        SetGlobalVariable(GV_Prefix + "_PeakPrice", PeakPriceBeforeReduce);
+        SetGlobalVariable(GV_Prefix + "_HasAddOn1", HasAddOn1 ? 1 : 0);
+        SetGlobalVariable(GV_Prefix + "_HasAddOn2", HasAddOn2 ? 1 : 0);
+        SetGlobalVariable(GV_Prefix + "_AddOn1Price", AddOn1Price);
+        SetGlobalVariable(GV_Prefix + "_AddOn2Price", AddOn2Price);
+        SetGlobalVariable(GV_Prefix + "_Highest", HighestSinceEntry);
+        SetGlobalVariable(GV_Prefix + "_Lowest", LowestSinceEntry);
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：LoadStateFromGV
+    // 说明：从全局变量加载策略状态（用于断电恢复）
+    // ----------------------------------------------------------------------
+    Integer LoadStateFromGV()
+    {
+        Numeric val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_AddOnReduced", -1);
+        If(val != -1) AddOnReduced = (val == 1);
+        
+        val = GetGlobalVariable(GV_Prefix + "_AddOnCount", -1);
+        If(val != -1) AddOnCount = val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_PeakPrice", -999999);
+        If(val != -999999) PeakPriceBeforeReduce = val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_HasAddOn1", -1);
+        If(val != -1) HasAddOn1 = (val == 1);
+        
+        val = GetGlobalVariable(GV_Prefix + "_HasAddOn2", -1);
+        If(val != -1) HasAddOn2 = (val == 1);
+        
+        val = GetGlobalVariable(GV_Prefix + "_AddOn1Price", -999999);
+        If(val != -999999) AddOn1Price = val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_AddOn2Price", -999999);
+        If(val != -999999) AddOn2Price = val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_Highest", -999999);
+        If(val != -999999) HighestSinceEntry = val;
+        
+        val = GetGlobalVariable(GV_Prefix + "_Lowest", -999999);
+        If(val != -999999) LowestSinceEntry = val;
+        
+        WriteLog("📂 已从全局变量 (GV) 恢复状态 | AddOnReduced:" + Text(AddOnReduced) + " | Count:" + Text(AddOnCount));
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ClearStateGV
+    // 说明：清除全局变量中的策略状态
+    // ----------------------------------------------------------------------
+    Integer ClearStateGV()
+    {
+        DeleteGlobalVariable(GV_Prefix + "_AddOnReduced");
+        DeleteGlobalVariable(GV_Prefix + "_AddOnCount");
+        DeleteGlobalVariable(GV_Prefix + "_PeakPrice");
+        DeleteGlobalVariable(GV_Prefix + "_HasAddOn1");
+        DeleteGlobalVariable(GV_Prefix + "_HasAddOn2");
+        DeleteGlobalVariable(GV_Prefix + "_AddOn1Price");
+        DeleteGlobalVariable(GV_Prefix + "_AddOn2Price");
+        DeleteGlobalVariable(GV_Prefix + "_Highest");
+        DeleteGlobalVariable(GV_Prefix + "_Lowest");
+        
+        WriteLog("🗑️ 已清除全局变量 (GV) 状态");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：OpenLongPosition
+    // 说明：开立多头仓位
+    // ----------------------------------------------------------------------
+    Integer OpenLongPosition(Numeric lots)
+    {
+        If(MarketPosition < 0)
+        {
+            BuyCover(0, Open);
+            WriteLog("🔄 平空开多：平掉空仓");
+        }
+        
+        Buy(lots, Open);
+        State = STATE_LONG;
+        HighestSinceEntry = High;
+        AddOnCount = 0;
+        
+        AddOnReduced = False;
+        PeakPriceBeforeReduce = 0;
+        HasAddOn1 = False;
+        HasAddOn2 = False;
+        AddOn1Price = 0;
+        AddOn2Price = 0;
+        
+        SaveStateToGV();
+        
+        WriteLog("🟢 做多开仓 (突破观察期高点)：" + Text(lots) + "手 | 价格：" + Text(Open) + " | 仓位：" + Text(GetCurrentPositionRatio(), 2) + "%");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：OpenShortPosition
+    // 说明：开立空头仓位
+    // ----------------------------------------------------------------------
+    Integer OpenShortPosition(Numeric lots)
+    {
+        If(MarketPosition > 0)
+        {
+            Sell(0, Open);
+            WriteLog("🔄 平多开空：平掉多仓");
+        }
+        
+        BuyShort(lots, Open);
+        State = STATE_SHORT;
+        LowestSinceEntry = Low;
+        AddOnCount = 0;
+        
+        AddOnReduced = False;
+        PeakPriceBeforeReduce = 0;
+        HasAddOn1 = False;
+        HasAddOn2 = False;
+        AddOn1Price = 0;
+        AddOn2Price = 0;
+        
+        SaveStateToGV();
+        
+        WriteLog("🔴 做空开仓 (跌破观察期低点)：" + Text(lots) + "手 | 价格：" + Text(Open) + " | 仓位：" + Text(GetCurrentPositionRatio(), 2) + "%");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CloseAllPositions
+    // 说明：平掉所有仓位
+    // ----------------------------------------------------------------------
+    Integer CloseAllPositions(String reason)
+    {
+        If(MarketPosition > 0)
+        {
+            Sell(0, Open);
+            WriteLog("📉 平仓：" + reason + " | 平多仓");
+        }
+        Else If(MarketPosition < 0)
+        {
+            BuyCover(0, Open);
+            WriteLog("📈 平仓：" + reason + " | 平空仓");
+        }
+        State = STATE_IDLE;
+        ClearStateGV();
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：UpdateStopLoss
+    // 说明：更新止损止盈价格
+    // ----------------------------------------------------------------------
+    Integer UpdateStopLoss()
+    {
+        If(MarketPosition == 0 Or ATRVal <= 0)
+        {
+            Return 0;
+        }
+        
+        If(MarketPosition > 0)
+        {
+            HighestSinceEntry = Max(HighestSinceEntry, High);
+            StopPrice = AvgEntryPrice - InitialStopATR * ATRVal;
+            TrailPrice = HighestSinceEntry - TrailStopATR * ATRVal;
+            StopPrice = Max(StopPrice, TrailPrice);
+            
+            If(Low <= StopPrice)
+            {
+                Sell(0, Open);
+                State = STATE_IDLE;
+                ClearStateGV();
+                WriteLog("🛑 多头止损/止盈触发 | 入场：" + Text(AvgEntryPrice) + " | 触发价：" + Text(StopPrice));
+            }
+            Else If(LongExitSignalPrev)
+            {
+                Sell(0, Open);
+                State = STATE_IDLE;
+                ClearStateGV();
+                WriteLog("📉 多头均线出场触发");
+            }
+            Else
+            {
+                SaveStateToGV();
+            }
+        }
+        Else If(MarketPosition < 0)
+        {
+            LowestSinceEntry = Min(LowestSinceEntry, Low);
+            StopPrice = AvgEntryPrice + InitialStopATR * ATRVal;
+            TrailPrice = LowestSinceEntry + TrailStopATR * ATRVal;
+            StopPrice = Min(StopPrice, TrailPrice);
+            
+            If(High >= StopPrice)
+            {
+                BuyCover(0, Open);
+                State = STATE_IDLE;
+                ClearStateGV();
+                WriteLog("🛑 空头止损/止盈触发 | 入场：" + Text(AvgEntryPrice) + " | 触发价：" + Text(StopPrice));
+            }
+            Else If(ShortExitSignalPrev)
+            {
+                BuyCover(0, Open);
+                State = STATE_IDLE;
+                ClearStateGV();
+                WriteLog("📈 空头均线出场触发");
+            }
+            Else
+            {
+                SaveStateToGV();
+            }
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：CheckAndReducePosition
+    // 说明：检查并执行分层减仓
+    // ----------------------------------------------------------------------
+    Integer CheckAndReducePosition()
+    {
+        If(MarketPosition == 0 Or PyramidEnable == False)
+        {
+            Return 0;
+        }
+        
+        Numeric CurrentPrice = Open;
+        Numeric LotsToReduce = 0;
+        String ReduceReason = "";
+        
+        If(MarketPosition > 0)
+        {
+            If(HasAddOn2 And CurrentPrice <= AddOn2Price)
+            {
+                LotsToReduce = 1; 
+                ReduceReason = "回落至第 2 次加仓成本 (" + Text(AddOn2Price) + ")";
+                HasAddOn2 = False;
+            }
+            Else If(HasAddOn1 And CurrentPrice <= AddOn1Price)
+            {
+                LotsToReduce = 1;
+                ReduceReason = "回落至第 1 次加仓成本 (" + Text(AddOn1Price) + ")";
+                HasAddOn1 = False;
+            }
+        }
+        Else If(MarketPosition < 0)
+        {
+            If(HasAddOn2 And CurrentPrice >= AddOn2Price)
+            {
+                LotsToReduce = 1;
+                ReduceReason = "反弹至第 2 次加仓成本 (" + Text(AddOn2Price) + ")";
+                HasAddOn2 = False;
+            }
+            Else If(HasAddOn1 And CurrentPrice >= AddOn1Price)
+            {
+                LotsToReduce = 1;
+                ReduceReason = "反弹至第 1 次加仓成本 (" + Text(AddOn1Price) + ")";
+                HasAddOn1 = False;
+            }
+        }
+        
+        If(LotsToReduce > 0)
+        {
+            If(MarketPosition > 0)
+            {
+                PeakPriceBeforeReduce = HighestSinceEntry;
+                Sell(LotsToReduce, Open);
+                WriteLog("📉 分层减仓 (多)：" + ReduceReason + " | 平仓：" + Text(LotsToReduce) + "手 | 锁定突破价：" + Text(PeakPriceBeforeReduce));
+            }
+            Else
+            {
+                PeakPriceBeforeReduce = LowestSinceEntry;
+                BuyCover(LotsToReduce, Open);
+                WriteLog("📈 分层减仓 (空)：" + ReduceReason + " | 平仓：" + Text(LotsToReduce) + "手 | 锁定突破价：" + Text(PeakPriceBeforeReduce));
+            }
+            
+            AddOnReduced = True;
+            If(AddOnCount > 0) AddOnCount = AddOnCount - 1;
+            
+            SaveStateToGV();
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ExecutePyramidAddOn
+    // 说明：执行金字塔加仓
+    // ----------------------------------------------------------------------
+    Integer ExecutePyramidAddOn()
+    {
+        If(PyramidEnable == False Or MarketPosition == 0)
+        {
+            Return 0;
+        }
+        
+        If(AddOnReduced == True)
+        {
+            Bool ShouldReset = False;
+            
+            If(MarketPosition > 0 And High > PeakPriceBeforeReduce)
+            {
+                ShouldReset = True;
+                WriteLog("✅ 防抖重置：多头价格突破减仓前高点 (" + Text(PeakPriceBeforeReduce) + ")");
+            }
+            Else If(MarketPosition < 0 And Low < PeakPriceBeforeReduce)
+            {
+                ShouldReset = True;
+                WriteLog("✅ 防抖重置：空头价格跌破减仓前低点 (" + Text(PeakPriceBeforeReduce) + ")");
+            }
+            
+            If(ShouldReset)
+            {
+                AddOnReduced = False;
+                SaveStateToGV();
+            }
+            Else
+            {
+                WriteLog("⚠️ 加仓跳过：防抖锁定中，未突破前高/前低");
+                Return 0;
+            }
+        }
+        
+        If(AddOnCount >= MaxAddOnLevels)
+        {
+            WriteLog("⚠️ 加仓跳过：已达最大加仓次数 (" + Text(MaxAddOnLevels) + "次)");
+            Return 0;
+        }
+        
+        Numeric CurrentPrice = Open;
+        PositionProfit = (CurrentPrice - AvgEntryPrice) * MarketPosition * ContractUnit;
+        Numeric ProfitInATR = Abs(PositionProfit) / (ATRVal * ContractUnit * Abs(MarketPosition));
+        Numeric NextAddOnThreshold = PyramidInterval * (AddOnCount + 1);
+        
+        If(ProfitInATR >= NextAddOnThreshold)
+        {
+            Numeric AddOnLots = CalculatePositionSize(True);
+            
+            If(AddOnLots <= 0)
+            {
+                WriteLog("⚠️ 加仓跳过：已达到仓位上限 (" + Text(PositionRatio) + "%)");
+                Return 0;
+            }
+            
+            If(MarketPosition > 0 And LongSignalPrev)
+            {
+                Buy(AddOnLots, Open);
+                AddOnCount = AddOnCount + 1;
+                
+                If(AddOnCount == 1)
+                {
+                    AddOn1Price = Open;
+                    HasAddOn1 = True;
+                }
+                Else If(AddOnCount == 2)
+                {
+                    AddOn2Price = Open;
+                    HasAddOn2 = True;
+                }
+                
+                SaveStateToGV();
+                WriteLog("📈 金字塔加仓（多）：第" + Text(AddOnCount) + "次 | " + Text(AddOnLots) + "手 | 成本：" + Text(Open) + " | 当前仓位：" + Text(GetCurrentPositionRatio(), 2) + "%");
+            }
+            Else If(MarketPosition < 0 And ShortSignalPrev)
+            {
+                BuyShort(AddOnLots, Open);
+                AddOnCount = AddOnCount + 1;
+                
+                If(AddOnCount == 1)
+                {
+                    AddOn1Price = Open;
+                    HasAddOn1 = True;
+                }
+                Else If(AddOnCount == 2)
+                {
+                    AddOn2Price = Open;
+                    HasAddOn2 = True;
+                }
+                
+                SaveStateToGV();
+                WriteLog("📉 金字塔加仓（空）：第" + Text(AddOnCount) + "次 | " + Text(AddOnLots) + "手 | 成本：" + Text(Open) + " | 当前仓位：" + Text(GetCurrentPositionRatio(), 2) + "%");
+            }
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：UpdatePeakEquity
+    // 说明：更新权益峰值（用于回撤计算）
+    // ----------------------------------------------------------------------
+    Integer UpdatePeakEquity()
+    {
+        PeakEquity = Max(PeakEquity, AccountEquity);
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：UpdateChartDisplay
+    // 说明：更新图表显示信息
+    // ----------------------------------------------------------------------
+    Integer UpdateChartDisplay()
+    {
+        PlotNumeric("FastMA", FastMA);
+        PlotNumeric("SlowMA", SlowMA);
+        
+        // 绘制观察期高低点辅助线
+        If(State == STATE_IDLE)
+        {
+            PlotNumeric("EntryHigh", EntryHigh, Color_Red);
+            PlotNumeric("EntryLow", EntryLow, Color_Green);
+            Commentary("👀 观察期 | 多信号:" + Text(EntryHigh) + " | 空信号:" + Text(EntryLow));
+        }
+        Else
+        {
+            String StateText = "未知";
+            If(State == STATE_IDLE) StateText = "空闲";
+            Else If(State == STATE_LONG) StateText = "持多";
+            Else If(State == STATE_SHORT) StateText = "持空";
+            Else If(State == STATE_DISABLED) StateText = "禁用";
+            
+            String guardStatus = EnableAccountGuard ? "ON" : "OFF";
+            String pyramidStatus = PyramidEnable ? "ON" : "OFF";
+            String reduceStatus = AddOnReduced ? "LOCKED" : "ACTIVE";
+            
+            Numeric curRatio = GetCurrentPositionRatio();
+            
+            Commentary("状态:" + StateText + 
+                      " | 风控:" + guardStatus + 
+                      " | 加仓:" + pyramidStatus +
+                      " | 防抖:" + reduceStatus +
+                      " | 持仓:" + Text(MarketPosition) + 
+                      " | 仓位:" + Text(curRatio, 2) + "%" +
+                      " | 上限:" + Text(PositionRatio) + "%");
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ProcessIdleState
+    // 说明：处理空闲状态（等待开仓信号）
+    // ----------------------------------------------------------------------
+    Integer ProcessIdleState()
+    {
+        // V11: 只有当 AllowLong/AllowShort 为 True 且突破观察期高低点时才开仓
+        If(LongSignalPrev)
+        {
+            Numeric lots = CalculatePositionSize(False);
+            OpenLongPosition(lots);
+            Return 0;
+        }
+        
+        If(ShortSignalPrev)
+        {
+            Numeric lots = CalculatePositionSize(False);
+            OpenShortPosition(lots);
+            Return 0;
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ProcessLongState
+    // 说明：处理多头持仓状态
+    // ----------------------------------------------------------------------
+    Integer ProcessLongState()
+    {
+        UpdateStopLoss();
+        CheckAndReducePosition();
+        
+        If(MarketPosition > 0)
+        {
+            ExecutePyramidAddOn();
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ProcessShortState
+    // 说明：处理空头持仓状态
+    // ----------------------------------------------------------------------
+    Integer ProcessShortState()
+    {
+        UpdateStopLoss();
+        CheckAndReducePosition();
+        
+        If(MarketPosition < 0)
+        {
+            ExecutePyramidAddOn();
+        }
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：ProcessDisabledState
+    // 说明：处理禁用状态（风控触发后）
+    // ----------------------------------------------------------------------
+    Integer ProcessDisabledState()
+    {
+        Commentary("⛔ 交易已禁用 - 风控触发");
+        Return 0;
+    }
+    
+    // ----------------------------------------------------------------------
+    // 函数：RunStateMachine
+    // 说明：运行策略状态机
+    // ----------------------------------------------------------------------
+    Integer RunStateMachine()
+    {
+        If(State == STATE_IDLE)
+        {
+            ProcessIdleState();
+        }
+        Else If(State == STATE_LONG)
+        {
+            ProcessLongState();
+        }
+        Else If(State == STATE_SHORT)
+        {
+            ProcessShortState();
+        }
+        Else If(State == STATE_DISABLED)
+        {
+            ProcessDisabledState();
+        }
+        Return 0;
+    }
+
+//========================================================================
+// 事件区
+//========================================================================
+Events
+
+    OnInit()
+    {
+        STATE_IDLE = 0;
+        STATE_LONG = 1;
+        STATE_SHORT = 2;
+        STATE_DISABLED = 3;
+        
+        State = STATE_IDLE;
+        TradingEnabled = True;
+        
+        PeakEquity = AccountInitialCapital;
+        DailyStartEquity = AccountInitialCapital;
+        Equity10DaysAgo = AccountInitialCapital;
+        AddOnCount = 0;
+        HistoryIndex = 0;
+        DaysCount = 0;
+        LastTradeDate = 0;
+        BarsSinceStart = 0;
+        
+        // V11: 初始化全局变量前缀
+        GV_Prefix = "DualDir_V11_" + Code + "_" + Text(FastLength) + "_" + Text(SlowLength);
+        
+        AddOnReduced = False;
+        PeakPriceBeforeReduce = 0;
+        HasAddOn1 = False;
+        HasAddOn2 = False;
+        AddOn1Price = 0;
+        AddOn2Price = 0;
+        HighestSinceEntry = 0;
+        LowestSinceEntry = 0;
+        
+        FileHandle = 0;
+        LogFileInitialized = False;
+        
+        Range[0:14]
+        {
+            EquityHistory[ArrayIndex] = AccountInitialCapital;
+        }
+        
+        InitializeLogFile();
+        PrintAccountInfo();
+        PrintStrategyParams();
+        
+        // V11 关键：尝试从全局变量恢复状态
+        LoadStateFromGV();
+        
+        // V11: 根据 AllowLong/AllowShort 显示当前交易方向
+        If(AllowLong == True And AllowShort == False)
+        {
+            WriteLog("🟢 交易方向：仅做多 (AllowLong=True, AllowShort=False)");
+        }
+        Else If(AllowLong == False And AllowShort == True)
+        {
+            WriteLog("🔴 交易方向：仅做空 (AllowLong=False, AllowShort=True)");
+        }
+        Else If(AllowLong == True And AllowShort == True)
+        {
+            WriteLog("⚠️ 警告：AllowLong 和 AllowShort 均为 True，策略将双向交易");
+        }
+        Else
+        {
+            WriteLog("⛔ 警告：AllowLong 和 AllowShort 均为 False，策略无法交易");
+        }
+        
+        WriteLog("✅ 策略初始化完成 (V11 - 回调突破开仓)");
+    }
+    
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:DataCount-1]
+        {
+            // V11: 累计启动后的 K 线数
+            BarsSinceStart = BarsSinceStart + 1;
+            
+            UpdateDateTracking();
+            
+            Bool riskPassed = CheckRiskControl();
+            If(riskPassed == False)
+            {
+                UpdateChartDisplay();
+                Return;
+            }
+            
+            CalculateIndicators();
+            RunStateMachine();
+            UpdatePeakEquity();
+            UpdateChartDisplay();
+        }
+    }
+    
+    OnDailySettlement()
+    {
+        SaveStateToGV();
+        
+        WriteLog("🌙 日终结算 | 权益：" + Text(AccountEquity, 2) + 
+              " | 持仓：" + Text(MarketPosition) + 
+              " | 仓位：" + Text(GetCurrentPositionRatio(), 2) + "%" +
+              " | 日回撤:" + Text(DailyDrawdown, 2) + "%" +
+              " | 10 日回撤:" + Text(Drawdown10Days, 2) + "%");
+    }
+    
+    OnExit()
+    {
+        SaveStateToGV();
+        CloseLogFile();
+        WriteLog("👋 策略已退出 (状态已保存)");
+    }
