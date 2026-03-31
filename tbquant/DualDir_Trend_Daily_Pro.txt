@@ -3,13 +3,13 @@
 // 名称：多空双向趋势跟踪策略（回调突破开仓版）
 // 类别：趋势跟踪
 // 作者：松鼠 Quant AI 助手
-// 版本：11.0
+// 版本：11.0 (精简版)
 // 说明：
 //   1. 【方向控制】通过 AllowLong/AllowShort 参数单向控制 (启动时只设一个为 True)
 //   2. 【开仓优化】启动后观察 N 根 K 线，突破观察期高低点开仓 (过滤回调)
 //   3. 【状态持久】使用 GlobalVariable 实现断电/重启恢复
 //   4. 【资金管理】金字塔加仓 + 分层减仓 + 防抖机制
-//   5. 【风控系统】账户级回撤控制 + 完整日志
+//   5. 【风控系统】仅保留交易级 ATR 止损，移除账户级回撤控制
 //------------------------------------------------------------------------
 
 //========================================================================
@@ -32,13 +32,7 @@ Params
     Numeric InitialStopATR(2.0);        // 初始止损 ATR 倍数
     Numeric TrailStopATR(1.5);          // 跟踪止损 ATR 倍数
     
-    // ========== 5. 账户级风控 ==========
-    Bool EnableAccountGuard(False);     // 是否启用账户级风控
-    Numeric MaxTotalDrawdown(15.0);     // 最大总回撤 (%)
-    Numeric MaxDailyDrawdown(5.0);      // 最大日回撤 (%)
-    Numeric Max10DayDrawdown(10.0);     // 最大 10 日回撤 (%)
-    
-    // ========== 6. 资金管理（金字塔优化） ==========
+    // ========== 5. 资金管理（金字塔优化） ==========
     Numeric PositionRatio(10.0);        // 总仓位上限 (%)
     Bool PyramidEnable(True);           // 是否启用金字塔加仓
     Numeric PyramidInterval(1.0);       // 加仓间隔 (ATR 倍数)
@@ -47,7 +41,7 @@ Params
     Numeric AddOn1Ratio(3.0);           // 第 1 次加仓比例 (%)
     Numeric AddOn2Ratio(2.0);           // 第 2 次加仓比例 (%)
     
-    // ========== 7. 日志配置 ==========
+    // ========== 6. 日志配置 ==========
     Bool EnableFileLog(True);           // 是否启用文件日志
     String LogFileName("StrategyLog_V11");  // 日志文件名前缀
 
@@ -60,7 +54,7 @@ Vars
     Numeric STATE_IDLE;
     Numeric STATE_LONG;
     Numeric STATE_SHORT;
-    Numeric STATE_DISABLED;
+    // 注：已移除 STATE_DISABLED (原用于账户风控禁用)
     
     // ---------- 技术指标 ----------
     Series<Numeric> FastMA;
@@ -79,21 +73,11 @@ Vars
     Numeric EntryHigh;                  // 观察期最高价
     Numeric EntryLow;                   // 观察期最低价
     
-    // ---------- 账户风控变量 ----------
-    Numeric PeakEquity;
-    Numeric DailyStartEquity;
-    Numeric Equity10DaysAgo;
-    Numeric CurrentDrawdown;
-    Numeric DailyDrawdown;
-    Numeric Drawdown10Days;
-    Bool TradingEnabled;
-    
-    // ---------- 日期追踪 ----------
+    // ---------- 日期追踪（用于日志记录） ----------
     Numeric LastTradeDate;
     Numeric CurrentDate;
     Numeric DaysCount;
-    Array<Numeric> EquityHistory(15);
-    Numeric HistoryIndex;
+    Numeric DailyStartEquity;           // 日初权益（用于日志显示）
     
     // ---------- 持仓追踪 (关键状态 - 需持久化) ----------
     Numeric HighestSinceEntry;
@@ -243,7 +227,6 @@ Defs
         WriteLog("└─ 第 2 次加仓：" + Text(AddOn2Ratio) + "%");
         WriteLog("金字塔加仓：" + Text(PyramidEnable));
         WriteLog("最大加仓次数：" + Text(MaxAddOnLevels));
-        WriteLog("启用账户级风控：" + Text(EnableAccountGuard));
         WriteLog("持久化机制：全局变量 (GV)");
         WriteLog("========================================");
         Return 0;
@@ -282,7 +265,7 @@ Defs
     
     // ----------------------------------------------------------------------
     // 函数：UpdateDateTracking
-    // 说明：更新日期追踪和权益记录
+    // 说明：更新日期追踪和权益记录（用于日志显示）
     // ----------------------------------------------------------------------
     Integer UpdateDateTracking()
     {
@@ -292,97 +275,11 @@ Defs
         {
             DailyStartEquity = AccountEquity;
             DaysCount = DaysCount + 1;
-            
-            EquityHistory[HistoryIndex] = AccountEquity;
-            HistoryIndex = HistoryIndex + 1;
-            If(HistoryIndex >= 15) HistoryIndex = 0;
-            
-            Numeric LookbackIndex = HistoryIndex - 10;
-            If(LookbackIndex < 0) LookbackIndex = LookbackIndex + 15;
-            Equity10DaysAgo = EquityHistory[LookbackIndex];
-            
             LastTradeDate = CurrentDate;
             
             WriteLog("📅 新交易日：" + Text(CurrentDate) + " | 日初权益：" + Text(DailyStartEquity, 2));
         }
         Return 0;
-    }
-    
-    // ----------------------------------------------------------------------
-    // 函数：CheckRiskControl
-    // 说明：检查账户级风控限制
-    // ----------------------------------------------------------------------
-    Bool CheckRiskControl()
-    {
-        If(TradingEnabled == False)
-        {
-            WriteLog("⛔ 交易已禁用（触及风控限制）");
-            Return False;
-        }
-        
-        If(PeakEquity > 0)
-        {
-            CurrentDrawdown = (PeakEquity - AccountEquity) / PeakEquity * 100;
-        }
-        Else
-        {
-            CurrentDrawdown = 0;
-        }
-        
-        If(CurrentDrawdown >= MaxTotalDrawdown)
-        {
-            TradingEnabled = False;
-            State = STATE_DISABLED;
-            CloseAllPositions("总回撤触及最终防线");
-            WriteLog("🚨 风控触发：总回撤达到" + Text(MaxTotalDrawdown) + "%，强制停止！");
-            Return False;
-        }
-        
-        If(EnableAccountGuard)
-        {
-            If(DailyStartEquity > 0)
-            {
-                DailyDrawdown = (DailyStartEquity - AccountEquity) / DailyStartEquity * 100;
-            }
-            Else
-            {
-                DailyDrawdown = 0;
-            }
-            
-            If(DailyDrawdown >= MaxDailyDrawdown)
-            {
-                TradingEnabled = False;
-                State = STATE_DISABLED;
-                CloseAllPositions("当日回撤触及限制");
-                WriteLog("🚨 风控触发：当日回撤达到" + Text(MaxDailyDrawdown) + "%，强制停止！");
-                Return False;
-            }
-            
-            If(Equity10DaysAgo > 0 And DaysCount >= 10)
-            {
-                Drawdown10Days = (Equity10DaysAgo - AccountEquity) / Equity10DaysAgo * 100;
-            }
-            Else
-            {
-                Drawdown10Days = 0;
-            }
-            
-            If(Drawdown10Days >= Max10DayDrawdown And DaysCount >= 10)
-            {
-                TradingEnabled = False;
-                State = STATE_DISABLED;
-                CloseAllPositions("10 日回撤触及限制");
-                WriteLog("🚨 风控触发：10 日回撤达到" + Text(Max10DayDrawdown) + "%，强制停止！");
-                Return False;
-            }
-        }
-        Else
-        {
-            DailyDrawdown = 0;
-            Drawdown10Days = 0;
-        }
-        
-        Return True;
     }
     
     // ----------------------------------------------------------------------
@@ -867,16 +764,6 @@ Defs
     }
     
     // ----------------------------------------------------------------------
-    // 函数：UpdatePeakEquity
-    // 说明：更新权益峰值（用于回撤计算）
-    // ----------------------------------------------------------------------
-    Integer UpdatePeakEquity()
-    {
-        PeakEquity = Max(PeakEquity, AccountEquity);
-        Return 0;
-    }
-    
-    // ----------------------------------------------------------------------
     // 函数：UpdateChartDisplay
     // 说明：更新图表显示信息
     // ----------------------------------------------------------------------
@@ -898,16 +785,13 @@ Defs
             If(State == STATE_IDLE) StateText = "空闲";
             Else If(State == STATE_LONG) StateText = "持多";
             Else If(State == STATE_SHORT) StateText = "持空";
-            Else If(State == STATE_DISABLED) StateText = "禁用";
             
-            String guardStatus = EnableAccountGuard ? "ON" : "OFF";
             String pyramidStatus = PyramidEnable ? "ON" : "OFF";
             String reduceStatus = AddOnReduced ? "LOCKED" : "ACTIVE";
             
             Numeric curRatio = GetCurrentPositionRatio();
             
             Commentary("状态:" + StateText + 
-                      " | 风控:" + guardStatus + 
                       " | 加仓:" + pyramidStatus +
                       " | 防抖:" + reduceStatus +
                       " | 持仓:" + Text(MarketPosition) + 
@@ -973,16 +857,6 @@ Defs
     }
     
     // ----------------------------------------------------------------------
-    // 函数：ProcessDisabledState
-    // 说明：处理禁用状态（风控触发后）
-    // ----------------------------------------------------------------------
-    Integer ProcessDisabledState()
-    {
-        Commentary("⛔ 交易已禁用 - 风控触发");
-        Return 0;
-    }
-    
-    // ----------------------------------------------------------------------
     // 函数：RunStateMachine
     // 说明：运行策略状态机
     // ----------------------------------------------------------------------
@@ -1000,10 +874,6 @@ Defs
         {
             ProcessShortState();
         }
-        Else If(State == STATE_DISABLED)
-        {
-            ProcessDisabledState();
-        }
         Return 0;
     }
 
@@ -1017,16 +887,11 @@ Events
         STATE_IDLE = 0;
         STATE_LONG = 1;
         STATE_SHORT = 2;
-        STATE_DISABLED = 3;
         
         State = STATE_IDLE;
-        TradingEnabled = True;
         
-        PeakEquity = AccountInitialCapital;
         DailyStartEquity = AccountInitialCapital;
-        Equity10DaysAgo = AccountInitialCapital;
         AddOnCount = 0;
-        HistoryIndex = 0;
         DaysCount = 0;
         LastTradeDate = 0;
         BarsSinceStart = 0;
@@ -1045,11 +910,6 @@ Events
         
         FileHandle = 0;
         LogFileInitialized = False;
-        
-        Range[0:14]
-        {
-            EquityHistory[ArrayIndex] = AccountInitialCapital;
-        }
         
         InitializeLogFile();
         PrintAccountInfo();
@@ -1088,16 +948,9 @@ Events
             
             UpdateDateTracking();
             
-            Bool riskPassed = CheckRiskControl();
-            If(riskPassed == False)
-            {
-                UpdateChartDisplay();
-                Return;
-            }
-            
+            // 注：已移除 CheckRiskControl() 调用，不再进行账户级风控拦截
             CalculateIndicators();
             RunStateMachine();
-            UpdatePeakEquity();
             UpdateChartDisplay();
         }
     }
@@ -1108,9 +961,7 @@ Events
         
         WriteLog("🌙 日终结算 | 权益：" + Text(AccountEquity, 2) + 
               " | 持仓：" + Text(MarketPosition) + 
-              " | 仓位：" + Text(GetCurrentPositionRatio(), 2) + "%" +
-              " | 日回撤:" + Text(DailyDrawdown, 2) + "%" +
-              " | 10 日回撤:" + Text(Drawdown10Days, 2) + "%");
+              " | 仓位：" + Text(GetCurrentPositionRatio(), 2) + "%");
     }
     
     OnExit()
