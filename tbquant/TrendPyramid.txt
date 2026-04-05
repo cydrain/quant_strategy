@@ -1,0 +1,211 @@
+//------------------------------------------------------------------------
+// 简称: TrendPyramid
+// 名称: 趋势金字塔加仓策略
+// 类别: 趋势跟踪
+// 类型: 用户应用
+// 输出: Void
+//------------------------------------------------------------------------
+
+Params
+    Numeric TradeDirection(1);              // 交易方向：1=只做多，-1=只做空
+    Numeric EntryLength(20);                // 开仓突破周期
+    Numeric ATRLength(14);                  // ATR 计算周期
+    Numeric InitialPosition(0.3);           // 初始仓位比例 (30%)
+    Numeric AddPositionRate(2.0);           // 加仓间隔 (多少倍 ATR 加仓一次)
+    Numeric MaxAddTimes(4);                 // 最多加仓次数
+    Numeric StopLossATR(3.0);               // 初始止损 ATR 倍数
+    Numeric TrailingStopATR(2.0);           // 移动止损 ATR 倍数
+    Numeric TimeStopBars(20);               // 时间止损周期
+    Numeric Fund(100000);                   // 初始资金
+    Numeric RiskPerTrade(0.02);             // 单笔风险比例 (2%)
+
+Vars
+    // 序列变量（必须在 Vars 中声明）
+    Series<Numeric> ATRValue;               // ATR 值
+    Series<Numeric> EntryPrice;             // 入场价格
+    Series<Numeric> HighestPrice;           // 持仓期间最高价
+    Series<Numeric> LowestPrice;            // 持仓期间最低价
+    Series<Numeric> TrailingStopLong;       // 多头移动止损价
+    Series<Numeric> TrailingStopShort;      // 空头移动止损价
+    Series<Numeric> PositionCost;           // 持仓成本
+    Series<Integer> AddCount;               // 加仓次数
+    Series<Bool> Condition_Long;            // 多头开仓条件
+    Series<Bool> Condition_Short;           // 空头开仓条件
+    Series<Numeric> BreakoutLevel;          // 突破价位
+    
+    // 临时变量
+    Numeric Lots(0);                        // 交易手数
+    Numeric BaseLots(0);                    // 基础手数
+    Numeric AddLots(0);                     // 加仓手数
+    Numeric StopPrice(0);                   // 止损价格
+ 
+    Numeric TotalPosition(0);               // 总仓位比例
+    Numeric AddRatio(0);                    // 加仓比例
+    String strMsg;                          // 打印消息用字符串
+
+Events
+    OnInit()
+    {
+        Range[0:DataCount-1]
+        {
+            AddDataFlag(Enum_Data_RolloverBackWard());
+            AddDataFlag(Enum_Data_RolloverRealPrice());
+            AddDataFlag(Enum_Data_AutoSwapPosition());
+            SetOrderMap2MainSymbol();
+        }
+    }
+    
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:DataCount-1]
+        {
+            // ========== 1. 计算 ATR（序列函数必须在 If 外面调用）==========
+            ATRValue = AvgTrueRange(ATRLength);
+            
+            // ========== 2. 计算开仓条件 ==========
+            // 多头条件：突破 N 周期高点
+            BreakoutLevel = Highest(High, EntryLength);
+            Condition_Long = Close > BreakoutLevel[1] And TradeDirection == 1;
+            
+            // 空头条件：突破 N 周期低点
+            BreakoutLevel = Lowest(Low, EntryLength);
+            Condition_Short = Close < BreakoutLevel[1] And TradeDirection == -1;
+            
+            // ========== 3. 开仓逻辑 ==========
+            // 计算基础手数（根据风险和 ATR）
+            BaseLots = Max(1, IntPart(Fund * RiskPerTrade / (ATRValue * StopLossATR * ContractUnit * BigPointValue)));
+            
+            // 多头开仓
+            If(MarketPosition <= 0 And Condition_Long[1])
+            {
+                Lots = IntPart(BaseLots * InitialPosition);
+                If(Lots >= 1)
+                {
+                    Buy(Lots, Open);
+                    EntryPrice = Open;
+                    HighestPrice = Open;
+                    AddCount = 0;
+                    PositionCost = Open;
+                    strMsg = "多头开仓：" + Text(Lots) + "手，价格：" + Text(Open);
+                    Print(strMsg);
+                }
+            }
+            
+            // 空头开仓
+            If(MarketPosition >= 0 And Condition_Short[1])
+            {
+                Lots = IntPart(BaseLots * InitialPosition);
+                If(Lots >= 1)
+                {
+                    SellShort(Lots, Open);
+                    EntryPrice = Open;
+                    LowestPrice = Open;
+                    AddCount = 0;
+                    PositionCost = Open;
+                    strMsg = "空头开仓：" + Text(Lots) + "手，价格：" + Text(Open);
+                    Print(strMsg);
+                }
+            }
+            
+            // ========== 4. 金字塔加仓逻辑 ==========
+            // 持有多头时加仓
+            If(MarketPosition > 0)
+            {
+                // 更新最高价
+                HighestPrice = Max(HighestPrice, High);
+                
+                // 计算加仓条件：价格比入场价上涨了 N 倍 ATR
+                If(High >= EntryPrice + (AddCount + 1) * ATRValue * AddPositionRate And AddCount < MaxAddTimes)
+                {
+                    // 金字塔加仓：仓位递减
+                    AddRatio = InitialPosition * (1 - AddCount * 0.05);  // 30% -> 25% -> 20% -> 15% -> 10%
+                    AddLots = Max(1, IntPart(BaseLots * AddRatio));
+                    
+                    Buy(AddLots, Open);
+                    AddCount = AddCount + 1;
+                    PositionCost = (PositionCost * (AddCount - 1) + Open * AddLots) / AddCount;  // 更新平均成本
+                    strMsg = "多头加仓：" + Text(AddLots) + "手，价格：" + Text(Open) + "，加仓次数：" + Text(AddCount);
+                    Print(strMsg);
+                }
+                
+                // 计算移动止损价
+                TrailingStopLong = HighestPrice - ATRValue * TrailingStopATR;
+            }
+            
+            // 持有空头时加仓
+            If(MarketPosition < 0)
+            {
+                // 更新最低价
+                LowestPrice = Min(LowestPrice, Low);
+                
+                // 计算加仓条件：价格比入场价下跌了 N 倍 ATR
+                If(Low <= EntryPrice - (AddCount + 1) * ATRValue * AddPositionRate And AddCount < MaxAddTimes)
+                {
+                    // 金字塔加仓：仓位递减
+                    AddRatio = InitialPosition * (1 - AddCount * 0.05);
+                    AddLots = Max(1, IntPart(BaseLots * AddRatio));
+                    
+                    SellShort(AddLots, Open);
+                    AddCount = AddCount + 1;
+                    PositionCost = (PositionCost * (AddCount - 1) + Open * AddLots) / AddCount;
+                    strMsg = "空头加仓：" + Text(AddLots) + "手，价格：" + Text(Open) + "，加仓次数：" + Text(AddCount);
+                    Print(strMsg);
+                }
+                
+                // 计算移动止损价
+                TrailingStopShort = LowestPrice + ATRValue * TrailingStopATR;
+            }
+            
+            // ========== 5. 止损止盈逻辑 ==========
+            // 多头平仓条件
+            If(MarketPosition > 0 And BarsSinceEntry >= 1)
+            {
+                // 移动止损平仓
+                If(Low <= TrailingStopLong[1])
+                {
+                    Sell(0, Min(Open, TrailingStopLong[1]));
+                    strMsg = "多头移动止损平仓，价格：" + Text(Min(Open, TrailingStopLong[1]));
+                    Print(strMsg);
+                }
+                // 时间止损
+                Else If(BarsSinceEntry >= TimeStopBars And Close < EntryPrice)
+                {
+                    Sell(0, Open);
+                    strMsg = "多头时间止损平仓，价格：" + Text(Open);
+                    Print(strMsg);
+                }
+            }
+            
+            // 空头平仓条件
+            If(MarketPosition < 0 And BarsSinceEntry >= 1)
+            {
+                // 移动止损平仓
+                If(High >= TrailingStopShort[1])
+                {
+                    BuyToCover(0, Max(Open, TrailingStopShort[1]));
+                    strMsg = "空头移动止损平仓，价格：" + Text(Max(Open, TrailingStopShort[1]));
+                    Print(strMsg);
+                }
+                // 时间止损
+                Else If(BarsSinceEntry >= TimeStopBars And Close > EntryPrice)
+                {
+                    BuyToCover(0, Open);
+                    strMsg = "空头时间止损平仓，价格：" + Text(Open);
+                    Print(strMsg);
+                }
+            }
+            
+            // ========== 6. 绘图输出 ==========
+            PlotNumeric("ATR", ATRValue);
+            
+            If(MarketPosition > 0)
+            {
+                PlotNumeric("TrailingStop", TrailingStopLong);
+            }
+            If(MarketPosition < 0)
+            {
+                PlotNumeric("TrailingStop", TrailingStopShort);
+            }
+        }
+    }
+
