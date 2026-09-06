@@ -177,6 +177,7 @@ def initialize(context):
     # ==================== 交易参数 ====================
     g.holdings_num = 1
     g.defensive_etf = "511880.XSHG"
+    g.use_defensive_etf = True  # 无候选时是否买入防御ETF 511880；False=资金闲置空仓
     g.min_money = 10
 
     # ==================== 过滤条件 ====================
@@ -896,7 +897,7 @@ def execute_sell_trades(context):
             etf_name = get_security_name(g.defensive_etf)
             log.info(f"🛡️{header} 确定最终目标(防御模式): {g.defensive_etf} {etf_name}")
         else:
-            log.info(f"💤{header} 无最终目标(空仓模式)")
+            log.info(f"💤{header} 无最终目标(空仓模式)，资金闲置")
             target_etf_list = []
 
     g.target_etf_list = target_etf_list
@@ -1133,6 +1134,9 @@ def get_security_name(security):
 
 
 def check_defensive_etf_available(context):
+    if not g.use_defensive_etf:  # 策略开关：False 时不使用防御ETF，资金闲置
+        log.info(f"防御性ETF {g.defensive_etf} 未启用(use_defensive_etf=False)，跳过防御模式")
+        return False
     defensive_etf = g.defensive_etf
     ok, reason = is_tradeable(context, defensive_etf)
     if not ok:
