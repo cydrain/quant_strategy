@@ -908,7 +908,7 @@ def execute_sell_trades(context):
         position = context.portfolio.positions[security]
         if position.total_amount > 0 and security not in target_etf_set:
             security_name = get_security_name(security)
-            success = smart_order_target_value(context, security, 0)
+            success = smart_order_target_value(context, security, 0, "轮动调仓")
             if success:
                 sell_count += 1
                 log.info(f"✅{header} 已成功卖出: {security} {security_name}")
@@ -1011,17 +1011,41 @@ def is_tradeable(context, security, data=None):
     return True, ''
 
 
-def smart_order_target_value(context, security, target_value):
+def log_close_pnl(context, security, sold_qty, avg_cost, cash_before, reason=""):
+    """卖出成交后结算：完全清仓时打印该笔交易盈亏（511880防御仓不打印）。
+
+    卖出净得 = 卖出前后现金增量（成交价含滑点、已扣卖出佣金）；
+    买入成本 = 持仓均价(avg_cost)口径 × 卖出数量（聚宽 avg_cost 通常已含买入费）。
+    """
+    if security.startswith('511880') or sold_qty <= 0 or not avg_cost or avg_cost <= 0:
+        return
+    try:
+        cash_diff = max(0.0, context.portfolio.available_cash - cash_before)   # 卖出净得（现金差，已扣卖出费）
+        total_buy_cost = avg_cost * sold_qty                                   # 买入成本总额
+        remaining = context.portfolio.positions[security].total_amount if security in context.portfolio.positions else 0
+        if remaining > 0:
+            return  # 部分卖出（T+1残留），等完全清仓时再打印整笔盈亏
+        net_pnl = cash_diff - total_buy_cost                                   # 净盈亏金额
+        net_pnl_pct = net_pnl / total_buy_cost * 100                           # 净盈亏收益率(%)
+        name = get_security_name(security)
+        log.info(f"【平仓盈亏】卖出 {security} {name} {sold_qty}股 | 原因: {reason or '未标注'}")
+        log.info(f"  持仓均价 {avg_cost:.4f} | 成本 ¥{total_buy_cost:,.2f} → 卖出净得(扣费) ¥{cash_diff:,.2f} | 净盈亏 {net_pnl:+,.2f} 元 ({net_pnl_pct:+.2f}%)")
+    except Exception as e:
+        log.warning(f"【平仓盈亏】结算异常 {security}: {e}")
+
+
+def smart_order_target_value(context, security, target_value, reason=""):
     """
     智能下单：根据目标市值调整持仓，处理停牌、涨跌停、最小交易金额、T+1
+    reason: 卖出原因标记（如'轮动调仓'/'固定止损'），用于平仓盈亏日志
     """
     header = "【智能交易】"
     data = get_current_data()
     name = get_security_name(security)
     # ========== 1. 统一可交易性检查（停牌/临时停牌/价格0/涨跌停） ==========
-    ok, reason = is_tradeable(context, security, data)
+    ok, block_reason = is_tradeable(context, security, data)
     if not ok:
-        log.info(f"{header} {security} {name} {reason}，跳过交易")
+        log.info(f"{header} {security} {name} {block_reason}，跳过交易")
         return False
     price = data[security].last_price
     # ========== 2. 买入时使用预估成交价（包含佣金+滑点）计算股数 ==========
@@ -1059,12 +1083,15 @@ def smart_order_target_value(context, security, target_value):
         diff = -min(abs(diff), closeable)
     # ========== 4. 执行下单 ==========
     if diff != 0:
+        cash_before = context.portfolio.available_cash
+        sell_cost = cur_pos.avg_cost if (diff < 0 and cur_pos) else None
         order_result = order(security, diff)
         if order_result:
             if diff > 0:
                 log.info(f"📥{header} 买入 {security} {name} 数量{abs(diff)} 价格{price:.3f} (预估含成本价: {estimated_price:.3f})")
             else:
                 log.info(f"📤{header} 卖出 {security} {name} 数量{abs(diff)} 价格{price:.3f}")
+                log_close_pnl(context, security, abs(diff), sell_cost, cash_before, reason)
             return True
         else:
             log.warning(f"{header} 下单失败: {security} {name}，数量{diff}")
@@ -1093,7 +1120,7 @@ def minute_level_stop_loss(context):
             security_name = get_security_name(security)
             loss_percent = (current_price / cost_price - 1) * 100
             log.info(f"🚨 【分钟级固定止损】{security} {security_name} 触发止损，亏损: {loss_percent:.2f}%")
-            smart_order_target_value(context, security, 0)
+            smart_order_target_value(context, security, 0, "固定止损")
 
 
 def get_security_name(security):
