@@ -1,0 +1,16 @@
+# 本地验证数据与凭据（勿提交）
+local_data/
+.jq_env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 沙盒运行输出（可随时重跑生成）
+out*.log
+
+# 工具/编辑器
+.idea/
+.qoder/
+.DS_Store
+*.swp
