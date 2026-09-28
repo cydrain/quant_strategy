@@ -145,7 +145,7 @@ PARAMS = {
     'signal_exit_dist_atr': 0.5,  # 信号反转失守缓冲（ATR 倍数）
     'risk_pct': 0.02,             # 单笔风险预算
     'max_adds': 2,                # 最大加仓次数
-    'add_min_dist_atr': 0.5,      # 加仓最小距离（ATR 倍数），0 = 仅要求正浮盈
+    'add_min_dist_atr': 0.5,      # 加仓趋势推进：MA20 较上笔入场的最小推进（ATR 倍数），0 = 不检查
     'signal_time': '14:45',       # 信号判定时刻
     'multiplier': 10,             # RU 合约乘数
     'margin_rate': 0.12,          # 保证金率（回测设定值）
@@ -638,7 +638,7 @@ def close_leg(context, leg, reason):
     if has_open_order(c):
         warn_once('close_' + c, f"[RU] WARN close pending exists {c}")
         return False
-    amt = -leg['lots'] if leg['side'] == 'long' else leg['lots']
+    amt = -leg['lots']                        # 平台实测：order(数量>0, side='short') 是卖出开空，平仓（多/空）统一用负数量
     o = order(c, amt, side=leg['side'])
     if o is None or o.filled < leg['lots']:
         warn_once('close_' + c, f"[RU] WARN close unfilled (limit board?) {c} {leg['side']} "
@@ -733,25 +733,29 @@ def cooldown_ok(context):
 
 
 def try_add(context, d):
-    """加仓：入场形态 + 价差确认 + 次数限制（设计文档 2.5）"""
+    """加仓：入场形态 + 趋势推进确认（MA20 较上笔入场推进）+ 次数限制（设计文档 2.5）"""
     p = g.params
-    if not g.legs or g.adds >= p['max_adds']:
+    if not g.legs or g.migrating is not None or g.adds >= p['max_adds']:
         return
     side = g.legs[0]['side']
     if d is None or d['direction'] == 0 or dir_to_side(d['direction']) != side:
         return
     if not entry_ok(d, p):
         return
-    gap = d['price'] - g.legs[-1]['entry_price'] if side == 'long' \
-        else g.legs[-1]['entry_price'] - d['price']
-    if p['add_min_dist_atr'] > 0:
-        if gap < p['add_min_dist_atr'] * d['atr']:
-            return
-    elif gap <= 0:
+    last = g.legs[-1]
+    gap = d['price'] - last['entry_price'] if side == 'long' else last['entry_price'] - d['price']
+    if gap <= 0:                                      # 固定规则：金字塔不允许向下加仓
         return
+    if p['add_min_dist_atr'] > 0:                     # MA20 较上笔入场推进 ≥ 阈值（原"价差"条件的设计本意）
+        ma_entry = last.get('ma_at_entry')
+        if ma_entry is None:                          # 状态缺失（如重建补记），保守跳过
+            return
+        ma_advance = d['ma'][-1] - ma_entry if side == 'long' else ma_entry - d['ma'][-1]
+        if ma_advance < p['add_min_dist_atr'] * d['atr']:
+            return
     lots = calc_lots(context.portfolio.total_value, p['risk_pct'], p['stop_loss_dist_atr'],
                      d['atr'], p['multiplier'])
-    open_leg(context, d['direction'], lots, d['atr'], 'add')
+    open_leg(context, d['direction'], lots, d['atr'], 'add', d['ma'][-1])
 
 
 def try_open(context, d):
@@ -942,7 +946,7 @@ def retry_migration(context):
         g.warned.pop('mig_new', None)
         log.info(f"[RU] MIGRATE open {m['new']} {m['side']} {m['total']}@{o.price:.1f}")
     if m['old_price'] is None:
-        amt = -m['total'] if m['side'] == 'long' else m['total']
+        amt = -m['total']   # 平台实测：平仓（多/空）统一用负数量（正数量对空头是加仓）
         o = order(m['old'], amt, side=m['side'])
         if o is None or o.filled < m['total']:
             warn_once('mig_old', f"[RU] WARN migrate close unfilled {m['old']} lots={m['total']}")
