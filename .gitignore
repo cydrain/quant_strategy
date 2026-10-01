@@ -7,7 +7,7 @@ __pycache__/
 *.py[cod]
 
 # 沙盒运行输出（可随时重跑生成）
-out*.log
+out*
 
 # 工具/编辑器
 .idea/
