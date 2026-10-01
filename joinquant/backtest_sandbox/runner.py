@@ -36,6 +36,7 @@ def parse_args():
     ap.add_argument('--tick', type=float, default=5.0)
     ap.add_argument('--multiplier', type=float, default=10)
     ap.add_argument('--out', default=os.path.join(HERE, 'out.log'))
+    ap.add_argument('--equity-out', default=None, help='每日权益（资金曲线）输出 CSV：date,equity')
     ap.add_argument('--param', action='append', default=[],
                     help='运行时覆盖策略 PARAMS（k=v，可重复；策略文件保持零修改），如 --param symbol=P --param exchange=XDCE')
     ap.add_argument('--debug', action='store_true', help='策略日志级别设为 debug（打印 ENTRY_REJECT 等判定细节）')
@@ -112,6 +113,7 @@ def main():
             errors.append((t, traceback.format_exc()))
 
     n_events = 0
+    curve = []                      # 每个交易日结束（夜盘收盘）时的权益快照
     for k, d in enumerate(days):
         prev = prev_trade_day(d)
         # 日盘：每个 bar 触发 every_bar（同时触发该分钟的定时任务，如有）
@@ -124,6 +126,7 @@ def main():
             h, m = label.split(':')
             fire(dt.datetime.combine(d, dt.time(int(h), int(m))), prev, False)
             n_events += 1
+        curve.append((d, jqdata._account.total_value()))
         if (k + 1) % 200 == 0:
             print(f'[sandbox] {k + 1}/{len(days)} days...', file=sys.stderr, flush=True)
 
@@ -132,8 +135,20 @@ def main():
     print(f'[sandbox] strategy={strategy_path}')
     print(f'[sandbox] events={n_events} days={len(days)} fills={len(acct.fills)} '
           f'errors={len(errors)}')
-    print(f'[sandbox] final_equity={acct.total_value():.2f} realized={acct.realized:.2f} '
-          f'fees={acct.fees:.2f} open={ {k: v for k, v in acct.pos.items()} }')
+    equity = acct.total_value()
+    ret = equity - acct.init
+    note = '（含未平仓浮盈）' if acct.pos else ''
+    print(f'[sandbox] final_equity={equity:.2f}  final_return={ret:+.2f} '
+          f'({ret / acct.init * 100:+.2f}%){note}')
+    print(f'[sandbox] realized={acct.realized:.2f} fees={acct.fees:.2f} '
+          f'open={ {k: v for k, v in acct.pos.items()} }')
+    if args.equity_out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.equity_out)), exist_ok=True)
+        with open(args.equity_out, 'w', encoding='utf-8') as fh:
+            fh.write('date,equity\n')
+            for d0, v0 in curve:
+                fh.write(f'{d0},{v0:.2f}\n')
+        print(f'[sandbox] equity -> {args.equity_out}')
     print(f'[sandbox] log -> {out_log}')
     for t, tb in errors[:5]:
         print(f'[sandbox][ERROR] {t}\n{tb}', file=sys.stderr)
