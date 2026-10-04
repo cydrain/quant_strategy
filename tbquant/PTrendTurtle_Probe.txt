@@ -1,0 +1,290 @@
+//------------------------------------------------------------------------
+// 公式: PTrendTurtle_Probe
+// 类别: 运行时假设验证探针（非交易策略）
+// 用途: 为 05-PTrend-turtle-v3.0-TB 移植定稿验证 TBQuant(1.4.4.6) 回测环境假设
+// 挂载: P2505（具体合约）1 分钟图，单图层，K 线收盘模型
+// 回测: 2025-01-02 ~ 2025-01-10（覆盖周五夜盘 -> 周一的交易日切换）
+// 输出: C:/Users/MI/work/quant_strategy/tbquant/logs/PTrendTurtle_Probe_日志.txt
+//       实际落盘为同名 ".txt.tbf"（SQLite 封装）；FileAppend 跨运行追加，
+//       OnInit 已尝试 FileDelete(".txt.tbf") 清理，若不生效请手工删除后再跑
+//
+// [v2 修复] 跨 bar 状态全部改为 Global 修饰（v1 日志实证：普通 Vars 逐 bar 重置，
+//   BarCnt 恒 1 / PB.size 恒 1 / Stage 恒 0 / R2 切换 0 次）；
+//   SetOrderMap2MainSymbol 改为开关 MapToMain（单合约图默认不映射，避免订单流向 p2701）；
+//   Set* 打印原始返回值（v1 恒显示 fail）；新增 R8 字符串持久性验证
+//
+// 验证项：
+//   R1 撮合模型   指令价在 bar 最高之上/最低之下时是否成交（严格见价 vs 优价成交）
+//   R2 交易日边界 夜盘 21:00 bar 的 TradingDate 是否归属下一交易日
+//   R3 数组持久   Global 声明的 Array 是否跨 bar 保留
+//   R4 合约属性   ContractUnit / BigPointValue / MinMove / MarginRatio 实测值
+//   R5 时间标签   14:45 前后 bar 的 Hour/Minute 命名惯例
+//   R6 资金函数   回测下 Portfolio_* 与 A_* 的可用性
+//   R7 成交即时性 下单当 bar MarketPosition/AvgEntryPrice 是否即时刷新
+//   R8 字符串持久 Global String 跨 bar 保留（主公式 LastMainSym 方案验证）
+//
+// 使用: 回测跑完后把日志文件回传，用于主公式定稿（撮合模型决定入场/止损写法）
+//------------------------------------------------------------------------
+Params
+    Integer ProbeDate(20250106);   // 受控交易测试日（yyyymmdd，必须是交易日）
+    Bool LogAllBars(False);        // True=记录所有 bar（仅极短区间调试用）
+    Integer MapToMain(0);          // 1=订单映射到主力合约（主连回测）；0=不映射（单合约图/探针默认）
+
+Vars
+    // [v2] 跨 bar 状态必须用 Global 修饰：TBQuant Chart 模式下普通 Vars 逐 bar 重置
+    //（v1 日志实证：9232 根 bar 上 BarCnt 恒=1、PB.size 恒=1、Stage 恒 0；官方文档：全局变量不因 Bar 改变而消失）
+    Global Array<Numeric> PB;      // R3: 跨 bar 持久性验证数组
+    Global TimeStamp LastTD;       // 上一 bar 的交易日
+    Global Bool TDInit;            // 初值统一在 OnInit 赋值
+    Global Integer BarCnt;
+    Global Integer Stage;          // 受控交易测试序列进度
+    Global Bool FinalDone;
+    Global String GStr;            // R8: 字符串持久性
+    Numeric TstO(0);               // 下单 bar 的 OHLC 快照（仅同 bar 内使用，无需持久）
+    Numeric TstH(0);
+    Numeric TstL(0);
+    Numeric TstC(0);
+
+Defs
+    Integer PL(String s)
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", s, False);
+        Return 0;
+    }
+
+    Integer PLP(String s)          // 关键行：文件 + 日志窗口双写
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", s, False);
+        Print(s);
+        Return 0;
+    }
+
+    Integer YMD()
+    {
+        Return Year() * 10000 + Month() * 100 + Day();
+    }
+
+    String Snap(String tag)        // 持仓/资金快照
+    {
+        Return tag
+            + " MP=" + Text(MarketPosition())
+            + " CC=" + Text(CurrentContracts())
+            + " Entries=" + Text(CurrentEntries())
+            + " AvgEntry=" + Text(AvgEntryPrice(), 1)
+            + " LastEntry=" + Text(LastEntryPrice(), 1)
+            + " BSE=" + Text(BarsSinceEntry())
+            + " Equity=" + Text(Portfolio_CurrentEquity(), 0)
+            + " Capital=" + Text(Portfolio_CurrentCapital(), 0)
+            + " UsedMargin=" + Text(Portfolio_UsedMargin(), 0);
+    }
+
+    String BarOHLC()
+    {
+        Return "barOHLC=" + Text(TstO, 1) + "/" + Text(TstH, 1) + "/" + Text(TstL, 1) + "/" + Text(TstC, 1);
+    }
+
+Events
+    OnInit()
+    {
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt");
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt.tbf");
+        // 全局状态复位（Global 跨 bar/跨运行保留；防同一图表会话内重复运行时残留）
+        BarCnt = 0;
+        Stage = 0;
+        TDInit = False;
+        FinalDone = False;
+        GStr = "";
+        PLP("===== OnInit " + DateTimeToString(CurrentDate()) + " =====");
+        // R4: 合约属性
+        PLP("R4 Symbol=" + Symbol + " MainSymbol=" + MainSymbol()
+            + " ContractUnit=" + Text(ContractUnit())
+            + " BigPointValue=" + Text(BigPointValue(), 1)
+            + " ContractSize=" + Text(ContractSize(), 1)
+            + " MinMove=" + Text(MinMove())
+            + " PriceScale=" + Text(PriceScale(), 2)
+            + " MarginRatio=" + Text(MarginRatio(), 3));
+        PLP("R4 DataCount=" + Text(DataCount()) + " BarInterval=" + Text(BarInterval()) + " BarType=" + Text(BarType())
+            + " StrategyMode=" + Text(StrategyMode())
+            + " (Chart=" + Text(Enum_Mode_Strategy_Chart()) + " Opt=" + Text(Enum_Mode_Strategy_Optimize()) + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + ")");
+        // 与主公式一致的设置（冒烟测试）：滑点先用 0 观察原始撮合，
+        // 想验证滑点单位时改为 1 重跑：P 一跳=2，若成交价偏移 2 则单位为"跳"
+        SetInitCapital(1000000);
+        // [v2] 打印 Set* 原始返回值（v1 用 IIFString 判定恒显示 fail，改念原始 Bool 分辨真假失败）
+        Bool srMargin = SetMarginRate(0.12);
+        Bool srComm = SetCommissionRate(Enum_Rate_ByFillAmount(), 0.000023);
+        Bool srSlip = SetSlippage(Enum_Rate_PointPerHand(), 0);
+        PLP("设置(原始返回): SetMarginRate=" + IIFString(srMargin, "True", "False")
+            + " SetCommissionRate=" + IIFString(srComm, "True", "False")
+            + " SetSlippage=" + IIFString(srSlip, "True", "False"));
+        AddDataFlag(Enum_Data_RolloverBackWard());
+        AddDataFlag(Enum_Data_RolloverRealPrice());
+        AddDataFlag(Enum_Data_AutoSwapPosition());
+        If (MapToMain == 1)
+        {
+            SetOrderMap2MainSymbol();
+        }
+        SetSwapPosVolType(2);
+        SetConsecEntries(4);
+        PLP("数据标识: BackWard+RealPrice+AutoSwap" + IIFString(MapToMain == 1, "+OrderMap2Main", "+OrderMapOff")
+            + "+SwapVolType2+ConsecEntries4 已设置; 图合约=" + Symbol + " 主力=" + MainSymbol());
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:DataCount-1]
+        {
+            BarCnt = BarCnt + 1;
+
+            // ---- R3: Global 数组跨 bar 持久性 ----
+            ArrayPushBack(PB, Close());
+            If (BarCnt == 1 Or BarCnt == 2 Or BarCnt == 3 Or BarCnt == 1000 Or BarCnt == 5000 Or BarCnt == 10000)
+            {
+                PL("R3 bar#" + Text(BarCnt) + " PB.size=" + Text(GetArraySize(PB)) + " (size 随 bar 递增=持久)");
+            }
+
+            // ---- R8: Global String 跨 bar 持久性 ----
+            String prevGStr = GStr;
+            GStr = Text(BarCnt);
+            If (BarCnt == 1 Or BarCnt == 2 Or BarCnt == 3 Or BarCnt == 1000)
+            {
+                PL("R8 bar#" + Text(BarCnt) + " prevGStr='" + prevGStr + "' (持久则 bar2 起 prev='1','2'...)");
+            }
+
+            // ---- R2: 交易日边界 ----
+            TimeStamp td = TradingDate();
+            If (TDInit == False)
+            {
+                LastTD = td;
+                TDInit = True;
+                PLP("R2 首bar: " + Text(Date()) + " " + Text(Time()) + " TradingDate=" + DateTimeToString(td) + " MainSymbol=" + MainSymbol());
+            }
+            Else If (td != LastTD)
+            {
+                PLP("R2 切换: 旧TD=" + DateTimeToString(LastTD) + " 新TD=" + DateTimeToString(td)
+                    + " bar=" + Text(Date()) + " " + Text(Time()) + " MainSymbol=" + MainSymbol());
+                LastTD = td;
+            }
+
+            // ---- R2/R5: 边界与 14:45 时段抽样 ----
+            Bool edge = (Hour() == 20 And Minute() >= 58)
+                Or (Hour() == 21 And Minute() <= 2)
+                Or (Hour() == 22 And Minute() >= 58)
+                Or (Hour() == 23)
+                Or (Hour() == 8 And Minute() >= 58)
+                Or (Hour() == 9 And Minute() <= 2)
+                Or (Hour() == 14 And Minute() >= 43 And Minute() <= 47)
+                Or (Hour() == 14 And Minute() >= 58)
+                Or (Hour() == 15 And Minute() <= 1);
+            If (edge Or LogAllBars)
+            {
+                PL("R2/R5 bar=" + Text(Date()) + " " + Text(Time())
+                    + " H=" + Text(Hour()) + " M=" + Text(Minute())
+                    + " TD=" + DateTimeToString(TradingDate())
+                    + " BS=" + Text(BarStatus())
+                    + " O/H/L/C=" + Text(Open(), 1) + "/" + Text(High(), 1) + "/" + Text(Low(), 1) + "/" + Text(Close(), 1));
+            }
+
+            // ---- R1/R6/R7: 受控交易测试（严格模型/优价模型判别） ----
+            If (YMD() == ProbeDate)
+            {
+                If (Stage == 0 And Hour() == 9 And Minute() == 31)
+                {
+                    PLP("R6 基线: A_AccountDataExist=" + IIFString(A_AccountDataExist(0), "True", "False") + " | " + Snap("Base"));
+                    Stage = 1;
+                }
+                If (Stage == 1 And Hour() == 9 And Minute() == 35)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    Buy(1, Open());
+                    PLP("R1/T1 下多单 Buy(1,Open) " + BarOHLC() + " | 同bar: " + Snap("T1same"));
+                    Stage = 2;
+                }
+                If (Stage == 2 And Hour() == 9 And Minute() == 36)
+                {
+                    PLP("R1/T1 次bar: 成交价看AvgEntry/LastEntry(严格=Open) | " + Snap("T1next"));
+                    Stage = 3;
+                }
+                If (Stage == 3 And Hour() == 10 And Minute() == 45)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    Buy(1, Close());
+                    PLP("R1/T2 加多单 Buy(1,Close) " + BarOHLC() + " | 同bar: " + Snap("T2same"));
+                    Stage = 4;
+                }
+                If (Stage == 4 And Hour() == 10 And Minute() == 46)
+                {
+                    PLP("R1/T2 次bar: (严格=Close / 优价模型=Min(O,C)) | " + Snap("T2next"));
+                    Stage = 5;
+                }
+                If (Stage == 5 And Hour() == 11 And Minute() == 0)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    Buy(1, High() + 50);
+                    PLP("R1/T3 下多单 Buy(1,H+50) " + BarOHLC() + " | 严格模型=不成交(CC仍为2) / 过价模型=成交@Open | 同bar: " + Snap("T3same"));
+                    Stage = 6;
+                }
+                If (Stage == 6 And Hour() == 11 And Minute() == 1)
+                {
+                    PLP("R1/T3 次bar: " + Snap("T3next"));
+                    Stage = 7;
+                }
+                If (Stage == 7 And Hour() == 13 And Minute() == 35)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    Sell(0, Close());
+                    PLP("R1/T4 平多单 Sell(0,Close) " + BarOHLC() + " | 同bar: " + Snap("T4same"));
+                    Stage = 8;
+                }
+                If (Stage == 8 And Hour() == 13 And Minute() == 36)
+                {
+                    PLP("R1/T4 次bar: 期望 MP=0 (成交价按严格=Close) | " + Snap("T4next"));
+                    Stage = 9;
+                }
+                If (Stage == 9 And Hour() == 14 And Minute() == 0)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    SellShort(1, Low() - 50);
+                    PLP("R1/T5 开空单 SellShort(1,L-50) " + BarOHLC() + " | 严格模型=不成交 / 过价模型=成交@Open | 同bar: " + Snap("T5same"));
+                    Stage = 10;
+                }
+                If (Stage == 10 And Hour() == 14 And Minute() == 1)
+                {
+                    PLP("R1/T5 次bar: " + Snap("T5next"));
+                    Stage = 11;
+                }
+                If (Stage == 11 And Hour() == 14 And Minute() == 15)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    SellShort(1, Close());
+                    PLP("R1/T6 开空单 SellShort(1,Close) " + BarOHLC() + " | 同bar: " + Snap("T6same"));
+                    Stage = 12;
+                }
+                If (Stage == 12 And Hour() == 14 And Minute() == 16)
+                {
+                    PLP("R1/T6 次bar: 期望 CC=1(空) | " + Snap("T6next"));
+                    Stage = 13;
+                }
+                If (Stage == 13 And Hour() == 14 And Minute() == 30)
+                {
+                    TstO = Open(); TstH = High(); TstL = Low(); TstC = Close();
+                    BuyToCover(0, Close());
+                    PLP("R1/T7 平空单 BuyToCover(0,Close) " + BarOHLC() + " | 同bar: " + Snap("T7same"));
+                    Stage = 14;
+                }
+                If (Stage == 14 And Hour() == 14 And Minute() == 31)
+                {
+                    PLP("R1/T7 次bar: 期望 MP=0 | " + Snap("T7next"));
+                    Stage = 15;
+                }
+            }
+
+            // ---- 结束摘要 ----
+            If (BarStatus() == 2 And FinalDone == False)
+            {
+                FinalDone = True;
+                PLP("结束: BarCnt=" + Text(BarCnt) + " PB.size=" + Text(GetArraySize(PB))
+                    + " Stage=" + Text(Stage) + "(期望15) 最后TD=" + DateTimeToString(TradingDate())
+                    + " 末GStr='" + GStr + "'");
+            }
+        }
+    }

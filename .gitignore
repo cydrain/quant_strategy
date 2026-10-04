@@ -9,6 +9,11 @@ __pycache__/
 # 沙盒运行输出（可随时重跑生成）
 out*
 
+# TBQuant 本地运行产物（日志与临时脚本）
+tbquant/log/
+tbquant/logs/
+tbquant/tmp_*
+
 # 工具/编辑器
 .idea/
 .qoder/

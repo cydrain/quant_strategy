@@ -1,0 +1,661 @@
+//------------------------------------------------------------------------
+// 简称: PTrendTurtle_v3
+// 名称: 棕榈油海龟趋势策略 v3.0（TBQuant 公式版 · 1.4.4.6 实测环境）
+// 类别: 趋势跟踪
+// 类型: 用户应用
+// 输出: Void
+// 移植: joinquant/05-PTrend-turtle-v3.0.py（聚宽 · 棕榈油 P）
+//------------------------------------------------------------------------
+// 挂载: 1 分钟图，单图层；运行模式选「K线收盘模型」。
+//       单合约切片图（如 P2505）保持 MapToMain=0；主连图（P9888）用 MapToMain=1（订单映射到主力）
+// 说明:
+//   1) 日线N值/通道由 TradingDate() 现场聚合 1 分钟 bar 得到（夜盘归属下一交易日，
+//      与期货日K口径一致），环容量 61 根，对齐聚宽 attribute_history(need+1)。
+//   2) 信号顺序与聚宽一致：共享止损(2N) → 反向突破出场 → 顺向加仓 → 突破入场，
+//      每 bar 只执行一个动作；全部分钟级检查（14:45 仅做定时日志）。
+//   3) 主力移仓用平台原生机制（真实价+自动换仓；主连图 MapToMain=1 时映射主力），移仓后按平台口径重建台账。
+//   4) 回测请从切片起始日提前约 4 个月开始（预热建日线环），TradeStartDate 控制实际开仓日。
+//   5) 运行前建议先跑 PTrendTurtle_Probe.txt 验证撮合/时间标签等假设，详见配套说明.md。
+//
+// [更新 2026-10-03] 依探针实测修复：跨 bar 状态全部改 Global（普通 Vars 逐 bar 重置）；
+//   订单映射改开关 MapToMain（默认 0，单合约图上订单留在图合约，避免被路由到 MainSymbol）；
+//   日志增加 Set* 返回值与 .tbf 清理；全局状态在 OnInit 复位（环数组无法清零，重跑前先关闭图表重开）。
+//   OPEN_SKIP（手数不足）日志按「日+原因」节流：保证金上限卡住 3 号仓时不再逐 bar 刷屏。
+//------------------------------------------------------------------------
+Params
+    // ---- 策略参数（对应聚宽 PARAMS）----
+    Integer FixedDir(1);          // 固定方向：1=只做多 / -1=只做空 / 0=双向
+    Integer NPeriod(20);          // N（ATR）周期
+    Integer NSmooth(20);          // N 平滑系数（经典 N=((s-1)*N+TR)/s）
+    Integer EntryN(20);           // 突破入场通道周期（系统1=20）
+    Integer ExitN(10);            // 反向突破出场通道周期（系统1=10）
+    Numeric UnitRisk(0.01);       // 1 unit 风险预算（占权益比例）
+    Numeric MarginCapPct(0.10);   // 保证金占用上限（占权益比例，0=不限）
+    Integer MaxUnits(4);          // 最大 unit 数（含首仓）
+    Numeric AddStepN(0.5);        // 顺向每 N*该值 加 1 unit
+    Numeric StopDistN(2.0);       // 止损距离（N 倍数）
+    Integer S1Skip(0);            // 系统1跳过规则：1=上次突破盈利则跳过下一次同类突破
+    Integer TradeStartDate(20200313); // 开始交易日期(yyyymmdd)；之前仅预热建通道
+    // ---- 账户/撮合参数 ----
+    Numeric InitCapital(1000000); // 初始资金（回测）
+    Numeric MultiplierP(10);      // 合约乘数（元/点/手，P=10）
+    Numeric MarginRateP(0.12);    // 保证金率
+    Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
+    Numeric SlippageTicks(1);     // 滑点（跳；P 一跳=2 元/吨）
+    Integer MapToMain(0);         // 订单映射主力：0=不映射（单合约切片图）；1=映射（主连图回测）
+    // ---- 日志 ----
+    Integer LogHour(14);          // 每日定时日志时刻
+    Integer LogMinute(45);
+
+Vars
+    // [更新 2026-10-03] 跨 bar 状态必须用 Global 修饰：探针实测 TBQuant Chart 模式下普通 Vars 逐 bar 重置；
+    //   类型组合 Bool/Integer/TimeStamp/String/Array<Numeric> 已由探针 v2 验证，初值统一在 OnInit 赋值
+    // ---- 日线聚合环（现场合成日K，按 TradingDate 分组）----
+    Global Array<Numeric> RingDH; // 日K最高
+    Global Array<Numeric> RingDL; // 日K最低
+    Global Array<Numeric> RingDC; // 日K收盘
+    Global TimeStamp CurTD;       // 当前累计中的交易日
+    Global Bool TDInit;           // 首个bar初始化标记
+    Global Numeric TodayH;        // 当日累计高/低/收
+    Global Numeric TodayL;
+    Global Numeric TodayC;
+    // ---- 每交易日刷新的 N 与四通道 ----
+    Global Numeric NVal;
+    Global Numeric EntryLongLv;
+    Global Numeric EntryShortLv;
+    Global Numeric ExitLongLv;
+    Global Numeric ExitShortLv;
+    // ---- 持仓台账（替代聚宽 g.legs）----
+    Global Integer PLots;         // 总持仓手数
+    Global Numeric PCost;         // 总成本（价*手）
+    Global Numeric LastUnitPrice; // 最近一个 unit 的入场价
+    Global Integer UnitCount;     // unit 计数
+    Global Numeric StopLine;      // 共享止损线
+    // ---- 系统1 跳过 ----
+    Global Bool SkipNextBreakout;
+    // ---- 移仓跟踪 ----
+    Global String LastMainSym;    // 上次主力合约；变化=发生移仓
+    Global Bool MainSymInit;      // 主力字符串初始化标记
+    // ---- 运行状态 ----
+    Global Integer BarCnt;
+    Global Integer LastLogYmd;
+    Global String LastSkipKey;    // OPEN_SKIP 日志节流键：YMD:reason，每天每原因只打第一条
+    Global Bool FinalDone;
+
+Defs
+    // ---------- 基础辅助 ----------
+
+    Integer WLog(String s)
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", Text(Date()) + " " + Text(Time()) + " | " + s, False);
+        Return 0;
+    }
+
+    // OnInit 阶段无 bar 时间，用平台当前时间
+    Integer WLogInit(String s)
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", DateTimeToString(CurrentDate()) + " | " + s, False);
+        Return 0;
+    }
+
+    Integer YMD()
+    {
+        Return Year() * 10000 + Month() * 100 + Day();
+    }
+
+    Integer RingCap()
+    {
+        Return IntPart(Max(60, NPeriod * 3)) + 1;
+    }
+
+    // 环尾追加，超出容量从头删除（容量 61，对齐聚宽 attribute_history(61) 窗口）
+    Integer PushRing(ArrayRef<Numeric> arr, Numeric v)
+    {
+        ArrayPushBack(arr, v);
+        If (GetArraySize(arr) > RingCap())
+        {
+            ArrayErase(arr, 0, 1);
+        }
+        Return 0;
+    }
+
+    // 第 i 根日K的真实波幅（i>=1）
+    Numeric TRAt(Integer i)
+    {
+        Numeric t1 = RingDH[i] - RingDL[i];
+        Numeric t2 = Abs(RingDH[i] - RingDC[i - 1]);
+        Numeric t3 = Abs(RingDL[i] - RingDC[i - 1]);
+        Return Max(Max(t1, t2), t3);
+    }
+
+    // 复刻聚宽 calc_n：前 NPeriod 个 TR 均值初始化，再按 NSmooth 递推到最新
+    Integer RefreshLevels()
+    {
+        Integer sz = GetArraySize(RingDH);
+        If (sz < NPeriod + 1)
+        {
+            Return 0;
+        }
+        If (sz < EntryN Or sz < ExitN)
+        {
+            Return 0;
+        }
+        Integer i;
+        Numeric n = 0;
+        For i = 1 To NPeriod
+        {
+            n = n + TRAt(i);
+        }
+        n = n / NPeriod;
+        For i = NPeriod + 1 To sz - 1
+        {
+            n = ((NSmooth - 1) * n + TRAt(i)) / NSmooth;
+        }
+        NVal = n;
+
+        Numeric eh = RingDH[sz - EntryN];
+        Numeric el = RingDL[sz - EntryN];
+        Numeric xl = RingDL[sz - ExitN];
+        Numeric xs = RingDH[sz - ExitN];
+        Integer j;
+        For j = sz - EntryN + 1 To sz - 1
+        {
+            eh = Max(eh, RingDH[j]);
+            el = Min(el, RingDL[j]);
+        }
+        For j = sz - ExitN + 1 To sz - 1
+        {
+            xl = Min(xl, RingDL[j]);
+            xs = Max(xs, RingDH[j]);
+        }
+        EntryLongLv = eh;
+        EntryShortLv = el;
+        ExitLongLv = xl;
+        ExitShortLv = xs;
+        Return 0;
+    }
+
+    // ---------- 资金分支：回测用 Portfolio_*，实盘/模拟用 A_* ----------
+
+    Bool IsLiveTrade()
+    {
+        If (StrategyMode() <> Enum_Mode_Strategy_Trade())
+        {
+            Return False;
+        }
+        Return A_AccountDataExist(0);
+    }
+
+    Numeric CurEquity()
+    {
+        If (IsLiveTrade())
+        {
+            Return A_CurrentEquity(0);
+        }
+        Return Portfolio_CurrentEquity();
+    }
+
+    Numeric CurAvailable()
+    {
+        If (IsLiveTrade())
+        {
+            Return A_FreeMargin(0);
+        }
+        Return Portfolio_CurrentCapital();
+    }
+
+    // ---------- 手数计算（复刻聚宽 unit_lots + fit_margin + fit_cap）----------
+
+    Integer CalcLots(Numeric px)
+    {
+        Numeric eq = CurEquity();
+        Integer lots = Max(1, IntPart(eq * UnitRisk / (NVal * MultiplierP)));
+        Numeric mpl = px * MultiplierP * MarginRateP;
+        If (mpl > 0)
+        {
+            lots = Min(lots, IntPart(CurAvailable() / mpl));
+            If (MarginCapPct > 0)
+            {
+                Numeric room = eq * MarginCapPct - PLots * mpl;
+                lots = Min(lots, IntPart(room / mpl));
+            }
+        }
+        If (lots < 0)
+        {
+            lots = 0;
+        }
+        Return lots;
+    }
+
+    // ---------- 订单封装 ----------
+
+    // 开 1 个 unit；台账按预期成交价记账（下单价=触发价，跳空时取开盘价）
+    Integer DoOpenUnit(Integer dir, Numeric refPx, String reason)
+    {
+        Numeric ordPx = refPx;
+        If (IsLiveTrade())
+        {
+            Numeric qp = Q_BidPrice(0);
+            If (dir > 0)
+            {
+                qp = Q_AskPrice(0);
+            }
+            If (qp > 0)
+            {
+                ordPx = qp;
+            }
+        }
+        Else
+        {
+            If (dir > 0 And Open() > refPx)
+            {
+                ordPx = Open();
+            }
+            If (dir < 0 And Open() < refPx)
+            {
+                ordPx = Open();
+            }
+        }
+        Integer lots = CalcLots(Close());
+        If (lots < 1)
+        {
+            // 节流：同一交易日内同一原因只记第一条（3号仓被保证金上限卡住时会逐 bar 重试）
+            String skipKey = Text(YMD()) + ":" + reason;
+            If (skipKey <> LastSkipKey)
+            {
+                LastSkipKey = skipKey;
+                WLog("OPEN_SKIP 手数不足 reason=" + reason + " dir=" + Text(dir) + " px=" + Text(ordPx, 1));
+            }
+            Return 0;
+        }
+        Bool ok = False;
+        If (dir > 0)
+        {
+            ok = Buy(lots, ordPx);
+        }
+        Else
+        {
+            ok = SellShort(lots, ordPx);
+        }
+        If (ok == False)
+        {
+            WLog("OPEN_FAIL 委托被拒 reason=" + reason + " dir=" + Text(dir) + " lots=" + Text(lots) + " px=" + Text(ordPx, 1));
+            Return 0;
+        }
+        PLots = PLots + lots;
+        PCost = PCost + ordPx * lots;
+        LastUnitPrice = ordPx;
+        UnitCount = UnitCount + 1;
+        StopLine = LastUnitPrice - dir * StopDistN * NVal;
+        WLog(reason + " OPEN dir=" + Text(dir) + " lots=" + Text(lots) + " px=" + Text(ordPx, 1)
+            + " N=" + Text(NVal, 1) + " stop=" + Text(StopLine, 1)
+            + " units=" + Text(UnitCount) + " totalLots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0));
+        Return 0;
+    }
+
+    // 全部平仓（止损/反向突破）；委托失败则保留台账下一 bar 重试
+    Integer DoCloseAll(Integer dir, Numeric refPx, String reason)
+    {
+        If (PLots <= 0)
+        {
+            Return 0;
+        }
+        Numeric ordPx = refPx;
+        If (IsLiveTrade())
+        {
+            Numeric qp = Q_AskPrice(0);
+            If (dir > 0)
+            {
+                qp = Q_BidPrice(0);
+            }
+            If (qp > 0)
+            {
+                ordPx = qp;
+            }
+        }
+        Else
+        {
+            If (dir > 0 And Open() < refPx)
+            {
+                ordPx = Open();
+            }
+            If (dir < 0 And Open() > refPx)
+            {
+                ordPx = Open();
+            }
+        }
+        Numeric avg = AvgEntryPrice();
+        If (avg <= 0)
+        {
+            avg = PCost / PLots;
+        }
+        Integer lots = PLots;
+        Bool ok = False;
+        If (dir > 0)
+        {
+            ok = Sell(lots, ordPx);
+        }
+        Else
+        {
+            ok = BuyToCover(lots, ordPx);
+        }
+        If (ok == False)
+        {
+            WLog("CLOSE_FAIL 委托被拒 reason=" + reason + " dir=" + Text(dir) + " lots=" + Text(lots) + " px=" + Text(ordPx, 1));
+            Return 0;
+        }
+        Numeric pnl = (ordPx - avg) * lots * MultiplierP * dir;
+        WLog(reason + " CLOSE dir=" + Text(dir) + " lots=" + Text(lots) + " px=" + Text(ordPx, 1)
+            + " avg=" + Text(avg, 1) + " pnl=" + Text(pnl, 0)
+            + " units=" + Text(UnitCount) + " equity=" + Text(CurEquity(), 0));
+        If (S1Skip > 0 And pnl > 0)
+        {
+            SkipNextBreakout = True;
+            WLog("S1_SKIP 上次突破盈利，下一次同类突破将跳过");
+        }
+        PLots = 0;
+        PCost = 0;
+        UnitCount = 0;
+        LastUnitPrice = 0;
+        StopLine = 0;
+        Return 0;
+    }
+
+    // ---------- 台账一致性：重启/部分成交后按平台持仓重建 ----------
+
+    Integer RebuildLedger()
+    {
+        Integer cc = IntPart(Abs(CurrentContracts()));
+        PLots = cc;
+        UnitCount = Max(1, CurrentEntries());
+        Numeric avg = AvgEntryPrice();
+        If (avg <= 0)
+        {
+            avg = Close();
+        }
+        PCost = avg * cc;
+        LastUnitPrice = LastEntryPrice();
+        If (LastUnitPrice <= 0)
+        {
+            LastUnitPrice = avg;
+        }
+        Integer dir = 1;
+        If (MarketPosition() < 0)
+        {
+            dir = -1;
+        }
+        StopLine = LastUnitPrice - dir * StopDistN * NVal;
+        WLog("STATE_REBUILD cc=" + Text(cc) + " entries=" + Text(UnitCount) + " avg=" + Text(avg, 1)
+            + " lastEntry=" + Text(LastUnitPrice, 1) + " stop=" + Text(StopLine, 1));
+        Return 0;
+    }
+
+    // ---------- 主力移仓跟踪（原生自动换仓后重建基准）----------
+
+    Integer UpdateMainSymbol()
+    {
+        String ms = MainSymbol();
+        If (MainSymInit == False)
+        {
+            MainSymInit = True;
+            LastMainSym = ms;
+            Return 0;
+        }
+        If (ms <> LastMainSym)
+        {
+            WLog("ROLLOVER " + LastMainSym + " -> " + ms + " mp=" + Text(MarketPosition())
+                + " cc=" + Text(CurrentContracts()) + " avg=" + Text(AvgEntryPrice(), 1));
+            LastMainSym = ms;
+            If (MarketPosition() <> 0)
+            {
+                RebuildLedger();
+            }
+        }
+        Return 0;
+    }
+
+    // ---------- 信号逻辑 ----------
+
+    Bool CanTradeNow()
+    {
+        If (YMD() < TradeStartDate)
+        {
+            Return False;
+        }
+        If (NVal <= 0 Or EntryLongLv <= 0 Or EntryShortLv <= 0 Or ExitLongLv <= 0 Or ExitShortLv <= 0)
+        {
+            Return False;
+        }
+        Return True;
+    }
+
+    // 入场：突破前 EntryN 日极值（fixed_dir 限定方向；系统1 跳过规则）
+    Integer TryEntry()
+    {
+        Bool allowLong = (FixedDir == 0 Or FixedDir == 1);
+        Bool allowShort = (FixedDir == 0 Or FixedDir == -1);
+        If (allowLong And High() >= EntryLongLv)
+        {
+            If (S1Skip > 0 And SkipNextBreakout)
+            {
+                SkipNextBreakout = False;
+                WLog("BREAKOUT_SKIP long level=" + Text(EntryLongLv, 1));
+                Return 0;
+            }
+            DoOpenUnit(1, EntryLongLv, "entry");
+            Return 0;
+        }
+        If (allowShort And Low() <= EntryShortLv)
+        {
+            If (S1Skip > 0 And SkipNextBreakout)
+            {
+                SkipNextBreakout = False;
+                WLog("BREAKOUT_SKIP short level=" + Text(EntryShortLv, 1));
+                Return 0;
+            }
+            DoOpenUnit(-1, EntryShortLv, "entry");
+        }
+        Return 0;
+    }
+
+    // 每分钟风控与信号：止损 → 反向突破出场 → 加仓 → 入场（每 bar 只执行一个动作）
+    Integer TradeLogic()
+    {
+        If (MarketPosition() == 0)
+        {
+            If (PLots <> 0 Or UnitCount <> 0)
+            {
+                WLog("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
+                PLots = 0;
+                PCost = 0;
+                UnitCount = 0;
+                LastUnitPrice = 0;
+                StopLine = 0;
+            }
+            TryEntry();
+            Return 0;
+        }
+        If (IntPart(Abs(CurrentContracts())) <> PLots)
+        {
+            RebuildLedger();
+        }
+        Integer dir = 1;
+        If (MarketPosition() < 0)
+        {
+            dir = -1;
+        }
+        // 1) 共享止损（2N，含加仓后上移）
+        If (StopLine > 0)
+        {
+            If (dir > 0 And Low() <= StopLine)
+            {
+                DoCloseAll(dir, StopLine, "stop");
+                Return 0;
+            }
+            If (dir < 0 And High() >= StopLine)
+            {
+                DoCloseAll(dir, StopLine, "stop");
+                Return 0;
+            }
+        }
+        // 2) 反向突破出场
+        If (dir > 0 And Low() <= ExitLongLv)
+        {
+            DoCloseAll(dir, ExitLongLv, "exit_breakout");
+            Return 0;
+        }
+        If (dir < 0 And High() >= ExitShortLv)
+        {
+            DoCloseAll(dir, ExitShortLv, "exit_breakout");
+            Return 0;
+        }
+        // 3) 加仓：顺向每 AddStepN*N 加 1 unit
+        If (UnitCount < MaxUnits)
+        {
+            If (dir > 0 And High() >= LastUnitPrice + AddStepN * NVal)
+            {
+                DoOpenUnit(dir, LastUnitPrice + AddStepN * NVal, "add");
+                Return 0;
+            }
+            If (dir < 0 And Low() <= LastUnitPrice - AddStepN * NVal)
+            {
+                DoOpenUnit(dir, LastUnitPrice - AddStepN * NVal, "add");
+                Return 0;
+            }
+        }
+        Return 0;
+    }
+
+Events
+    OnInit()
+    {
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt");
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt.tbf");
+        // [修复] 全局状态复位（Global 跨 bar/跨运行保留；防同一会话重复运行时残留）
+        // 注意：环数组 RingDH/DL/DC 无法在此清零，重跑前请关闭图表再重新打开
+        BarCnt = 0;
+        LastLogYmd = 0;
+        LastSkipKey = "";
+        TDInit = False;
+        MainSymInit = False;
+        SkipNextBreakout = False;
+        FinalDone = False;
+        TodayH = 0;
+        TodayL = 0;
+        TodayC = 0;
+        NVal = 0;
+        EntryLongLv = 0;
+        EntryShortLv = 0;
+        ExitLongLv = 0;
+        ExitShortLv = 0;
+        PLots = 0;
+        PCost = 0;
+        LastUnitPrice = 0;
+        UnitCount = 0;
+        StopLine = 0;
+        SetInitCapital(InitCapital);
+        Bool okMargin = SetMarginRate(MarginRateP);
+        Bool okComm = SetCommissionRate(Enum_Rate_ByFillAmount(), CommissionRateP);
+        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlippageTicks);
+        SetConsecEntries(-1);          // 平台不限建仓次数，加仓由 UnitCount<MaxUnits 控制
+        Range[0:DataCount-1]
+        {
+            AddDataFlag(Enum_Data_RolloverBackWard());
+            AddDataFlag(Enum_Data_RolloverRealPrice());
+            AddDataFlag(Enum_Data_AutoSwapPosition());
+            If (MapToMain == 1)
+            {
+                SetOrderMap2MainSymbol();
+            }
+            SetSwapPosVolType(2);
+        }
+        WLogInit("===== OnInit 棕榈油海龟 v3.0（TB公式版）=====");
+        WLogInit("合约: Symbol=" + Symbol + " MainSymbol=" + MainSymbol()
+            + " ContractUnit=" + Text(ContractUnit()) + " BigPointValue=" + Text(BigPointValue(), 1)
+            + " MinMove=" + Text(MinMove()) + " PriceScale=" + Text(PriceScale(), 2)
+            + " MarginRatio=" + Text(MarginRatio(), 3));
+        WLogInit("模式: StrategyMode=" + Text(StrategyMode())
+            + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
+            + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + " Chart=" + Text(Enum_Mode_Strategy_Chart()));
+        WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
+            + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " MaxUnits=" + Text(MaxUnits));
+        WLogInit("参数B: UnitRisk=" + Text(UnitRisk, 4) + " MarginCapPct=" + Text(MarginCapPct, 4)
+            + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2) + " S1Skip=" + Text(S1Skip));
+        WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
+            + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
+            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlippageTicks=" + Text(SlippageTicks, 2));
+        WLogInit("设置(原始返回): SetMarginRate=" + IIFString(okMargin, "True", "False")
+            + " SetCommissionRate=" + IIFString(okComm, "True", "False")
+            + " SetSlippage=" + IIFString(okSlip, "True", "False")
+            + " MapToMain=" + Text(MapToMain) + IIFString(MapToMain == 1, "(OrderMap2Main)", "(OrderMapOff)"));
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:DataCount-1]
+        {
+            BarCnt = BarCnt + 1;
+
+            // ---- 1. 日线聚合：TradingDate 变化 = 上一交易日结束，入环并刷新通道 ----
+            TimeStamp td = TradingDate();
+            If (TDInit == False)
+            {
+                TDInit = True;
+                CurTD = td;
+                TodayH = High();
+                TodayL = Low();
+                TodayC = Close();
+            }
+            Else If (td <> CurTD)
+            {
+                PushRing(RingDH, TodayH);
+                PushRing(RingDL, TodayL);
+                PushRing(RingDC, TodayC);
+                CurTD = td;
+                TodayH = High();
+                TodayL = Low();
+                TodayC = Close();
+                RefreshLevels();
+            }
+            Else
+            {
+                TodayH = Max(TodayH, High());
+                TodayL = Min(TodayL, Low());
+                TodayC = Close();
+            }
+
+            // ---- 2. 主力移仓检测（原生自动换仓）----
+            UpdateMainSymbol();
+
+            // ---- 3. 风控与信号（预热期只建通道，不交易）----
+            If (CanTradeNow())
+            {
+                TradeLogic();
+            }
+
+            // ---- 4. 每日定时日志（14:45，同聚宽 signal_time）----
+            If (Hour() == LogHour And Minute() == LogMinute And YMD() <> LastLogYmd)
+            {
+                LastLogYmd = YMD();
+                WLog("DAILY " + MainSymbol()
+                    + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
+                    + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
+                    + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
+                    + " equity=" + Text(CurEquity(), 0) + " ring=" + Text(GetArraySize(RingDH)));
+            }
+
+            // ---- 5. 结束摘要 ----
+            If (BarStatus() == 2 And FinalDone == False)
+            {
+                FinalDone = True;
+                WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " ring=" + Text(GetArraySize(RingDH))
+                    + " N=" + Text(NVal, 1) + " mp=" + Text(MarketPosition()) + " cc=" + Text(CurrentContracts())
+                    + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + " ===");
+            }
+        }
+    }
+
+//------------------------------------------------------------------------
+// 版本: v3.0-TB  2026/10  PTrendTurtle_v3  TBQuant 公式版
+// 对应聚宽: joinquant/05-PTrend-turtle-v3.0.py
+//------------------------------------------------------------------------
