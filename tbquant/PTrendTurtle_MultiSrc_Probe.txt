@@ -1,0 +1,375 @@
+//------------------------------------------------------------------------
+// 公式: PTrendTurtle_MultiSrc_Probe
+// 类别: 运行时假设验证探针（非交易策略）
+// 用途: 为"DATA0=1分钟 + DATA1=日线"多数据源方案（v4 候选）取证：
+//       验证 1 分钟现场聚合链（v3.0 口径）与 日线数据源链 能否逐日对上、N 能否等价重现
+// 挂载: 与 v3.0 同合约同图；data0 = P2505（或 P9888）1 分钟（主商品），data1 = 同合约 日线
+//       追加方法：策略研究中选中策略单元 → 右键数据源 → 周期选 1d → 追加；
+//       两图层都右键「同步为主商品数据范围」，避免回测起止日期错位
+// 运行: K线收盘模型。环需 61 根预热，回测起点提前约 4 个月；区间建议覆盖 ≥1 次换月，
+//       推荐直接用切片 6 同段：回测起点 2024-09-01 ~ 2025-03-10（TradeStart 口径同 v3.0）
+// 输出: C:/Users/MI/work/quant_strategy/tbquant/logs/PTrendTurtle_MultiSrc_Probe_日志.txt
+//       （实际落盘为 .txt.tbf SQLite 封装；FileAppend 跨运行追加，OnInit 已尝试清理）
+//
+// 验证项:
+//   M1 对齐映射  换日(夜盘首根)时打印 data1 的 [0]/[1]/[2] 三根(datetime+OHLC) 与聚合环刚
+//                收完日的 H/L/C → "已收完日K"到底等于 data1 的哪一根，一锤定音
+//   M2 数值一致  上述逐值对照即逐日校验 1 分钟链 vs 日线链（复权/换月拼接是最大风险点）
+//   M3 N 对拍    同一 calc_n 算法: 环 NVal vs N61@base0 vs N61@base1；附带 N21（21 根窗口）
+//                → 直接量化"窗口从 61 缩到 21 会差多少"（回答"能不能少用几天"）
+//   M4 触发机制  前 3 根打印 indexs 内容；data0 层 / data1 层 执行次数各计一个
+//
+// 判读要点:
+//   - FLIP 行的"环收完日 H/L/C"与 D1[0]/[1]/[2] 中哪一根三项全等 → 已收完日K 的偏移
+//   - N61 的 MATCH 计数应随预热完成 100% 命中同一 base；若 MISMATCH 连片 → 两链数值有分歧
+//   - N21 与 N61 的差值即"缩窗误差"的实际量级
+// 注意: 环数组为 Global 无法清零——同一图表内重跑前先关闭图表重开（同 v3.0）；
+//       LogAllBars=True 仅建议 1~2 周短区间（逐 bar 打印 data1[0] 形成态）
+//       data1 前缀写法取自官方文档示例（Data[i]. 可加在任意函数/变量前）；若个别行
+//       编译不过，优先回报 data1 相关行号，注释该行不影响其余验证
+//------------------------------------------------------------------------
+Params
+    Integer NPeriod(20);       // N（ATR）周期（与 v3.0 同口径）
+    Integer NSmooth(20);       // N 平滑系数
+    Integer EntryN(20);        // 环通道复算用（对照）
+    Integer ExitN(10);
+    Integer LogHour(14);       // 快照时点1：14:45（同 v3.0 DAILY 日志）
+    Integer LogMinute(45);
+    Bool LogAllBars(False);    // True=逐 bar 打印 data1[0] 形成态（短区间调试）
+
+Vars
+    // 跨 bar 状态必须 Global（v1 探针实证：普通 Vars 逐 bar 重置）
+    Global Array<Numeric> RingDH;   // 聚合环：日K高
+    Global Array<Numeric> RingDL;   // 聚合环：日K低
+    Global Array<Numeric> RingDC;   // 聚合环：日K收
+    Global TimeStamp CurTD;
+    Global Bool TDInit;
+    Global Numeric TodayH;
+    Global Numeric TodayL;
+    Global Numeric TodayC;
+    Global Numeric NVal;
+    Global Numeric EntryLongLv;
+    Global Numeric EntryShortLv;
+    Global Numeric ExitLongLv;
+    Global Numeric ExitShortLv;
+    Global Integer BarCnt;
+    Global Integer BarCnt1;      // data1 图层执行次数
+    Global Integer LastSnapKey;  // 快照去重键 ymd*10000+hm
+    Global Bool FinalDone;
+    Global Integer FlipCnt;
+    Global Integer N61HitA;      // N61@base0 == 环N 计数
+    Global Integer N61HitB;      // N61@base1 == 环N 计数
+    Global Integer NMisCnt;      // 都不等计数
+    Bar curBar;                  // GetBar 传出结构（同 bar 内复用）
+
+Defs
+    Integer PL(String s)
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", s, False);
+        Return 0;
+    }
+
+    Integer PLP(String s)          // 关键行：文件 + 日志窗口双写
+    {
+        FileAppend("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt", s, False);
+        Print(s);
+        Return 0;
+    }
+
+    Integer YMD()
+    {
+        Return Year() * 10000 + Month() * 100 + Day();
+    }
+
+    Integer RingCap()
+    {
+        Return IntPart(Max(60, NPeriod * 3)) + 1;
+    }
+
+    // 环尾追加，超出容量从头删除（容量 61，对齐聚宽 attribute_history(61) 窗口）
+    Integer PushRing(ArrayRef<Numeric> arr, Numeric v)
+    {
+        ArrayPushBack(arr, v);
+        If (GetArraySize(arr) > RingCap())
+        {
+            ArrayErase(arr, 0, 1);
+        }
+        Return 0;
+    }
+
+    // 第 i 根日K的真实波幅（i>=1）
+    Numeric TRAt(Integer i)
+    {
+        Numeric t1 = RingDH[i] - RingDL[i];
+        Numeric t2 = Abs(RingDH[i] - RingDC[i - 1]);
+        Numeric t3 = Abs(RingDL[i] - RingDC[i - 1]);
+        Return Max(Max(t1, t2), t3);
+    }
+
+    // 复刻聚宽 calc_n：前 NPeriod 个 TR 均值初始化，再按 NSmooth 递推到最新
+    Integer RefreshLevels()
+    {
+        Integer sz = GetArraySize(RingDH);
+        If (sz < NPeriod + 1)
+        {
+            Return 0;
+        }
+        If (sz < EntryN Or sz < ExitN)
+        {
+            Return 0;
+        }
+        Integer i;
+        Numeric n = 0;
+        For i = 1 To NPeriod
+        {
+            n = n + TRAt(i);
+        }
+        n = n / NPeriod;
+        For i = NPeriod + 1 To sz - 1
+        {
+            n = ((NSmooth - 1) * n + TRAt(i)) / NSmooth;
+        }
+        NVal = n;
+
+        Numeric eh = RingDH[sz - EntryN];
+        Numeric el = RingDL[sz - EntryN];
+        Numeric xl = RingDL[sz - ExitN];
+        Numeric xs = RingDH[sz - ExitN];
+        Integer j;
+        For j = sz - EntryN + 1 To sz - 1
+        {
+            eh = Max(eh, RingDH[j]);
+            el = Min(el, RingDL[j]);
+        }
+        For j = sz - ExitN + 1 To sz - 1
+        {
+            xl = Min(xl, RingDL[j]);
+            xs = Max(xs, RingDH[j]);
+        }
+        EntryLongLv = eh;
+        EntryShortLv = el;
+        ExitLongLv = xl;
+        ExitShortLv = xs;
+        Return 0;
+    }
+
+    // ---------- data1（日线源）显式前缀读取：写法见官方文档 Data[i]. 规则 ----------
+    // 第 idx 根数据的 TR（idx=偏移，0=最新；用 idx 与 idx+1 两根，同环口径）
+    Numeric D1TR(Integer idx)
+    {
+        Numeric t1 = Data1.High[idx] - Data1.Low[idx];
+        Numeric t2 = Abs(Data1.High[idx] - Data1.Close[idx + 1]);
+        Numeric t3 = Abs(Data1.Low[idx] - Data1.Close[idx + 1]);
+        Return Max(Max(t1, t2), t3);
+    }
+
+    // 基于 data1 的 calc_n：base=最新那根的偏移（0 或 1），win=窗口根数（61 或 21）
+    Numeric D1N(Integer base, Integer win)
+    {
+        If (win < NPeriod + 1)
+        {
+            Return 0;
+        }
+        Numeric n = 0;
+        Integer t;
+        For t = 1 To NPeriod
+        {
+            n = n + D1TR(base + win - 1 - t);
+        }
+        n = n / NPeriod;
+        For t = NPeriod + 1 To win - 1
+        {
+            n = ((NSmooth - 1) * n + D1TR(base + win - 1 - t)) / NSmooth;
+        }
+        Return n;
+    }
+
+    // data1 第 i 根的描述行（GetBar 取 datetime+OHLC，官方案例写法）
+    String D1BarDesc(Integer i)
+    {
+        Data1.GetBar(curBar, i);
+        Return "D1[" + Text(i) + "] dt=" + Text(curBar.datetime)
+            + " O/H/L/C=" + Text(curBar.open, 1) + "/" + Text(curBar.high, 1) + "/" + Text(curBar.low, 1) + "/" + Text(curBar.close, 1);
+    }
+
+Events
+    OnInit()
+    {
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt");
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt.tbf");
+        // 全局状态复位（环数组无法清零，重跑前请关闭图表重开）
+        BarCnt = 0;
+        BarCnt1 = 0;
+        TDInit = False;
+        FinalDone = False;
+        FlipCnt = 0;
+        N61HitA = 0;
+        N61HitB = 0;
+        NMisCnt = 0;
+        LastSnapKey = 0;
+        PLP("===== OnInit " + DateTimeToString(CurrentDate()) + " =====");
+        PLP("M0 DataCount=" + Text(DataCount()) + " data0=" + Symbol + " MainSymbol=" + MainSymbol());
+        If (DataCount() >= 2)
+        {
+            PLP("M0 data1.Symbol=" + Data1.Symbol + " (必须与 data0 同合约、周期=日线)");
+        }
+        Else
+        {
+            PLP("!! 只检测到一个数据源——请先在图表右键追加同合约日线数据源再跑");
+        }
+        // 复权/换月口径：作用于全部图层（与 v3.0 一致）
+        Range[0:DataCount-1]
+        {
+            AddDataFlag(Enum_Data_RolloverBackWard());
+            AddDataFlag(Enum_Data_RolloverRealPrice());
+            AddDataFlag(Enum_Data_AutoSwapPosition());
+        }
+        PLP("M0 口径: BackWard+RealPrice+AutoSwap 已设置（含 data1）");
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:0]
+        {
+            TimeStamp td = TradingDate();
+            Bool HasD1 = DataCount() >= 2;
+            Numeric hd = 0;
+            Numeric ld = 0;
+            Numeric cd = 0;
+            Integer sz = 0;
+            Numeric nA = 0;
+            Numeric nB = 0;
+            Numeric n21A = 0;
+            Numeric n21B = 0;
+            String tag = "";
+            String ixs = "";
+            Integer ii = 0;
+            Integer sk = 0;
+
+            BarCnt = BarCnt + 1;
+            If (BarCnt <= 3)
+            {
+                For ii = 0 To GetArraySize(indexs) - 1
+                {
+                    ixs = ixs + Text(indexs[ii]) + ",";
+                }
+                PLP("M4 bar#" + Text(BarCnt) + " indexs=[" + ixs + "] size=" + Text(GetArraySize(indexs))
+                    + " DataCount=" + Text(DataCount()));
+            }
+
+            // ---- 1. 日线聚合（与 v3.0 同构）：换日时入环 + M1/M2/M3 对拍 ----
+            If (TDInit == False)
+            {
+                TDInit = True;
+                CurTD = td;
+                TodayH = High();
+                TodayL = Low();
+                TodayC = Close();
+                PLP("M1 首bar TD=" + DateTimeToString(td) + " (环开始预热)");
+            }
+            Else If (td <> CurTD)
+            {
+                hd = TodayH;
+                ld = TodayL;
+                cd = TodayC;
+                PushRing(RingDH, TodayH);
+                PushRing(RingDL, TodayL);
+                PushRing(RingDC, TodayC);
+                CurTD = td;
+                TodayH = High();
+                TodayL = Low();
+                TodayC = Close();
+                RefreshLevels();
+                FlipCnt = FlipCnt + 1;
+                sz = GetArraySize(RingDH);
+                If (sz >= 4)
+                {
+                    PLP("M1 FLIP #" + Text(FlipCnt) + " bar=" + Text(Date()) + " " + Text(Time())
+                        + " 入TD=" + DateTimeToString(td)
+                        + " | 环收完日 H/L/C=" + Text(hd, 1) + "/" + Text(ld, 1) + "/" + Text(cd, 1)
+                        + " RING[-2]=" + Text(RingDH[sz - 2], 1) + "/" + Text(RingDL[sz - 2], 1) + "/" + Text(RingDC[sz - 2], 1)
+                        + " RING[-3]=" + Text(RingDH[sz - 3], 1) + "/" + Text(RingDL[sz - 3], 1) + "/" + Text(RingDC[sz - 3], 1));
+                    If (HasD1)
+                    {
+                        PL("  " + D1BarDesc(0));
+                        PL("  " + D1BarDesc(1));
+                        PL("  " + D1BarDesc(2));
+                        PL("  Data1.BarStatus=" + Text(Data1.BarStatus) + "  (2=正在形成的当前根)");
+                        If (sz >= 61)
+                        {
+                            nA = D1N(0, 61);
+                            nB = D1N(1, 61);
+                            n21A = D1N(0, 21);
+                            n21B = D1N(1, 21);
+                            If (Abs(nA - NVal) < 0.001)
+                            {
+                                tag = "MATCH 61@base0";
+                                N61HitA = N61HitA + 1;
+                            }
+                            Else If (Abs(nB - NVal) < 0.001)
+                            {
+                                tag = "MATCH 61@base1";
+                                N61HitB = N61HitB + 1;
+                            }
+                            Else
+                            {
+                                tag = "MISMATCH dA=" + Text(nA - NVal, 4) + " dB=" + Text(nB - NVal, 4);
+                                NMisCnt = NMisCnt + 1;
+                            }
+                            PLP("  M3 N: ring=" + Text(NVal, 2) + " | N61@0=" + Text(nA, 2) + " N61@1=" + Text(nB, 2)
+                                + " | N21@0=" + Text(n21A, 2) + " N21@1=" + Text(n21B, 2) + " → " + tag);
+                        }
+                        Else
+                        {
+                            PL("  M3 ring=" + Text(sz) + "/61 未满, N 对拍跳过");
+                        }
+                    }
+                }
+            }
+            Else
+            {
+                TodayH = Max(TodayH, High());
+                TodayL = Min(TodayL, Low());
+                TodayC = Close();
+            }
+
+            // ---- 2. 定点快照：14:45 / 09:01 / 15:00(日盘收) 各一条（看 data1 形成态演化）----
+            If ((Hour() == LogHour And Minute() == LogMinute)
+                Or (Hour() == 9 And Minute() == 1)
+                Or (Hour() == 15 And Minute() == 0))
+            {
+                sk = YMD() * 10000 + Hour() * 100 + Minute();
+                If (sk <> LastSnapKey)
+                {
+                    LastSnapKey = sk;
+                    If (HasD1)
+                    {
+                        PL("M1 SNAP " + Text(Date()) + " " + Text(Time()) + " | " + D1BarDesc(0) + " | " + D1BarDesc(1));
+                    }
+                }
+            }
+            If (LogAllBars And HasD1)
+            {
+                PL("M1 ALL " + Text(Date()) + " " + Text(Time()) + " | " + D1BarDesc(0));
+            }
+
+            // ---- 3. 结束摘要 ----
+            If (BarStatus() == 2 And FinalDone == False)
+            {
+                FinalDone = True;
+                PLP("=== 结束 BarCnt=" + Text(BarCnt) + " BarCnt1=" + Text(BarCnt1)
+                    + " flips=" + Text(FlipCnt) + " ring=" + Text(GetArraySize(RingDH))
+                    + " N61Match(base0/base1/miss)=" + Text(N61HitA) + "/" + Text(N61HitB) + "/" + Text(NMisCnt)
+                    + " N=" + Text(NVal, 2) + " ===");
+            }
+        }
+
+        Range[1:1]
+        {
+            BarCnt1 = BarCnt1 + 1;
+            If (BarCnt1 <= 3)
+            {
+                PL("M4 data1图层执行#" + Text(BarCnt1) + " Date/Time=" + Text(Date()) + " " + Text(Time()));
+            }
+        }
+    }
