@@ -232,7 +232,14 @@ Defs
         {
             n = ((NSmooth - 1) * n + DailyTR(win - t)) / NSmooth;
         }
-        Return n;
+        // NaN 守卫：NPeriod/NSmooth ≤0 等参数滥用产生除零 → 无效值/无穷；
+        // 无效值会使 CanTradeNow 的 NVal<=0 比较恒 False 而漏过门禁 → 此处归一为 0
+        //（RefreshNChannels 见 0 记 ERROR 并保持五值全 0，当日拒绝交易、下个换日自动重试）
+        If (n != InvalidNumeric And n > 0)
+        {
+            Return n;
+        }
+        Return 0;
     }
 
     // 四通道（唐奇安）：Data1[1]=最近一根完整日K，其后按各自周期数取极值。
@@ -312,6 +319,11 @@ Defs
         }
         // 前置守卫已通过 → 窗口内各 bar 有效，交计算函数
         NVal = CalcDailyN(win);
+        If (NVal <= 0)   // CalcDailyN 已做 NaN 守卫（参数滥用归 0）；此处保持「失败=全 0 + ERROR」语义，CalcChannels 不执行
+        {
+            WLogE("N/四通道刷新失败 CalcDailyN 无效, NVal=" + Text(NVal, 2) + "（检查 NPeriod/NSmooth 参数）");
+            Return 0;
+        }
         CalcChannels();
         Return 0;
     }
