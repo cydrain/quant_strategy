@@ -7,13 +7,18 @@
 // 移植: joinquant/05-PTrend-turtle-v3.0.py（聚宽 · 棕榈油 P）/ tbquant/05-PTrend-turtle-v3.0-TB.txt
 //------------------------------------------------------------------------
 // 策略说明（v4.0 = v3.0 交易逻辑原样 + 数据来源更换，不并入 v3.1 候选补丁）:
-//   日线 N 与四通道从日线数据源直读；交易机制——手数/unit/
-//   共享止损/加仓/出场/台账自愈/移仓——与 v3.0 完全相同。
+//   N 与四通道从 data1 数据源直读；窗口头恒为最新一根已完成 data1 K线，
+//   每根新 bar 生成时在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 驱动不会重复重算）；
+//   交易机制——手数/unit/共享止损/加仓/出场/台账自愈/移仓——与 v3.0 完全相同。
 //   本版 → 全局状态随 OnInit 复位，重跑无需关闭图表（v3 的环数组限制不适用）。
+//   日线 data1 下取值与旧版「换日一刷」逐值等价（Data1[1] 日内稳定，探针 M3 实测 43/43）；
+//   30 分钟等日内周期 data1 下每根K收完即推进 → 真 30 分钟海龟口径。
 //
 // 挂载（两图层，缺一不可；运行模式「K线收盘模型」）:
 //   data0 = 1 分钟（主商品，如 P2505 / P9888）—— 全部信号/风控/下单在此层执行
 //   data1 = 同合约 日线 —— 纯只读数据源（挂图才暴露 Data1.*，不触发任何执行；代码内 Data1 仅出现在 Defs「数据源约定」段）
+//     也支持 30 分钟等日内周期（实验）：N/四通道随每根完整K收完推进（真 30 分钟海龟）；
+//     注意 30 分钟口径下 Data1[0]/[1] 盘中对齐尚未经探针验证（日线已 43/43），上实盘前先复验。
 //   追加方法：策略研究中选中策略单元 → 右键数据源 → 周期选 1d → 追加；
 //   两图层都右键「同步为主商品数据范围」，避免回测起止错位。
 //   单合约切片图 MapToMain=False —— 数据源保持「不复权」（公式不下发复权标志）；
@@ -25,7 +30,8 @@
 //   2) 信号/风控/下单只读 Data1[1] 及更早。Data1[0] 是禁区：
 //      回测=当天完整日K（look-ahead）、实盘/模拟=形成中（逐 tick 变），两边口径不一致；
 //      仅 DAILY 日志在 DEBUG 级保留一行 d0diag 诊断输出（D0 禁区唯一出口 DailyClose0Diag），禁入任何判断。
-//   3) 禁 GetBar（回测返回全 0 Bar）；换日时刻 Data1[0]=新交易日、Data1[1]=刚收完昨日。
+//   3) 禁 GetBar（回测返回全 0 Bar）；Data1[1] 恒为最新一根已完成K：日线=昨日（仅换日推进）、
+//      30 分钟等日内周期=上一根已收完K（每根推进）——N/四通道窗口头即取此根。
 //   4) 信号体只放 Range[0:0] 单块：多图层下 Range[0:1] 会把策略体在每个图层上下文各跑一遍
 //      （1分钟上下文 + 日线 look-ahead 上下文）——v3 双图层事故即此，勿复现。
 //   5) 代码约定：Data1 仅出现在 Defs「数据源约定」段的 Daily* 访问器内（DailySym/DailyHigh/
@@ -38,7 +44,7 @@
 //   b) 严重不足（图表从 TradeStartDate 当天才开始）→ 窗口退化为 1 根K：
 //      EL=XS、ES=XL 全等 + d1=d0diag → 08-02 假突破（-14,500）。
 //   修复=图表数据范围（两图层同步）提前到首个目标信号日前 ≥61 个交易日再跑。
-//   读取确为无效值/0 时守护才生效（记 ERROR 日志、当日不下单，之后每个换日自动重试）。
+//   读取确为无效值/0 时守护才生效（记 ERROR 日志、拒绝下单，之后每根新 bar 自动重试；错误日志按交易日节流）。
 //   与 v3 同段日志抽查：两侧窗口都填满后逐日全等（实测 2024-08-27 起 N/EL/XL/ES/XS 完全一致）。
 //
 //------------------------------------------------------------------------
@@ -71,9 +77,7 @@ Params
     Integer LogMinute(45);
 
 Vars
-    // ---- 换日检测 ----
-    Global TimeStamp CurTD;       // 当前交易日；OnInit 种 -1 哨兵 → 首 bar 必触发刷新
-    // ---- 每交易日刷新的 N 与四通道（来源：Data1[1..]）----
+    // ---- N 与四通道（来源 Data1[1..]；每根新 bar 在 OnBarOpen 刷新，见该事件）----
     Global Numeric NVal;
     Global Numeric EntryLongLv;
     Global Numeric EntryShortLv;
@@ -94,6 +98,7 @@ Vars
     Global Integer BarCnt;
     Global Integer LastLogYmd;
     Global Integer LastSkipYmd;   // OPEN_SKIP 日志节流：当日已记过即静默（拒因当日不解除）
+    Global Integer LastRefreshErrYmd; // N/四通道失败日志节流：失败态每根新 bar 重试下同交易日只记首条（不去重会刷屏）
     Global Bool FinalDone;
 
 Defs
@@ -170,6 +175,17 @@ Defs
         Return Year() * 10000 + Month() * 100 + Day();
     }
 
+    // 刷新失败日志（按交易日节流）：失败态每根新 bar 都会重试——每天只报首条防刷屏
+    Integer WLogRefreshErr(String s)
+    {
+        If (YMD() <> LastRefreshErrYmd)
+        {
+            LastRefreshErrYmd = YMD();
+            WLogE(s);
+        }
+        Return 0;
+    }
+
     // 窗口根数（对齐聚宽 attribute_history(need+1) 与 v3 环容量）
     Integer WinSize()
     {
@@ -177,11 +193,17 @@ Defs
     }
 
     // ---------- 数据源约定：全公式仅有的 Data1 引用点 ----------
-    // 图层约定：data0 = 同合约 1 分钟（信号/执行）；data1 = 同合约日线（只读，N/四通道来源）。
+    // 图层约定：data0 = 同合约 1 分钟（信号/执行）；data1 = 同合约日线（30 分钟等实验可选；只读，N/四通道来源）。
     // 层序若变动（前面插了别的数据源），只改本段访问器内的 Data1→DataN，其余代码零感知。
     String DailySym()
     {
         Return Data1.Symbol;
+    }
+
+    // data1 周期范围字符串（如 "1d"；30 分钟实验图层为 "30m"）——仅供 OnInit 表头日志留痕
+    String DailyFreq()
+    {
+        Return Data1.Frequency();
     }
 
     Numeric DailyHigh(Integer idx)
@@ -234,7 +256,7 @@ Defs
         }
         // NaN 守卫：NPeriod/NSmooth ≤0 等参数滥用产生除零 → 无效值/无穷；
         // 无效值会使 CanTradeNow 的 NVal<=0 比较恒 False 而漏过门禁 → 此处归一为 0
-        //（RefreshNChannels 见 0 记 ERROR 并保持五值全 0，当日拒绝交易、下个换日自动重试）
+        //（RefreshNChannels 见 0 记 ERROR 并保持五值全 0，拒绝交易、每根新 bar 自动重试；错误日志按交易日节流）
         If (n != InvalidNumeric And n > 0)
         {
             Return n;
@@ -268,7 +290,7 @@ Defs
         Return 0;
     }
 
-    // N 与四通道复位为无效值（0）：换日刷新「先清后算」与 OnInit 复位共用
+    // N 与四通道复位为无效值（0）：刷新「先清后算」与 OnInit 复位共用
     Integer ResetChannels()
     {
         NVal = 0;
@@ -279,16 +301,19 @@ Defs
         Return 0;
     }
 
-    // N 与四通道的换日刷新入口（编排器：零化 → 守卫 → 计算，数学都在被调函数里）。
+    // N 与四通道的刷新入口（编排器：零化 → 守卫 → 计算，数学都在被调函数里）。
     // 概念映射：NVal ← CalcDailyN(win)（经典海龟 N：前 NPeriod 个 TR 均值种子 + Wilder 递推）；
     //           四通道 ← CalcChannels()（唐奇安 EntryN 入场 / ExitN 出场极值）。
-    // 调用时机：OnBar 换日检测两处（首根与交易日切换各一次）；每日仅执行一次，当日冻结。
-    //           换日时刻 Data1[1]=刚收完的昨日完整日K，其后再不变（探针 M3 实测 43/43 对齐 v3 环）。
-    // 数据窗口：日线图层 data1 经 Daily* 访问器按 base=1 取 win=WinSize() 根，第 win 根仅作前收盘锚点。
-    // 守卫顺序：① DataCount≥2（有日线图层）② win≥EntryN 且 win≥ExitN（窗口够长）
-    //           ③ DailyClose(1)/(win) 有效且 >0（历史深度；成对合取，不依赖 And 短路）。
-    // 失败语义：五值先全部置 0；任一守卫不过 → 保持 0 + ERROR 日志 → CanTradeNow 见 0 拒绝交易，
-    //           下个换日自动重试（自愈，无需人工干预）。
+    // 调用时机：OnBarOpen（每根新 bar 生成时一次；正常历史回放与实盘均驱动）——实盘 OnBar
+    //           会随形成中 bar 逐 tick 重复，故刷新不放 OnBar。值随 data1 窗口头推进更新：
+    //           Data1[1]=最新一根已完成 data1 K线，日线仅换日推进（探针 M3 实测 43/43 对齐
+    //           v3 环）——同一根 K 期间与旧版「换日一刷」取值一致；30 分钟等日内周期每根收完即推进。
+    // 数据窗口：data1 图层经 Daily* 访问器按 base=1 取 win=WinSize() 根，第 win 根仅作前收盘锚点。
+    // 守卫顺序：① DataCount≥2（有 data1 图层）② data1 与 data0 同合约（错位拒交易，
+    //           防拿错合约的 N/通道下单）③ win≥EntryN 且 win≥ExitN（窗口够长）
+    //           ④ DailyClose(1)/(win) 有效且 >0（历史深度；成对合取，不依赖 And 短路）。
+    // 失败语义：五值先全部置 0；任一守卫不过 → 保持 0 + ERROR 日志（按交易日节流）→ CanTradeNow
+    //           见 0 拒绝交易，下根新 bar（OnBarOpen）自动重试（数据恢复即自愈，无需等次日）。
     // 后置保证：成功返回时 NVal 与四通道均 >0；CalcDailyN/CalcChannels 只允许本函数在守卫通过后调用。
     Integer RefreshNChannels()
     {
@@ -296,12 +321,17 @@ Defs
         ResetChannels();
         If (DataCount() < 2)
         {
-            WLogE("N/四通道刷新失败 NO Data1 source, DataCount=" + Text(DataCount()) + "（需追加同合约日线图层）");
+            WLogRefreshErr("N/四通道刷新失败 NO Data1 source, DataCount=" + Text(DataCount()) + "（需追加同合约 data1 图层）");
+            Return 0;
+        }
+        If (DailySym() <> Symbol)
+        {
+            WLogRefreshErr("N/四通道刷新失败 data1.Symbol≠data0.Symbol, data1=" + DailySym() + " data0=" + Symbol + "（图层顺序/合约不符，检查图表数据源）");
             Return 0;
         }
         If (win < EntryN Or win < ExitN)
         {
-            WLogE("N/四通道刷新失败 WinSize too small, win=" + Text(win) + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + "（检查 NPeriod/EntryN/ExitN 参数）");
+            WLogRefreshErr("N/四通道刷新失败 WinSize too small, win=" + Text(win) + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + "（检查 NPeriod/EntryN/ExitN 参数）");
             Return 0;
         }
         // 历史深度守卫：根数不足时序列读取返回无效值（官方：数据不足→无效值）。
@@ -311,17 +341,17 @@ Defs
                      (DailyClose(win) != InvalidNumeric And DailyClose(win) > 0);
         If (valid == False)
         {
-            WLogE("N/四通道刷新失败 Daily history too short, win=" + Text(win)
+            WLogRefreshErr("N/四通道刷新失败 Daily history too short, win=" + Text(win)
                 + " Close[1]=" + IIFString(DailyClose(1) != InvalidNumeric, "ok", "invalid")
                 + " Close[win]=" + IIFString(DailyClose(win) != InvalidNumeric, "ok", "invalid")
-                + "（日线历史不足或缺失）");
+                + "（data1 历史不足或缺失）");
             Return 0;
         }
         // 前置守卫已通过 → 窗口内各 bar 有效，交计算函数
         NVal = CalcDailyN(win);
         If (NVal <= 0)   // CalcDailyN 已做 NaN 守卫（参数滥用归 0）；此处保持「失败=全 0 + ERROR」语义，CalcChannels 不执行
         {
-            WLogE("N/四通道刷新失败 CalcDailyN 无效, NVal=" + Text(NVal, 2) + "（检查 NPeriod/NSmooth 参数）");
+            WLogRefreshErr("N/四通道刷新失败 CalcDailyN 无效, NVal=" + Text(NVal, 2) + "（检查 NPeriod/NSmooth 参数）");
             Return 0;
         }
         CalcChannels();
@@ -580,7 +610,8 @@ Defs
 
     // 主力换月检测：比较 MainSymbol() 字符串，变化=换月——留 ROLLOVER 日志，持仓≠0 时重建台账
     // 基准（TB 原生自动换仓把平台均价换到新合约价格口径，策略台账需跟随重建）。
-    // 调用时机：OnBar 每 bar 无条件（不放 ManagePosition 内——空仓时换月日志也要记）。
+    // 调用时机：OnBar 每 bar 无条件（不放 ManagePosition 内——空仓时换月日志也要记；也不放 OnBarOpen——
+    //           重建须紧贴交易判断：bar 中途换月时同一 OnBar 内先重建、后风控，旧口径 StopLine 不漏判）。
     // 盲区：停机期间发生换月时，重启后 MainSymInit 走静默分支不报 ROLLOVER——一致性由
     //       RebuildLedger 的数量守卫兜底，仅缺日志条（增强备选：按换月日历时间兜底检测）。
     // 后置保证：返回后 LastMainSym == 当前 MainSymbol()，同一换月不会重复触发。
@@ -626,7 +657,7 @@ Defs
         Return True;
     }
 
-    // 入场判断：空仓时检查价格是否突破前 EntryN 日极值（唐奇安通道上/下沿；通道每日刷新、当日冻结）。
+    // 入场判断：空仓时检查价格是否突破前 EntryN 根 data1 极值（唐奇安通道上/下沿；随最新完成 data1 K线刷新）。
     // 概念映射：多头触发 = High() ≥ EntryLongLv；空头触发 = Low() ≤ EntryShortLv；评估粒度 = 分钟 bar。
     // 系统1 跳过：S1Skip>0 且 SkipNextBreakout 置位（上次同类突破盈利）→ 本次突破取消并消费该标记。
     // 调用前提：仅由 ManagePosition 空仓分支调用（平台空仓、台账已清后）。
@@ -674,7 +705,7 @@ Defs
     //           先保护后进攻；任一动作完成后立即 Return，本 bar 不再做第二个动作。
     // 概念映射（对齐聚宽）：止损 = 共享 2N 线；出场 = ExitN 反向通道；加仓 = 顺向 AddStepN×N 步进；
     //           入场 = EntryN 唐奇安突破（细节见 TryEntry）。
-    // 调用前提：OnBar 第 3 步且 CanTradeNow() 通过（TradeStartDate 门槛 + N/四通道有效）。
+    // 调用前提：OnBar 第 2 步且 CanTradeNow() 通过（TradeStartDate 门槛 + N/四通道有效）。
     Integer ManagePosition()
     {
         // 空仓分支：先清残留台账（手工平仓/异常后可能残留），再尝试入场
@@ -754,7 +785,7 @@ Events
         BarCnt = 0;
         LastLogYmd = 0;
         LastSkipYmd = 0;
-        CurTD = -1;                    // -1 哨兵：真实交易日恒为正（文档：日期即 Numeric），首 bar 必刷新；防同会话重跑残留
+        LastRefreshErrYmd = 0;         // 刷新失败日志节流状态复位（0=与当年任何日期不等，首条必记）
         MainSymInit = False;
         SkipNextBreakout = False;
         FinalDone = False;
@@ -779,10 +810,12 @@ Events
             }
         }
         WLogInit("===== OnInit 棕榈油海龟 v4.0（TB公式版-双图层）=====");
-        WLogInit("图层: DataCount=" + Text(DataCount()) + " data0=" + Symbol + " MainSymbol=" + MainSymbol());
+        WLogInit("图层: DataCount=" + Text(DataCount()) + " MainSymbol=" + MainSymbol());
+        WLogInit("data0.Symbol=" + Symbol + "(" + Frequency() + ")");
         If (DataCount() >= 2)
         {
-            WLogInit("data1.Symbol=" + DailySym() + "（须与 data0 同合约、周期=日线）");
+            WLogInit("data1.Symbol=" + DailySym() + "(" + DailyFreq() + ")" + "（须与 data0 同合约；标准=日线，或其它周期）");
+            // 仅首屏告警；运行期强制（归 0 拒交易）由 RefreshNChannels 同合约守卫执行
             If (DailySym() <> Symbol)
             {
                 WLogInitE("数据源错位: data1.Symbol=" + DailySym() + " ≠ data0.Symbol=" + Symbol + "（图层顺序/合约不符，检查图表数据源）");
@@ -792,7 +825,8 @@ Events
         {
             WLogInitE("只有 1 个数据源——v4 依赖日线图层：请先在图表右键追加同合约日线（1d）再运行");
         }
-        WLogInit("合约: Symbol=" + Symbol + " ContractUnit=" + Text(ContractUnit()) + " BigPointValue=" + Text(BigPointValue(), 1)
+        WLogInit("合约: Symbol=" + Symbol + " Name=" + SymbolName() + " ContractUnit=" + Text(ContractUnit())
+            + " BigPointValue=" + Text(BigPointValue(), 1)
             + " MinMove=" + Text(MinMove()) + " PriceScale=" + Text(PriceScale(), 2)
             + " MarginRatio=" + Text(MarginRatio(), 3));
         WLogInit("模式: StrategyMode=" + Text(StrategyMode())
@@ -811,6 +845,19 @@ Events
             + " MapToMain=" + IIFString(MapToMain, "True(OrderMap2Main,RolloverOn)", "False(OrderMapOff,RolloverOff)"));
     }
 
+    // 新 bar 生成时驱动一次（正常历史回放与实盘均驱动；参数 indexs=本次新生成的图层数组，本公式不使用）
+    OnBarOpen(ArrayRef<Integer> indexs)
+    {
+        // [红线] 同 OnBar：只放 Range[0:0]——策略体只在 data0（1分钟）上下文执行一次（多图层防双跑）。
+        Range[0:0]
+        {
+            // N/四通道刷新：每根新 bar 一次——实盘形成中 bar 的逐 tick OnBar 驱动不会重复重算。
+            // 刻意不做「仅 data1 新 bar 时」过滤：刷新幂等（值随 data1 头部推进才变）、边界读数最迟下根 bar 自纠。
+            // 失败（无 data1 源/合约错位/历史不足/参数越界）→ 五值归 0 拒交易，下根新 bar 自动重试；日志按交易日节流。
+            RefreshNChannels();
+        }
+    }
+
     OnBar(ArrayRef<Integer> indexs)
     {
         // [红线] 只放 Range[0:0]：策略体只在 data0（1分钟）上下文执行一次。
@@ -826,26 +873,16 @@ Events
                 WLogW("TRADE_GATE 实盘未到 TradeStartDate=" + Text(TradeStartDate) + "，不会产生交易动作");
             }
 
-            // ---- 1. 换日检测：新交易日首根 → 从日线源直读刷新 N 与四通道（当日冻结）----
-            // 换日时刻（夜盘 21:00 或节后首根）Data1[1] = 刚收完的昨日完整日K，其后再不变；
-            // 首 bar 必刷新：OnInit 种 CurTD=-1，首根 TradingDate 恒 ≠ -1（日线预载充足时首日即可用）。
-            TimeStamp td = TradingDate();
-            If (td <> CurTD)
-            {
-                CurTD = td;
-                RefreshNChannels();
-            }
-
-            // ---- 2. 主力移仓检测（原生自动换仓）----
+            // ---- 1. 主力移仓检测（原生自动换仓）----
             UpdateMainSymbol();
 
-            // ---- 3. 风控与信号（历史不足期 levels=0 → CanTradeNow=False，不下单）----
+            // ---- 2. 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）----
             If (CanTradeNow())
             {
                 ManagePosition();
             }
 
-            // ---- 4. 每日定时日志（14:45，同聚宽 signal_time）----
+            // ---- 3. 每日定时日志（14:45，同聚宽 signal_time）----
             If (Hour() == LogHour And Minute() == LogMinute And YMD() <> LastLogYmd)
             {
                 LastLogYmd = YMD();
@@ -868,7 +905,7 @@ Events
                     + " d1=" + d1s + d0seg);
             }
 
-            // ---- 5. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
+            // ---- 4. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
             // 本段主要为回测验收/回归对照而设：不翻全程日志，一行核对三件事——
             //   ① 对账：pos/contracts（平台）vs lots（台账），不等=台账漂移（查 STATE_REBUILD）。
             //   ② 收益：equity 期末权益为主指标；BarCnt=处理的1分钟bar数 → 证明整段跑完。
