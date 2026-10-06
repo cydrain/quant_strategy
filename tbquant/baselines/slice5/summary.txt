@@ -1,0 +1,4 @@
+参数A: FixedDir=1 NPeriod=20 NSmooth=20 EntryN=20 ExitN=10 MaxUnits=4
+参数B: UnitRisk=0.0100 MarginCapPct=0.1000 AddStepN=0.50 StopDistN=2 S1Skip=0
+参数C: TradeStartDate=20240801 InitCapital=1000000 MultiplierP=10 MarginRateP=0.1200 CommissionRateP=0.00002300 SlippageTicks=1
+20241230 0.225900000 | === 运行结束 BarCnt=49607 win=61 DataCount=2 N=210.4 pos=0 contracts=0 lots=0 equity=1113820 d1=9894 ===
