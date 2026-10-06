@@ -1,0 +1,20 @@
+切片5 回归基准 — 05-PTrend 海龟 v4.0 TBQuant（caiyd_check_n_invalid 分支）
+
+来源：tbquant/logs/my_PTrendTurtle_v4_日志_20261006.tbf
+      （2026-10-06 18:29 运行；导出为 logs/tmp_v4_s5new.txt，raw_export.txt 为其快照）
+配置：p2501.DCE 单合约图（1m + 日线双图层）；回测 2024-04-01 ~ 2024-12-30；
+      TradeStartDate=20240801，FixedDir=1，资金 100 万（参数A/B/C 见 summary.txt）
+
+验明正身（与 10-05 10:42 运行逐笔互等）：
+  - 交易 58 条（6 开 3 平 + 49 SKIP）逐笔全等（时间/价格/手数/盈亏），
+    参数与结束行全等（BarCnt=49607 equity=1113820 pos=0 N=210.4 d1=9894）；
+  - equity=1,113,820 与聚宽基准 +116,340 差 Δ−2,520（−0.23%，见 说明.md §4.3）；
+  - DAILY 145 行：144 行逐字全等；唯一差异 = 首行 20240530（旧 N=104 冷启动脏值 vs
+    新 N=129.5，新值与次日 129.6 连续）——已设软豁免，理由见 soft_exempt.txt。
+
+脚注：本源日志由 TB 内较早的编译版产生（头部为合并式，无 ===== 行，未含 data0.Symbol
+      拆分行；守卫未触发、日志无痕）。表头类差异属豁免范围，不影响基准有效性；
+      重新导入当前 .txt 后重跑，应仍与本基准一致。
+
+比对：python tbquant/tools/check_slice.py check <导出.txt> -d tbquant/baselines/slice5
+      通过 exit 0；不一致 exit 1 并列明细；软豁免行值差异仅提示（见 soft_exempt.txt）。

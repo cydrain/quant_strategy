@@ -1,0 +1,58 @@
+20240822 0.133000000 | entry OPEN dir=1 lots=7 price=7812 N=141.6 stop=7528.8 units=1 totalLots=7 equity=1000420
+20240823 0.223100000 | add OPEN dir=1 lots=3 price=7883.3 N=142.6 stop=7598.1 units=2 totalLots=10 equity=1004640
+20240826 0.133000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7954.6
+20240827 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8036
+20240828 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8020
+20240829 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7992
+20240830 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8040
+20240902 0.090200000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7953.2
+20240903 0.100900000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7955.3
+20240904 0.093900000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7957.7
+20240905 0.210500000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7957
+20240906 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7974
+20240909 0.104900000 | exit_breakout CLOSE dir=1 lots=10 price=7798 avg=7833.6 pnl=-3560 units=2 equity=996040
+20240919 0.134500000 | entry OPEN dir=1 lots=6 price=8128 N=152.4 stop=7823.2 units=1 totalLots=6 equity=996160
+20240923 0.090000000 | add OPEN dir=1 lots=4 price=8204.5 N=153.1 stop=7898.4 units=2 totalLots=10 equity=999520
+20240923 0.112200000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8281.1
+20240924 0.090600000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8281.4
+20240925 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8410
+20240926 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8536
+20240927 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8562
+20240930 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8592
+20241008 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8994
+20241009 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8652
+20241010 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8700
+20241011 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8842
+20241014 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8926
+20241015 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8758
+20241016 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8900
+20241017 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8880
+20241018 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8966
+20241021 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8808
+20241022 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8892
+20241023 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9172
+20241024 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9170
+20241025 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9360
+20241028 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9256
+20241029 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9250
+20241030 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9340
+20241031 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9446
+20241101 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9550
+20241104 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9688
+20241105 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9668
+20241106 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9598
+20241107 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9840
+20241108 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=10000
+20241111 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=10230
+20241112 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=10286
+20241113 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=10142
+20241114 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9820
+20241115 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9942
+20241118 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=10076
+20241119 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9860
+20241120 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9964
+20241121 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=9768
+20241121 0.090200000 | exit_breakout CLOSE dir=1 lots=10 price=9698 avg=8159.2 pnl=153880 units=2 equity=1149520
+20241203 0.142700000 | entry OPEN dir=1 lots=5 price=10344 N=224.4 stop=9895.2 units=1 totalLots=5 equity=1148720
+20241203 0.210000000 | add OPEN dir=1 lots=4 price=10458 N=227.7 stop=10002.6 units=2 totalLots=9 equity=1157560
+20241210 0.143100000 | stop CLOSE dir=1 lots=9 price=10002.6 avg=10394.7 pnl=-35284 units=2 equity=1113820

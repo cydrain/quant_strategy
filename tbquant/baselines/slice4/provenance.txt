@@ -1,0 +1,19 @@
+切片4 回归基准 — 05-PTrend 海龟 v4.0 TBQuant（caiyd_check_n_invalid 分支）
+
+来源：tbquant/logs/my_PTrendTurtle_v4_日志_20261006.tbf
+      （2026-10-06 18:19 运行；导出为 logs/tmp_v4_s4_new_1819.txt，raw_export.txt 为其快照）
+配置：p2405.DCE 单合约图（1m + 日线双图层）；回测 2023-10-01 ~ 2024-04-26；
+      TradeStartDate=20240201，FixedDir=1，资金 100 万（参数A/B/C 见 summary.txt）
+
+验明正身（与三份历史运行逐行互等）：
+  - 与 10-05（logs/tmp_v4_s4s6.txt）、10-06 17:00、17:23 两次运行一致：
+    交易 23 条（4 开 2 平 + 17 SKIP）、DAILY 120 行、结束行
+    （BarCnt=41218 equity=1019880 pos=0 N=168.6）全部相同；
+  - equity=1,019,880 与聚宽基准 +20,640 差 Δ−760（−0.07%，见 说明.md §4.3）。
+
+脚注：本源日志由 TB 内较早的编译版产生（表头为合并式，未含 data0.Symbol 拆分行；
+      守卫未触发、日志无痕）。表头类差异属豁免范围，不影响基准有效性；
+      重新导入当前 .txt 后重跑，应仍与本基准一致（即第一次回归验证）。
+
+比对：python tbquant/tools/check_slice.py check <导出.txt> -d tbquant/baselines/slice4
+      通过 exit 0；不一致 exit 1 并列明细（header 行豁免；交易/DAILY/参数/结束行逐字全等）。

@@ -1,0 +1,23 @@
+20240305 0.223800000 | entry OPEN dir=1 lots=8 price=7570 N=118.9 stop=7332.1 units=1 totalLots=8 equity=1000480
+20240306 0.092000000 | add OPEN dir=1 lots=2 price=7629.5 N=118.9 stop=7391.6 units=2 totalLots=10 equity=1004400
+20240306 0.210000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7698
+20240307 0.100200000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7690.2
+20240308 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7720
+20240311 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7798
+20240312 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7830
+20240313 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7876
+20240314 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=7960
+20240315 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8188
+20240318 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8322
+20240319 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8156
+20240320 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8170
+20240321 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8434
+20240322 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8348
+20240325 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8244
+20240326 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8410
+20240327 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8278
+20240328 0.090000000 | OPEN_SKIP 手数不足 reason=add dir=1 price=8130
+20240328 0.210800000 | exit_breakout CLOSE dir=1 lots=10 price=8054 avg=7582 pnl=47200 units=2 equity=1046800
+20240402 0.214200000 | entry OPEN dir=1 lots=6 price=8462 N=155.7 stop=8150.5 units=1 totalLots=6 equity=1046800
+20240403 0.144100000 | add OPEN dir=1 lots=4 price=8539.9 N=155.7 stop=8228.4 units=2 totalLots=10 equity=1050880
+20240408 0.135100000 | stop CLOSE dir=1 lots=10 price=8228.4 avg=8493.2 pnl=-26479 units=2 equity=1019880
