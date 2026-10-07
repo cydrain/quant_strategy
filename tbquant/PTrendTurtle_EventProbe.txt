@@ -1,0 +1,356 @@
+//------------------------------------------------------------------------
+// 公式: PTrendTurtle_EventProbe
+// 类别: 运行时假设验证探针（非交易策略 · 仅用于回测环境；请勿在实盘账户运行——会发出 4 笔真委托）
+// 用途: 验证「历史回测如何驱动各事件函数」——基础事件全量覆盖（OnSignal 除外，见下）:
+//       OnInit / OnReady / OnBarOpen / OnBar / OnBarClose / OnTimer / OnEvent /
+//       OnFill / OnOrder / OnPosition / OnStrategyPosition / OnAccount / OnAccountStatus / OnExit
+// 不含 OnSignal: 官方语义——该事件「接管当前策略单元的所有信号」→ 单独探针
+//       PTrendTurtle_OnSignalProbe.txt（单变量对照）
+//
+// ============ 实测结论（2026/10/07 首跑 · p2405.DCE 1m · 2023-10-09~2024-04-30 · 47080 bar） ============
+// ① 逐bar驱动（回放内同步）: OnBarOpen=47080 · OnBar=47080 · OnBarClose=47079（每bar一次，末根无close）
+// ② 一次性驱动: OnInit=1（启动）· OnReady=1（数据源就绪后、首bar前）· OnExit=1（仅「停止策略单元」时）
+// ③ 回放外驱动（回放期间 0 次）: OnTimer——结束后按 1s 周期（停止前共 384 次）；
+//    OnEvent——发布排队、结束后派发（自订阅 ProbeSelfEvent 链路验证通过）
+// ④ 回测全程 0 次: OnFill / OnOrder / OnPosition / OnStrategyPosition / OnAccount / OnAccountStatus
+//    —— 交易真实执行（mp 0→1→0→-1→0、4 笔 [SEND] ok=1）但账户类回调不来：执行引擎内部记账，不向公式回调
+// ⑤ OnReady 复设保证金/手续费/滑点返回与 OnInit 相同（全 False）→ False 与调用时机无关，是回测环境行为
+//    （解 v4 日志疑点；v4 无需改动）
+// 对策略的含义: 回测内可用时机 = OnInit/OnReady/OnBarOpen/OnBar/OnBarClose（+OnExit 收尾）；
+//    账户类事件与定时器均不可用于回放内逻辑；台账对账不能依赖事件
+// 判读口径（首跑自检）: 心跳≈140行 · [END] 摘要存在 · 4 笔 [SEND] ok=1 —— 本轮全部满足
+// 挂载: 策略研究 → p2405.DCE 1 分钟单图层（账户事件与数据图层无关）→
+//       数据范围 2023-10-01 ~ 2024-04-26（切片4口径）→ K线收盘模型
+// 运行: 4 笔信号委托: Buy@20240201 Sell@20240208 SellShort@20240226 BuyToCover@20240304
+//       自测事件发布: 20240311（PublishEvent("ProbeSelfEvent","所有订阅者")；OnInit 已订阅同名）
+//       定时器: OnInit CreateTimer(1000)
+// 输出: C:/Users/MI/work/quant_strategy/tbquant/logs/<FormulaName>_日志.txt(.tbf)
+//       （本轮 TB 内保存名 my_EventProbe）
+// 导出: python tbquant/tools/read_tbf.py "tbquant/logs/<该文件>.tbf" tbquant/logs/tmp_ep_export.txt
+// 判读: grep "PROBE" 导出.txt —— [BAR]心跳·[SEND]委托·[BAROPEN][BARCLOSE][TIMER][EVENT]样本·
+//       [FILL][ORDER][POSITION][STRATPOS][ACCOUNT][ACCTSTAT] 事件行·[READY][EXIT]·[END]汇总
+// 注意: OnFill/OnOrder 读字段（有据: my_GridTrade 实测 + doc 委托案例）；其余结构体事件
+//       (OnPosition/OnStrategyPosition/OnAccount/OnAccountStatus) 只记标记行不读字段（字段名未取证）→ 二轮补
+//------------------------------------------------------------------------
+Params
+    Integer BuyYmd(20240201);    // 开多触发日（首个 日期>=该值 的 bar）
+    Integer SellYmd(20240208);   // 平多
+    Integer ShortYmd(20240226);  // 开空
+    Integer CoverYmd(20240304);  // 平空
+    Integer PubYmd(20240311);    // 自测事件发布日
+    // OnReady 复设对照（取值同 v4）
+    Numeric MarginRateP(0.12);
+    Numeric CommissionRateP(0.000023);
+    Numeric SlippageTicks(1);
+
+Vars
+    Global Integer BarCnt;
+    Global Integer LastHbYmd;
+    Global Bool DoneBuy;
+    Global Bool DoneSell;
+    Global Bool DoneShort;
+    Global Bool DoneCover;
+    Global Bool DonePub;
+    Global Bool FinalDone;
+    // 各事件触发计数
+    Global Integer BarOpenCnt;
+    Global Integer BarCloseCnt;
+    Global Integer ReadyCnt;
+    Global Integer TimerCnt;
+    Global Integer TimerId;
+    Global Integer EventCnt;
+    Global Integer FillCnt;
+    Global Integer OrderCnt;
+    Global Integer PosCnt;
+    Global Integer StratPosCnt;
+    Global Integer AcctCnt;
+    Global Integer AcctStatCnt;
+    Global Integer ExitCnt;
+    // OnInit/OnReady 设置返回值对照
+    Global String SetRetInit;
+    Global String SetRetReady;
+    Map<String,String> EvtMap;   // 自测事件内容（同一 OnBar 内构造并发布）
+
+Defs
+    String LogPath()
+    {
+        Return "C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt";
+    }
+
+    Integer PL(String s)          // 仅写文件
+    {
+        FileAppend(LogPath(), s, False);
+        Return 0;
+    }
+
+    Integer PLP(String s)         // 关键行：文件 + TB 日志窗口双写
+    {
+        FileAppend(LogPath(), s, False);
+        Print(s);
+        Return 0;
+    }
+
+    Integer YMD()
+    {
+        Return Year() * 10000 + Month() * 100 + Day();
+    }
+
+    // 事件行公共前缀：bar 上下文（事件在 bar 上下文外驱动时值异常/归零 = 诊断信息）
+    String CtxStamp()
+    {
+        Return Text(YMD()) + " " + Text(Time());
+    }
+
+    // 三个账户设置函数调用 + 返回值打包（OnInit/OnReady 共用；调用同 v4 口径）
+    String CallSettings()
+    {
+        Bool okMargin = SetMarginRate(MarginRateP);
+        Bool okComm = SetCommissionRate(Enum_Rate_ByFillAmount(), CommissionRateP);
+        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlippageTicks);
+        Return "SetMarginRate=" + IIFString(okMargin, "True", "False")
+            + " SetCommissionRate=" + IIFString(okComm, "True", "False")
+            + " SetSlippage=" + IIFString(okSlip, "True", "False");
+    }
+
+Events
+    OnInit()
+    {
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt");
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt.tbf");
+        BarCnt = 0;
+        LastHbYmd = 0;
+        DoneBuy = False;
+        DoneSell = False;
+        DoneShort = False;
+        DoneCover = False;
+        DonePub = False;
+        FinalDone = False;
+        BarOpenCnt = 0;
+        BarCloseCnt = 0;
+        ReadyCnt = 0;
+        TimerCnt = 0;
+        EventCnt = 0;
+        FillCnt = 0;
+        OrderCnt = 0;
+        PosCnt = 0;
+        StratPosCnt = 0;
+        AcctCnt = 0;
+        AcctStatCnt = 0;
+        ExitCnt = 0;
+        SetRetInit = "";
+        SetRetReady = "";
+        TimerId = CreateTimer(1000);          // 1 秒定时器（验证 OnTimer 在回测中是否驱动）
+        SubscribeEvent("ProbeSelfEvent");     // 自订阅（配合 20240311 自我发布，验证 OnEvent）
+        SetRetInit = CallSettings();          // 对照 v4：此处返回 False ?
+        PLP("===== OnInit " + DateTimeToString(CurrentDate()) + " EventProbe 启动 =====");
+        PLP("[PROBE][INIT] sys=" + Text(SystemDateTime()) + " timerId=" + Text(TimerId)
+            + " 设置返回(OnInit): " + SetRetInit);
+    }
+
+    // 所有数据源准备完成后驱动（只运行一次）：在此复设三个设置函数做返回对照
+    OnReady()
+    {
+        ReadyCnt = ReadyCnt + 1;
+        SetRetReady = CallSettings();
+        PLP("[PROBE][READY] #" + Text(ReadyCnt) + " sys=" + Text(SystemDateTime())
+            + " 设置返回(OnReady): " + SetRetReady);
+    }
+
+    OnBarOpen(ArrayRef<Integer> indexs)
+    {
+        // [红线] 只放 Range[0:0]：多图层防双跑（账户事件与数据图层无关，计数同式保护）
+        Range[0:0]
+        {
+            BarOpenCnt = BarOpenCnt + 1;
+            If (BarOpenCnt <= 3)
+            {
+                PL(CtxStamp() + " | [PROBE][BAROPEN] #" + Text(BarOpenCnt));
+            }
+        }
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        // [红线] 只放 Range[0:0]：策略体只在 data0（1分钟）上下文执行一次
+        Range[0:0]
+        {
+            Integer ymd = 0;
+            Bool ok = False;
+
+            BarCnt = BarCnt + 1;
+            ymd = YMD();
+
+            // 心跳：每个交易日首根 bar 一行——证明整段跑完 + 平台侧持仓随委托推进
+            If (ymd <> LastHbYmd)
+            {
+                LastHbYmd = ymd;
+                PL(CtxStamp() + " | [PROBE][BAR] bar=" + Text(BarCnt)
+                    + " mp=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts()));
+            }
+
+            // ---- 4 笔信号委托（各一次；ok=委托返回值，False=未执行）----
+            If (ymd >= BuyYmd And DoneBuy == False)
+            {
+                DoneBuy = True;
+                ok = Buy(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] BUY ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1) + " bar=" + Text(BarCnt));
+            }
+            If (ymd >= SellYmd And DoneSell == False)
+            {
+                DoneSell = True;
+                ok = Sell(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] SELL ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1) + " bar=" + Text(BarCnt));
+            }
+            If (ymd >= ShortYmd And DoneShort == False)
+            {
+                DoneShort = True;
+                ok = SellShort(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] SHORT ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1) + " bar=" + Text(BarCnt));
+            }
+            If (ymd >= CoverYmd And DoneCover == False)
+            {
+                DoneCover = True;
+                ok = BuyToCover(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] COVER ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1) + " bar=" + Text(BarCnt));
+            }
+
+            // ---- 自测事件发布（一次）：发布给「所有订阅者」，OnInit 已自订阅同名 ----
+            If (ymd >= PubYmd And DonePub == False)
+            {
+                DonePub = True;
+                EvtMap["k"] = "probe-self";
+                // 不接收返回值：本 TB 版本 PublishEvent 返回类型非 Bool（文档标 Bool，实测版本不符）
+                PublishEvent("ProbeSelfEvent", EvtMap, "所有订阅者");
+                PLP(CtxStamp() + " | [PROBE][PUB] ProbeSelfEvent 已发布");
+            }
+
+            // 结束摘要：末根 bar 一次——全事件触发计数汇总
+            If (BarStatus() == 2 And FinalDone == False)
+            {
+                FinalDone = True;
+                PLP(CtxStamp() + " | [PROBE][END] bar=" + Text(BarCnt)
+                    + " mp=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
+                    + " cnts: baropen=" + Text(BarOpenCnt) + " barclose=" + Text(BarCloseCnt)
+                    + " timer=" + Text(TimerCnt) + " event=" + Text(EventCnt)
+                    + " fill=" + Text(FillCnt) + " order=" + Text(OrderCnt)
+                    + " pos=" + Text(PosCnt) + " stratpos=" + Text(StratPosCnt)
+                    + " account=" + Text(AcctCnt) + " acctstat=" + Text(AcctStatCnt)
+                    + " ready=" + Text(ReadyCnt));
+            }
+        }
+    }
+
+    // 下一根 bar 开始前，当前 bar 最后一次驱动
+    OnBarClose(ArrayRef<Integer> indexs)
+    {
+        Range[0:0]
+        {
+            BarCloseCnt = BarCloseCnt + 1;
+            If (BarCloseCnt <= 3)
+            {
+                PL(CtxStamp() + " | [PROBE][BARCLOSE] #" + Text(BarCloseCnt));
+            }
+        }
+    }
+
+    OnTimer(Integer id, Integer millsecs)
+    {
+        TimerCnt = TimerCnt + 1;
+        If (TimerCnt <= 10)
+        {
+            PL(CtxStamp() + " | [PROBE][TIMER] #" + Text(TimerCnt)
+                + " id=" + Text(id) + " ms=" + Text(millsecs) + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    OnEvent(StringRef name, MapRef<String,String> evtValue)
+    {
+        EventCnt = EventCnt + 1;
+        If (EventCnt <= 10)
+        {
+            PL(CtxStamp() + " | [PROBE][EVENT] #" + Text(EventCnt)
+                + " name=" + name + " k=" + evtValue["k"] + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    // ================= 回报/账户类事件：只记日志，零逻辑影响 =================
+
+    OnFill(FillRef ordFill)
+    {
+        FillCnt = FillCnt + 1;
+        PL(CtxStamp() + " | [PROBE][FILL] #" + Text(FillCnt)
+            + " side=" + IIFString(ordFill.side == Enum_Buy, "Buy", "Sell")
+            + " off=" + IIFString(ordFill.combOffset == Enum_Entry, "Entry", "Exit")
+            + " price=" + Text(ordFill.price, 1) + " fillPrice=" + Text(ordFill.fillPrice, 1)
+            + " sys=" + Text(SystemDateTime()));
+    }
+
+    OnOrder(OrderRef ord)
+    {
+        OrderCnt = OrderCnt + 1;
+        PL(CtxStamp() + " | [PROBE][ORDER] #" + Text(OrderCnt)
+            + " id=" + Text(ord.orderId) + " status=" + Text(ord.status)
+            + " side=" + IIFString(ord.side == Enum_Buy, "Buy", "Sell")
+            + " off=" + IIFString(ord.combOffset == Enum_Entry, "Entry", "Exit")
+            + " vol=" + Text(ord.volume) + " fvol=" + Text(ord.fillVolume)
+            + " px=" + Text(ord.price, 1) + " sys=" + Text(SystemDateTime()));
+    }
+
+    OnPosition(PositionRef pos)
+    {
+        PosCnt = PosCnt + 1;
+        If (PosCnt <= 10)
+        {
+            PL(CtxStamp() + " | [PROBE][POSITION] #" + Text(PosCnt) + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    OnStrategyPosition(PositionRef pos)
+    {
+        StratPosCnt = StratPosCnt + 1;
+        If (StratPosCnt <= 10)
+        {
+            PL(CtxStamp() + " | [PROBE][STRATPOS] #" + Text(StratPosCnt) + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    OnAccount(AccountRef acct)   // 参数名避开结构体名 Account：'account' 会被解析器判为无法识别的字符串
+    {
+        AcctCnt = AcctCnt + 1;
+        If (AcctCnt <= 5)
+        {
+            PL(CtxStamp() + " | [PROBE][ACCOUNT] #" + Text(AcctCnt) + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    OnAccountStatus(AccountStatusRef status)
+    {
+        AcctStatCnt = AcctStatCnt + 1;
+        If (AcctStatCnt <= 5)
+        {
+            PL(CtxStamp() + " | [PROBE][ACCTSTAT] #" + Text(AcctStatCnt) + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    // 策略退出时驱动（回测下触发时机未定——本行本身就是取证）
+    OnExit()
+    {
+        ExitCnt = ExitCnt + 1;
+        PLP("[PROBE][EXIT] #" + Text(ExitCnt) + " sys=" + Text(SystemDateTime())
+            + " cnts: baropen=" + Text(BarOpenCnt) + " barclose=" + Text(BarCloseCnt)
+            + " timer=" + Text(TimerCnt) + " event=" + Text(EventCnt)
+            + " fill=" + Text(FillCnt) + " order=" + Text(OrderCnt) + " pos=" + Text(PosCnt)
+            + " stratpos=" + Text(StratPosCnt) + " account=" + Text(AcctCnt) + " acctstat=" + Text(AcctStatCnt));
+    }
+
+//------------------------------------------------------------------------
+// 版本: EventProbe v3  2026/10/07  基础事件全量覆盖（14 个，OnSignal 见独立探针）· 首跑闭环
+// 实测: 2026/10/07 · p2405.DCE 1m · 47080 bar · 证据 tbquant/logs/tmp_ep_export3.txt
+//       （含停止策略单元后追加的 [EXIT] 行）· 结论已写入头部「实测结论」段
+// 依据: tmp_tbquant_doc.txt（2.1-2.12 事件章节/案例十/案例十三）· 在线帮助（tbq3.tbquant.net）
+// 关联: tbquant/05-PTrend-turtle-v4.0-TB.txt · tbquant/PTrendTurtle_MultiSrc_Probe.txt
+//------------------------------------------------------------------------

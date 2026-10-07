@@ -1,0 +1,138 @@
+//------------------------------------------------------------------------
+// 公式: PTrendTurtle_OnSignalProbe
+// 类别: 运行时假设验证探针（非交易策略 · 仅用于回测环境）
+// 用途: 验证 OnSignal 代理信号事件在历史回测中的行为（是否触发/数组大小/是否影响执行）
+// 依据（在线帮助 · 2026-10 检索）: 「OnSignal-代理信号事件: void OnSignal(ArrayRef<Signal> sig)；
+//       该事件会接管当前策略单元的所有信号，用户要在该事件内处理要不要发单」
+//       —— 定义即可能改变下单行为 → 与 EventProbe 分开运行（单变量对照：本探针 2 笔委托 =
+//       探针 A 前两笔 Buy@20240201 / Sell@20240208）
+//
+// ============ 实测结论（2026/10/07 首跑 · p2405.DCE 1m · 2023-10-09~2024-04-30 · 47080 bar） ============
+// ① 回测驱动: [SIGNAL] #1/#2 各 1 次，与同 bar 的 [SEND] BUY/SELL 同步回调
+// ② 数组大小: n=1（两次都是）——单信号逐个回调，非批量
+// ③ 不抑制执行: 空处理器下 mp 轨迹 0→1→0 与探针 A 基线一致——回测模拟统计不受 OnSignal 影响
+// ④ 调用总数 sigCnt=2 = 信号笔数，无空调用/重复/积压（[END] 完整跑完 bar=47080）
+// 语义佐证（论坛 bbs.tbquant.net + doc）: 「Buy/Sell 用于回测统计，实盘需 A 函数；OnSignal 跨公式
+//     捕捉信号；利用 signal 的 flag 区分历史/实时以过滤回测驱动」· Enum_Signal_History 枚举佐证 →
+//     「接管」的实践含义 = 信号出口：每笔信号在此浮现（回测/实盘均回调），实盘由用户决定是否转
+//     账户委托；回测里模拟执行与统计不变
+// 对 v4 的含义: v4 不定义 OnSignal 是正确选择——回测虽无影响，但定义它会改变实盘下单语义；
+//     未来如做「信号→账户委托」分离，用独立代理公式实现（论坛方案），不动 v4 本体
+// 挂载: 策略研究 → p2405.DCE 1 分钟单图层；数据范围 2023-10-01 ~ 2024-04-26（切片4口径）→ K线收盘模型
+// 输出: C:/Users/MI/work/quant_strategy/tbquant/logs/<FormulaName>_日志.txt(.tbf)
+//       （本轮 TB 内保存名 my_OnSignalProbe）
+// 导出: python tbquant/tools/read_tbf.py "tbquant/logs/<该文件>.tbf" tbquant/logs/tmp_os_export.txt
+// 注意: 不在 OnSignal 内发任何单（只观察）；Signal 结构体字段名未取证，仅记数组元素数
+//------------------------------------------------------------------------
+Params
+    Integer BuyYmd(20240201);    // 开多（同时是 OnSignal 的观察样本）
+    Integer SellYmd(20240208);   // 平多
+
+Vars
+    Global Integer BarCnt;
+    Global Integer LastHbYmd;
+    Global Bool DoneBuy;
+    Global Bool DoneSell;
+    Global Bool FinalDone;
+    Global Integer SigCnt;
+
+Defs
+    String LogPath()
+    {
+        Return "C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt";
+    }
+
+    Integer PL(String s)
+    {
+        FileAppend(LogPath(), s, False);
+        Return 0;
+    }
+
+    Integer PLP(String s)
+    {
+        FileAppend(LogPath(), s, False);
+        Print(s);
+        Return 0;
+    }
+
+    Integer YMD()
+    {
+        Return Year() * 10000 + Month() * 100 + Day();
+    }
+
+    String CtxStamp()
+    {
+        Return Text(YMD()) + " " + Text(Time());
+    }
+
+Events
+    OnInit()
+    {
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt");
+        FileDelete("C:/Users/MI/work/quant_strategy/tbquant/logs/" + FormulaName() + "_日志.txt.tbf");
+        BarCnt = 0;
+        LastHbYmd = 0;
+        DoneBuy = False;
+        DoneSell = False;
+        FinalDone = False;
+        SigCnt = 0;
+        PLP("===== OnInit " + DateTimeToString(CurrentDate()) + " OnSignalProbe 启动 =====");
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[0:0]
+        {
+            Integer ymd = 0;
+            Bool ok = False;
+
+            BarCnt = BarCnt + 1;
+            ymd = YMD();
+
+            // 心跳：每日首根 bar 一行——观察引擎是否仍自动执行（mp 轨迹）
+            If (ymd <> LastHbYmd)
+            {
+                LastHbYmd = ymd;
+                PL(CtxStamp() + " | [PROBE][BAR] bar=" + Text(BarCnt)
+                    + " mp=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts()));
+            }
+
+            // 2 笔信号委托（各一次）——既是观察样本，也是 OnSignal 的"接管对象"
+            If (ymd >= BuyYmd And DoneBuy == False)
+            {
+                DoneBuy = True;
+                ok = Buy(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] BUY ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1));
+            }
+            If (ymd >= SellYmd And DoneSell == False)
+            {
+                DoneSell = True;
+                ok = Sell(1, Close());
+                PLP(CtxStamp() + " | [PROBE][SEND] SELL ok=" + IIFString(ok, "1", "0")
+                    + " px=" + Text(Close(), 1));
+            }
+
+            If (BarStatus() == 2 And FinalDone == False)
+            {
+                FinalDone = True;
+                PLP(CtxStamp() + " | [PROBE][END] bar=" + Text(BarCnt)
+                    + " mp=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
+                    + " sigCnt=" + Text(SigCnt));
+            }
+        }
+    }
+
+    // 代理信号事件：定义即「接管策略单元全部信号」——本探针只观察不处理
+    OnSignal(ArrayRef<Signal> sig)
+    {
+        SigCnt = SigCnt + 1;
+        PL(CtxStamp() + " | [PROBE][SIGNAL] #" + Text(SigCnt)
+            + " n=" + Text(GetArraySize(sig)) + " sys=" + Text(SystemDateTime()));
+    }
+
+//------------------------------------------------------------------------
+// 版本: OnSignalProbe v2  2026/10/07  首跑闭环：回测驱动（每笔1次·n=1）且不抑制执行
+// 实测: 2026/10/07 · p2405.DCE 1m · 证据 tbquant/logs/tmp_os_export.txt · 结论见头部
+// 关联: tbquant/PTrendTurtle_EventProbe.txt（基线对照）· v4.0 事件体系分析
+//------------------------------------------------------------------------
