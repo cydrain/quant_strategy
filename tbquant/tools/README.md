@@ -74,4 +74,4 @@ python tbquant/tools/check_slice.py make <导出.txt> -d tbquant/baselines/slice
 
 - DAILY 首行 = 日线窗口刚满足的"边界日"，取值随图表预热深度/代码版本浮动——已给 slice5 首行设软豁免；新切片若遇同类情况照办（`soft_exempt.txt` + 注释写清理由）。
 - 比对不通过时：先看差异落在哪一类——`trade`/`DAILY` 是硬信号，必须逐条解释到零；`header` 类差异先确认是否属豁免范围。
-- 公式与对拍背景：`tbquant/05-PTrend-turtle-v4.0-TB-说明.md`（§4.3 已实测对拍结果）。
+- 公式与对拍背景：`tbquant/05-PTrend-turtle-v3.1-TB-说明.md`（§4.3 已实测对拍结果）。

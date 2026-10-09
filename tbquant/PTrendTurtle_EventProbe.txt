@@ -15,7 +15,7 @@
 // ④ 回测全程 0 次: OnFill / OnOrder / OnPosition / OnStrategyPosition / OnAccount / OnAccountStatus
 //    —— 交易真实执行（mp 0→1→0→-1→0、4 笔 [SEND] ok=1）但账户类回调不来：执行引擎内部记账，不向公式回调
 // ⑤ OnReady 复设保证金/手续费/滑点返回与 OnInit 相同（全 False）→ False 与调用时机无关，是回测环境行为
-//    （解 v4 日志疑点；v4 无需改动）
+//    （解 v3.1 日志疑点；v3.1 无需改动）
 // 对策略的含义: 回测内可用时机 = OnInit/OnReady/OnBarOpen/OnBar/OnBarClose（+OnExit 收尾）；
 //    账户类事件与定时器均不可用于回放内逻辑；台账对账不能依赖事件
 // 判读口径（首跑自检）: 心跳≈140行 · [END] 摘要存在 · 4 笔 [SEND] ok=1 —— 本轮全部满足
@@ -38,7 +38,7 @@ Params
     Integer ShortYmd(20240226);  // 开空
     Integer CoverYmd(20240304);  // 平空
     Integer PubYmd(20240311);    // 自测事件发布日
-    // OnReady 复设对照（取值同 v4）
+    // OnReady 复设对照（取值同 v3.1）
     Numeric MarginRateP(0.12);
     Numeric CommissionRateP(0.000023);
     Numeric SlippageTicks(1);
@@ -101,7 +101,7 @@ Defs
         Return Text(YMD()) + " " + Text(Time());
     }
 
-    // 三个账户设置函数调用 + 返回值打包（OnInit/OnReady 共用；调用同 v4 口径）
+    // 三个账户设置函数调用 + 返回值打包（OnInit/OnReady 共用；调用同 v3.1 口径）
     String CallSettings()
     {
         Bool okMargin = SetMarginRate(MarginRateP);
@@ -141,7 +141,7 @@ Events
         SetRetReady = "";
         TimerId = CreateTimer(1000);          // 1 秒定时器（验证 OnTimer 在回测中是否驱动）
         SubscribeEvent("ProbeSelfEvent");     // 自订阅（配合 20240311 自我发布，验证 OnEvent）
-        SetRetInit = CallSettings();          // 对照 v4：此处返回 False ?
+        SetRetInit = CallSettings();          // 对照 v3.1：此处返回 False ?
         PLP("===== OnInit " + DateTimeToString(CurrentDate()) + " EventProbe 启动 =====");
         PLP("[PROBE][INIT] sys=" + Text(SystemDateTime()) + " timerId=" + Text(TimerId)
             + " 设置返回(OnInit): " + SetRetInit);
@@ -352,5 +352,5 @@ Events
 // 实测: 2026/10/07 · p2405.DCE 1m · 47080 bar · 证据 tbquant/logs/tmp_ep_export3.txt
 //       （含停止策略单元后追加的 [EXIT] 行）· 结论已写入头部「实测结论」段
 // 依据: tmp_tbquant_doc.txt（2.1-2.12 事件章节/案例十/案例十三）· 在线帮助（tbq3.tbquant.net）
-// 关联: tbquant/05-PTrend-turtle-v4.0-TB.txt · tbquant/PTrendTurtle_MultiSrc_Probe.txt
+// 关联: tbquant/05-PTrend-turtle-v3.1-TB.txt · tbquant/PTrendTurtle_MultiSrc_Probe.txt
 //------------------------------------------------------------------------
