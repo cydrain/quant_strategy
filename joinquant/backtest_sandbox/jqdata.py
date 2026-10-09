@@ -78,6 +78,7 @@ class _DataStore:
         self.daily = {}
         self.minute = {}
         self.labels = set()
+        self._rh_cache = {}   # resampled_hist 缓存：(base, 周期, count, fields, 最后完成桶) -> 已完成聚合结果
         for f in sorted(glob.glob(os.path.join(root, 'daily_*.csv'))):
             base = os.path.basename(f)[len('daily_'):-len('.csv')]
             df = pd.read_csv(f, index_col=0, parse_dates=True)
@@ -122,6 +123,95 @@ class _DataStore:
             return pd.DataFrame()
         # 排除"当日"：日线索引为 00:00，须按日期比较（时间戳比较会把当天也算进来）
         return df[df.index.date < t.date()].tail(count)
+
+    # 会话区间（分钟标签 = bar 结束分钟：09:01..11:30 / 13:31..15:00 / 21:01..23:00）
+    _SESSIONS = ((9 * 60, 11 * 60 + 30), (13 * 60 + 30, 15 * 60), (21 * 60, 23 * 60))
+
+    def _bucket_bend(self, ts, period_min):
+        """分钟 bar 时刻 ts 所属会话桶的结束时刻；ts 不在任何会话返回 None"""
+        tod = ts.hour * 60 + ts.minute
+        for a, b in self._SESSIONS:
+            if a <= tod <= b:
+                bstart = a + (max(tod - a - 1, 0) // period_min) * period_min
+                return ts.normalize() + pd.Timedelta(minutes=min(bstart + period_min, b))
+        return None
+
+    def _last_completed_bend(self, m, i, t, period_min):
+        """t 时刻最后一根已完成桶的结束时刻（由最近一根分钟 bar 标量推导，无则 None）"""
+        tsn = m['ts']
+        last = pd.Timestamp(tsn[i - 1])
+        tod = last.hour * 60 + last.minute
+        seg = next(((a, b) for a, b in self._SESSIONS if a <= tod <= b), None)
+        if seg is None:
+            return None
+        a, b = seg
+        day0 = last.normalize()
+        bstart = a + (max(tod - a - 1, 0) // period_min) * period_min
+        bend = min(bstart + period_min, b)
+        if day0 + pd.Timedelta(minutes=bend) <= t:
+            return day0 + pd.Timedelta(minutes=bend)
+        if bstart > a:                       # 当前桶未完成：上一桶结束 = 当前桶起始
+            return day0 + pd.Timedelta(minutes=bstart)
+        for j in range(i - 2, -1, -1):       # 当前桶是会话段首桶：回溯到上一段末行
+            prev = pd.Timestamp(tsn[j])
+            if prev.normalize() != day0 or prev.hour * 60 + prev.minute < a:
+                return self._bucket_bend(prev, period_min)
+        return None
+
+    def resampled_hist(self, sec, t, count, period_min, fields):
+        """由 1 分钟数据聚合盘中周期 bar（会话锚定分桶；仅返回已完成 bar，索引=bar 起始时刻）
+        同一"最后完成桶"内结果不随 t 前移变化，命中缓存直接返回（缓存帧调用方只读）"""
+        m = self.minute.get(self.base(sec))
+        if m is None:
+            return pd.DataFrame(columns=fields)
+        t = pd.Timestamp(t)
+        i = int(np.searchsorted(m['ts'], np.datetime64(t), side='right'))
+        if i == 0:
+            return pd.DataFrame(columns=fields)
+        lce = self._last_completed_bend(m, i, t, period_min)
+        if lce is None:
+            return pd.DataFrame(columns=fields)
+        key = (self.base(sec), period_min, count, tuple(fields), lce)
+        cached = self._rh_cache.get(key)
+        if cached is not None:
+            return cached
+        need = (count + 2) * period_min + 240
+        sl = self.minute_slice(sec, t, need)
+        if sl is None or len(sl['ts']) == 0:
+            return pd.DataFrame(columns=fields)
+        ts = pd.DatetimeIndex(sl['ts'])
+        tod = ts.hour * 60 + ts.minute
+        s0 = np.full(len(ts), -1)
+        s1 = np.full(len(ts), -1)
+        for a, b in self._SESSIONS:
+            msk = (tod >= a) & (tod <= b)
+            s0[msk] = a
+            s1[msk] = b
+        valid = s0 >= 0
+        if not valid.any():
+            return pd.DataFrame(columns=fields)
+        floor_min = np.maximum(tod - s0 - 1, 0)
+        bstart_tod = s0 + (floor_min // period_min) * period_min
+        bend_tod = np.minimum(bstart_tod + period_min, s1)
+        day0 = ts.normalize()
+        bstart = day0 + pd.to_timedelta(bstart_tod[valid], unit='m')
+        bend = day0[valid] + pd.to_timedelta(bend_tod[valid], unit='m')
+        complete = bend <= t
+        if not complete.any():
+            return pd.DataFrame(columns=fields)
+        df = pd.DataFrame({'open': sl['open'][valid], 'high': sl['high'][valid],
+                           'low': sl['low'][valid], 'close': sl['close'][valid],
+                           'bs': bstart})[complete]
+        agg = df.groupby('bs', sort=True).agg(open=('open', 'first'), high=('high', 'max'),
+                                              low=('low', 'min'), close=('close', 'last'))
+        out = agg[list(fields)].tail(count)
+        # 稀疏期（合约上市初期）不缓存：切片窗口左端截断可能改变 tail 结果；
+        # 另以向量化结果校验标量桶键，不一致则同样不缓存（防御性，正常数据恒相等）
+        if len(agg) > count and bend[complete][-1] == lce:
+            if len(self._rh_cache) >= 256:
+                self._rh_cache.clear()
+            self._rh_cache[key] = out
+        return out
 
 
 _store = None
@@ -246,9 +336,13 @@ class _Portfolio:
 
 def attribute_history(security, count, unit='1d', fields=('open', 'close', 'high', 'low', 'volume', 'money'),
                       skip_paused=True, df=True, fq='pre'):
-    """日线：截至当前日期前一个交易日的最近 count 根（不含当日）"""
+    """日线：截至当前日期前一个交易日的最近 count 根（不含当日）；
+    盘中周期 `Nm`（15m/30m/60m 等，任意分钟数）：由分钟数据聚合，仅含已完成 bar"""
+    if len(unit) > 1 and unit[-1] == 'm' and unit[:-1].isdigit():
+        period_min = int(unit[:-1])
+        return _store.resampled_hist(security, context.current_dt, count, period_min, list(fields))
     if unit != '1d':
-        raise NotImplementedError(f'attribute_history unit={unit} 未实现（策略仅用 1d）')
+        raise NotImplementedError(f'attribute_history unit={unit} 未实现（策略仅用 1d 与 Nm 盘中周期）')
     sub = _store.daily_hist(security, context.current_dt, count)
     return sub[list(fields)].copy()
 

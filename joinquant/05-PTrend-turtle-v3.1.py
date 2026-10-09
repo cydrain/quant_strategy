@@ -1,15 +1,19 @@
 # ============================================================
-# 棕榈油 P 经典海龟策略 v3.0（聚宽回测 · 固定方向版）
+# 棕榈油 P 经典海龟策略 v3.1（聚宽回测 · 单周期版）
+#   指标周期（N、四通道）由 bar_freq 指定：15m/30m/60m 由分钟数据聚合仅用已完成 bar，
+#   1d 走日线口径、不含当日。触发仍为盘中分钟级。
 #   规则（Faith《海龟交易法则》系统 1 口径）：
 #   - N = TR 的平滑均值，经典递归 N=(19*PDN+TR)/20（参数 n_period / n_smooth）
-#   - 入场: 盘中触及"前 entry_n 日最高价"（多头；空头为最低价）→ 市价入场 1 unit
-#   - 出场: 盘中触及"前 exit_n 日反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
+#   - 入场: 盘中触及"前 entry_n 根 bar 最高价"（多头；空头为最低价）→ 市价入场 1 unit
+#   - 出场: 盘中触及"前 exit_n 根 bar 反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
 #   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
 #   - 系统1 跳过规则: 上次突破若盈利，跳过下一次同类突破（s1_skip 开关，默认关闭）
 #   - fixed_dir: 1=只做多 / -1=只做空 / 0=经典双向（跟随突破方向）
 #   工程: 主力移仓 / 夜盘分钟检查 / 停板等待 沿用既有框架
+#   沙盒口径: 盘中周期为会话锚定分桶（日盘 09:00/13:30 起、夜盘 21:00 起；
+#             60m 在 11:00-11:30、14:30-15:00 会形成半根 bar，按实际长度计入）
 # 回测设置: 期货账户 / 100 万 / 分钟频率
 # ============================================================
 from jqdata import *
@@ -21,17 +25,18 @@ PARAMS = {
     'symbol': 'P',                # 品种代码（主力解析/合约前缀）
     'exchange': 'XDCE',           # 交易所后缀（仅基准合约用）
     'fixed_dir': 1,               # 固定方向（分段已知行情）：1=只做多 / -1=只做空 / 0=经典双向
-    'n_period': 20,               # N（ATR）周期
+    'bar_freq': '1d',             # 指标周期：'15m' / '30m' / '60m' / '1d'（N、四通道均按该周期 bar 计算）
+    'n_period': 20,               # N（ATR）周期（单位=bar_freq 根）
     'n_smooth': 20,               # N 的平滑系数（经典 N=(19*PDN+TR)/20）
-    'entry_n': 20,                # 突破入场通道周期（系统1=20 / 系统2=55）
-    'exit_n': 10,                 # 反向突破出场通道周期（系统1=10 / 系统2=20）
+    'entry_n': 20,                # 突破入场通道周期（系统1=20 / 系统2=55，单位=bar_freq 根）
+    'exit_n': 10,                 # 反向突破出场通道周期（系统1=10 / 系统2=20，单位=bar_freq 根）
     'unit_risk': 0.01,            # 1 unit 风险预算（账户权益比例）
     'margin_cap_pct': 0.10,       # 保证金占用上限（当前权益比例；0=不限，每档按剩余额度开满）
     'max_units': 4,               # 最大 unit 数（含首仓）
     'add_step_n': 0.5,            # 顺向每 N×该值 加 1 unit
     'stop_dist_n': 2.0,           # 初始/加仓后止损距离（N 倍数）
     's1_skip': 0,                 # 系统1 跳过规则开关（默认关闭；置 1 = 上次突破盈利则跳过一次同类突破）
-    'signal_time': '14:45',       # 14:45 做主力切换检查与 DAILY 日志（交易本身全天分钟级）
+    'signal_time': '14:45',       # 14:45 做主力切换检查与 LEVELS 日志（交易本身全天分钟级）
     'night_start': '21:00',       # 夜盘任务注册起始时刻（空串 = 无夜盘品种）
     'night_end': '23:00',         # 夜盘任务注册结束时刻
     'multiplier': 10,             # 合约乘数
@@ -125,49 +130,35 @@ def current_minute_bar(ctx, contract):
     return {'high': row['high'], 'low': row['low'], 'close': row['close']}
 
 
-def load_daily(ctx, contract):
-    """日线序列（前若干根完整日线；夜盘时段补一根"当日完整日K"以对齐海龟的昨日通道口径）"""
+def load_bars(ctx, contract):
+    """指标周期 bar 序列（前若干根已完成 bar；盘中周期由分钟数据聚合，不含未完成 bar）"""
     p = g.params
-    need = max(60, p['n_period'] * 3)
-    hist = attribute_history(contract, need + 1, '1d', ['high', 'low', 'close'])
+    need = max(60, p['n_period'] * 3, p['entry_n'], p['exit_n'])
+    hist = attribute_history(contract, need + 1, p['bar_freq'], ['high', 'low', 'close'])
     if hist is None or len(hist) == 0:
         return None
+    return hist
+
+
+def bar_levels(ctx):
+    """每根新 bar 计算并缓存：N、入场/出场通道（口径=截至最近一根已完成 bar）"""
+    p = g.params
+    hist = load_bars(ctx, g.current_contract)
+    if hist is None or len(hist) == 0:
+        return None
+    key = (p['bar_freq'], g.current_contract, hist.index[-1])
+    if getattr(g, 'lv_key', None) == key and g.lv is not None:
+        return g.lv
     highs = list(hist['high'].values)
     lows = list(hist['low'].values)
     closes = list(hist['close'].values)
-    if ctx.current_dt.hour >= 21:      # 夜盘：当日日盘（09:00-15:00）已完整，合成一根追加
-        bars = get_bars(contract, 400, '1m', ['date', 'high', 'low', 'close'], include_now=True)
-        if bars is not None and len(bars):
-            today = ctx.current_dt.date()
-            sh = sl = sc = None
-            for t, h, l, c in zip(bars['date'], bars['high'], bars['low'], bars['close']):
-                ts = pd.Timestamp(t)
-                if ts.date() == today and '09:00' <= ts.strftime('%H:%M') <= '15:00':
-                    sh = h if sh is None else max(sh, h)
-                    sl = l if sl is None else min(sl, l)
-                    sc = c
-            if sh is not None:
-                highs.append(sh); lows.append(sl); closes.append(sc)
-    return highs, lows, closes
-
-
-def daily_levels(ctx):
-    """每日一次计算并缓存：N、入场/出场通道（口径=截至上一完整交易日）"""
-    d = ctx.current_dt.date()
-    if getattr(g, 'lv_date', None) == d and g.lv is not None:
-        return g.lv
-    p = g.params
-    data = load_daily(ctx, g.current_contract)
-    if data is None:
-        return None
-    highs, lows, closes = data
     n_val = calc_n(highs, lows, closes, p['n_period'], p['n_smooth'])
     if n_val is None or n_val <= 0:
         return None
     lv = {'n': n_val,
           'entry_long': max(highs[-p['entry_n']:]), 'entry_short': min(lows[-p['entry_n']:]),
           'exit_long': min(lows[-p['exit_n']:]), 'exit_short': max(highs[-p['exit_n']:])}
-    g.lv_date = d
+    g.lv_key = key
     g.lv = lv
     return lv
 
@@ -263,7 +254,7 @@ def check_state_consistency(ctx):
     log.warn(f"{log_pfx()} STATE_MISMATCH tracked={tracked} actual={actual} -> rebuild from actual")
     g.legs = []
     for (c, side), amt in actual.items():
-        d = daily_levels(ctx)
+        d = bar_levels(ctx)
         n_val = d['n'] if d is not None else 0.0
         price = get_current_data()[c].last_price
         stop_line = price - side_to_dir(side) * g.params['stop_dist_n'] * n_val
@@ -309,7 +300,7 @@ def turtle_minute_checks(ctx, bar, lv):
             if reach:
                 open_unit(ctx, direction, lv['n'], 'add')
         return
-    # 4) 入场：突破前 entry_n 日极值（fixed_dir 限定方向；系统1 跳过规则）
+    # 4) 入场：突破前 entry_n 根 bar 极值（fixed_dir 限定方向；系统1 跳过规则）
     allow_long = p['fixed_dir'] in (0, 1)
     allow_short = p['fixed_dir'] in (0, -1)
     if allow_long and bar['high'] >= lv['entry_long']:
@@ -387,7 +378,7 @@ def retry_migration(ctx):
                    * side_to_dir(m['side']) for leg in g.legs])
         log.info(f"{log_pfx()} MIGRATE close {m['old']} {m['side']} {m['total']}@{o.price:.1f} pnl={pnl:.0f}")
     delta = m['new_price'] - m['old_price']
-    d = daily_levels(ctx)
+    d = bar_levels(ctx)
     n_val = d['n'] if d is not None else (g.legs[0]['n_at_entry'] if g.legs else 0.0)
     direction = side_to_dir(m['side'])
     for leg in g.legs:
@@ -404,14 +395,14 @@ def retry_migration(ctx):
 
 
 def risk_and_signal_routine(ctx):
-    """分钟单入口：一致性校验 → 海龟检查（止损/出场/加仓/入场）→ 14:45 移仓检查与 DAILY"""
+    """分钟单入口：一致性校验 → 海龟检查（止损/出场/加仓/入场）→ 14:45 移仓检查与 LEVELS"""
     try:
         p = g.params
         if g.current_contract is None:
             g.current_contract = get_dominant_future(p['symbol'])
             log.info(f"{log_pfx()} dominant init {g.current_contract}")
         check_state_consistency(ctx)
-        lv = daily_levels(ctx)
+        lv = bar_levels(ctx)
         bar = current_minute_bar(ctx, g.current_contract)
         if lv is not None:
             turtle_minute_checks(ctx, bar, lv)
@@ -422,7 +413,7 @@ def risk_and_signal_routine(ctx):
             return
         check_dominant(ctx)
         if lv is not None:
-            log.info(f"{log_pfx()} DAILY {g.current_contract} N={lv['n']:.1f} "
+            log.info(f"{log_pfx()} LEVELS[{p['bar_freq']}] {g.current_contract} N={lv['n']:.1f} "
                      f"EL={lv['entry_long']:.1f} XL={lv['exit_long']:.1f} "
                      f"ES={lv['entry_short']:.1f} XS={lv['exit_short']:.1f} "
                      f"units={len(g.legs)} stop={(g.stop_line if g.stop_line is not None else 0):.1f}")
@@ -454,7 +445,7 @@ def initialize(ctx):
         g.legs = []
         g.stop_line = None
         g.lv = None
-        g.lv_date = None
+        g.lv_key = None
         g.last_signal_date = None
         g.skip_next_breakout = False
         g.dominant_counter = {'contract': None, 'days': 0}
