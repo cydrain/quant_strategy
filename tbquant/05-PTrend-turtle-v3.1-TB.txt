@@ -1,16 +1,16 @@
 //------------------------------------------------------------------------
-// 简称: PTrendTurtle_v4
-// 名称: 棕榈油海龟趋势策略 v4.0（TBQuant · 双图层：1分钟执行 + 日线数据源）
+// 简称: PTrendTurtle_v31
+// 名称: 棕榈油海龟趋势策略 v3.1（TBQuant · 双图层：1分钟执行 + 日线数据源）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
-// 移植: joinquant/05-PTrend-turtle-v3.0.py（聚宽 · 棕榈油 P）/ tbquant/05-PTrend-turtle-v3.0-TB.txt
+// 移植: joinquant/05-PTrend-turtle-v3.1.py（聚宽 · 棕榈油 P）/ tbquant/05-PTrend-turtle-v3.0-TB.txt
 //------------------------------------------------------------------------
-// 策略说明（v4.0 = v3.0 交易逻辑原样 + 数据来源更换，不并入 v3.1 候选补丁）:
+// 策略说明（v3.1-TB = v3.0-TB 交易逻辑原样 + 数据来源更换为双图层 data1；指标周期由 data1 图层周期决定——日线默认、30 分钟等日内周期实验）:
 //   N 与四通道从 data1 数据源直读；窗口头恒为最新一根已完成 data1 K线，
 //   每根新 bar 生成时在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 驱动不会重复重算）；
 //   交易机制——手数/unit/共享止损/加仓/出场/台账自愈/移仓——与 v3.0 完全相同。
-//   本版 → 全局状态随 OnInit 复位，重跑无需关闭图表（v3 的环数组限制不适用）。
+//   本版 → 全局状态随 OnInit 复位，重跑无需关闭图表（v3.0 的环数组限制不适用）。
 //   日线 data1 下取值与旧版「换日一刷」逐值等价（Data1[1] 日内稳定，探针 M3 实测 43/43）；
 //   30 分钟等日内周期 data1 下每根K收完即推进 → 真 30 分钟海龟口径。
 //
@@ -33,7 +33,7 @@
 //   3) 禁 GetBar（回测返回全 0 Bar）；Data1[1] 恒为最新一根已完成K：日线=昨日（仅换日推进）、
 //      30 分钟等日内周期=上一根已收完K（每根推进）——N/四通道窗口头即取此根。
 //   4) 信号体只放 Range[0:0] 单块：多图层下 Range[0:1] 会把策略体在每个图层上下文各跑一遍
-//      （1分钟上下文 + 日线 look-ahead 上下文）——v3 双图层事故即此，勿复现。
+//      （1分钟上下文 + 日线 look-ahead 上下文）——早期双图层事故即此，勿复现。
 //   5) 代码约定：Data1 仅出现在 Defs「数据源约定」段的 Daily* 访问器内（DailySym/DailyHigh/
 //      DailyLow/DailyClose/DailyClose0Diag），其余代码一律经访问器读写；层序变动只改该段一处。
 //
@@ -45,7 +45,7 @@
 //      EL=XS、ES=XL 全等 + d1=d0diag → 08-02 假突破（-14,500）。
 //   修复=图表数据范围（两图层同步）提前到首个目标信号日前 ≥61 个交易日再跑。
 //   读取确为无效值/0 时守护才生效（记 ERROR 日志、拒绝下单，之后每根新 bar 自动重试；错误日志按交易日节流）。
-//   与 v3 同段日志抽查：两侧窗口都填满后逐日全等（实测 2024-08-27 起 N/EL/XL/ES/XS 完全一致）。
+//   与 v3.0 同段日志抽查：两侧窗口都填满后逐日全等（实测 2024-08-27 起 N/EL/XL/ES/XS 完全一致）。
 //
 //------------------------------------------------------------------------
 Params
@@ -186,7 +186,7 @@ Defs
         Return 0;
     }
 
-    // 窗口根数（对齐聚宽 attribute_history(need+1) 与 v3 环容量）
+    // 窗口根数（对齐聚宽 attribute_history(need+1) 与 v3.0 环容量）
     Integer WinSize()
     {
         Return IntPart(Max(60, NPeriod * 3)) + 1;
@@ -240,7 +240,7 @@ Defs
     // N：经典海龟口径（与聚宽 calc_n 同式）：前 NPeriod 个 TR 均值初始化，
     // 再按 N=((NSmooth-1)*N+TR)/NSmooth 递推到最新。
     // 窗口 Data1[1..win]（base=1）；第 win 根仅作前收盘锚点。
-    // 与 v3 环口径探针实测逐值全等（M3 43/43 MATCH 61@base1）。调用前须通过 RefreshNChannels 守卫。
+    // 与 v3.0 环口径探针实测逐值全等（M3 43/43 MATCH 61@base1）。调用前须通过 RefreshNChannels 守卫。
     Numeric CalcDailyN(Integer win)
     {
         Integer t;
@@ -307,7 +307,7 @@ Defs
     // 调用时机：OnBarOpen（每根新 bar 生成时一次；正常历史回放与实盘均驱动）——实盘 OnBar
     //           会随形成中 bar 逐 tick 重复，故刷新不放 OnBar。值随 data1 窗口头推进更新：
     //           Data1[1]=最新一根已完成 data1 K线，日线仅换日推进（探针 M3 实测 43/43 对齐
-    //           v3 环）——同一根 K 期间与旧版「换日一刷」取值一致；30 分钟等日内周期每根收完即推进。
+    //           v3.0 环）——同一根 K 期间与旧版「换日一刷」取值一致；30 分钟等日内周期每根收完即推进。
     // 数据窗口：data1 图层经 Daily* 访问器按 base=1 取 win=WinSize() 根，第 win 根仅作前收盘锚点。
     // 守卫顺序：① DataCount≥2（有 data1 图层）② data1 与 data0 同合约（错位拒交易，
     //           防拿错合约的 N/通道下单）③ win≥EntryN 且 win≥ExitN（窗口够长）
@@ -809,7 +809,7 @@ Events
                 SetOrderMap2MainSymbol();
             }
         }
-        WLogInit("===== OnInit 棕榈油海龟 v4.0（TB公式版-双图层）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.1（TB公式版-双图层）=====");
         WLogInit("图层: DataCount=" + Text(DataCount()) + " MainSymbol=" + MainSymbol());
         WLogInit("data0.Symbol=" + Symbol + "(" + Frequency() + ")");
         If (DataCount() >= 2)
@@ -823,7 +823,7 @@ Events
         }
         Else
         {
-            WLogInitE("只有 1 个数据源——v4 依赖日线图层：请先在图表右键追加同合约日线（1d）再运行");
+            WLogInitE("只有 1 个数据源——v3.1 依赖日线图层：请先在图表右键追加同合约日线（1d）再运行");
         }
         WLogInit("合约: Symbol=" + Symbol + " Name=" + SymbolName() + " ContractUnit=" + Text(ContractUnit())
             + " BigPointValue=" + Text(BigPointValue(), 1)
@@ -929,7 +929,7 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v4.0-TB  2026/10/04  PTrendTurtle_v4  TBQuant 公式版（双图层）
-// 对应聚宽: joinquant/05-PTrend-turtle-v3.0.py
+// 版本: v3.1-TB  2026/10/09（由 v4.0-TB 更名）  PTrendTurtle_v31  TBQuant 公式版（双图层）
+// 对应聚宽: joinquant/05-PTrend-turtle-v3.1.py
 // 对应前版: tbquant/05-PTrend-turtle-v3.0-TB.txt（单图层 · 1分钟自聚合）
 //------------------------------------------------------------------------
