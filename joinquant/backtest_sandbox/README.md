@@ -18,13 +18,13 @@
 # RU 2020~2026（--strategy / --data 有默认值，可省略）
 python joinquant/backtest_sandbox/runner.py \
     --start 2020-01-01 --end 2026-09-28 \
-    --out joinquant/backtest_sandbox/out_ru.log
+    --out joinquant/logs/out_ru.log
 
 # 棕榈油（P）
 python joinquant/backtest_sandbox/runner.py \
     --data local_data/export_p --tick 2 \
     --param symbol=P --param exchange=XDCE \
-    --out joinquant/backtest_sandbox/out_p.log
+    --out joinquant/logs/out_p.log
 
 # 参数试验（运行时覆盖 PARAMS，策略文件保持零修改）
 python joinquant/backtest_sandbox/runner.py \
@@ -43,7 +43,7 @@ python joinquant/backtest_sandbox/runner.py \
 | `--tick` | `5` | 最小变动价位（RU=5；P=2） |
 | `--multiplier` | `10` | 合约乘数（RU/P 均 10） |
 | `--cash` | `1000000` | 起始资金 |
-| `--out` | 本目录 `out.log` | 输出日志（格式与聚宽导出一致，可直接 diff） |
+| `--out` | `joinquant/logs/out.log` | 输出日志（格式与聚宽导出一致，可直接 diff） |
 | `--param` | — | 运行时覆盖策略 `PARAMS`（`k=v`，可重复） |
 | `--debug` | 关 | 策略日志级别设为 debug |
 
@@ -85,4 +85,4 @@ python joinquant/backtest_sandbox/runner.py \
 - 撮合/滑点为**对账拟合**（非平台源码复刻），最终结论仍以聚宽平台为准；
 - 导出数据在合约上市前/退市后可能含零成交填充 bar——不影响回放
   （引擎按时间窗取数，用不到的 bar 不会被读到）；
-- 本目录 `out*.log` 为运行输出（已 gitignore，可随时重跑生成）。
+- 运行输出统一写入 `joinquant/logs/`（已 gitignore，可随时重跑生成）。

@@ -5,7 +5,7 @@
 
     python joinquant/backtest_sandbox/runner.py \
         --strategy joinquant/04-RubberTrendPullback-v1.0.py \
-        --data local_data/export_ru --start 2020-01-01 --end 2026-09-28 --out out.log
+        --data local_data/export_ru --start 2020-01-01 --end 2026-09-28 --out joinquant/logs/out.log
     # 棕榈油：--data local_data/export_p --tick 2 --param symbol=P --param exchange=XDCE
 
 事件语义（对齐聚宽期货回测）：
@@ -35,7 +35,7 @@ def parse_args():
     ap.add_argument('--cash', type=float, default=1_000_000)
     ap.add_argument('--tick', type=float, default=5.0)
     ap.add_argument('--multiplier', type=float, default=10)
-    ap.add_argument('--out', default=os.path.join(HERE, 'out.log'))
+    ap.add_argument('--out', default=os.path.join(HERE, '..', 'logs', 'out.log'))
     ap.add_argument('--equity-out', default=None, help='每日权益（资金曲线）输出 CSV：date,equity')
     ap.add_argument('--param', action='append', default=[],
                     help='运行时覆盖策略 PARAMS（k=v，可重复；策略文件保持零修改），如 --param symbol=P --param exchange=XDCE')
@@ -60,6 +60,7 @@ def main():
     data_root = os.path.abspath(args.data)
     out_log = os.path.abspath(args.out)
 
+    os.makedirs(os.path.dirname(out_log), exist_ok=True)
     store = jqdata._configure(data_root, out_log, cash=args.cash, tick=args.tick,
                               multiplier=args.multiplier)
     ctx = jqdata.context
