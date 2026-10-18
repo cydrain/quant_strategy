@@ -987,11 +987,44 @@ Defs
         Return 0;
     }
 
+    // data1 失效时的仅止损兜底（只对实盘/模拟启用）：
+    // N/四通道归 0 后 CanTradeNow=False，不能走 ManagePosition
+    // （重建会把 StopLine 推到均价，零通道也会误判出场/加仓）。
+    // 只用最后一次有效 StopLine 保护已有持仓；台账缺失（PLots<=0）时不动作。
+    // 注意：失效期间若恰逢换月，UpdateMainSymbol 的重建会把 StopLine 推到均价（按保本线兜底）。
+    Integer ManageStopOnly()
+    {
+        If (MarketPosition() == 0 Or PLots <= 0 Or StopLine <= 0)
+        {
+            Return 0;
+        }
+        Integer dir = 1;
+        If (MarketPosition() < 0)
+        {
+            dir = -1;
+        }
+        If (dir > 0 And Low() <= StopLine)
+        {
+            WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平多");
+            DoCloseAll(dir, StopLine, "stop");
+            Return 0;
+        }
+        If (dir < 0 And High() >= StopLine)
+        {
+            WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平空");
+            DoCloseAll(dir, StopLine, "stop");
+            Return 0;
+        }
+        Return 0;
+    }
+
 Events
     OnInit()
     {
-        // 日志：回测=清当天文件从头记录；实盘=不删、同日续写（跨天由文件名日期键自动换新文件）
-        If (IsLiveTrade() == False)
+        // 日志：回测=清当天文件从头记录；实盘/模拟=不删、同日续写（跨天由文件名日期键自动换新文件）
+        // 用 StrategyMode 而非 IsLiveTrade：OnInit 时 A_AccountDataExist(0) 可能尚未就绪，
+        // IsLiveTrade 会误判为回测并删掉当日实盘日志。
+        If (StrategyMode() <> Enum_Mode_Strategy_Trade())
         {
             FileDelete(LogPath());
             FileDelete(LogPath() + ".tbf");
@@ -1133,6 +1166,15 @@ Events
                 {
                     ManagePosition();
                 }
+                Else
+                {
+                    // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
+                    // 回测保持原语义，TradeStartDate 之前也不动作。
+                    If (IsLiveTrade() And YMD() >= TradeStartDate)
+                    {
+                        ManageStopOnly();
+                    }
+                }
             }
 
             // ---- 3. 每日定时日志（14:45，同聚宽 signal_time）----
@@ -1164,19 +1206,22 @@ Events
             //   ② 收益：equity 期末权益为主指标；BarCnt=处理的1分钟bar数 → 证明整段跑完。
             //   ③ 体检：DataCount=2（日线图层在）、N 应为合理正值、d1 日线源最新完成收盘。
             // 触发 BarStatus()==2 = 最右末根（0=首根 / 1=中间 / 2=末根）：回测=整段最后一根，只此一次。
-            // 实盘仅为副产品：实时 bar 天然最右 → 挂载后首根也命中一次，打的只是初始快照，非本段目的。
-            If (BarStatus() == 2 And FinalDone == False)
+            // 只在回测输出：实盘/模拟的最新 bar 天然最右，挂载后首根会命中并把初始快照误标成"运行结束"。
+            If (StrategyMode() <> Enum_Mode_Strategy_Trade())
             {
-                FinalDone = True;          // 幂等守卫：只打一次，实盘最右 bar 反复触发不刷屏；OnInit 复位
-                // 与 DAILY 同守卫：无日线图层时不碰 Data1（访问非法）→ d1e 保持空、字段自然省略
-                String d1e = "";
-                If (DataCount() >= 2)
+                If (BarStatus() == 2 And FinalDone == False)
                 {
-                    d1e = " d1=" + Text(DailyClose(1), 1);
+                    FinalDone = True;          // 幂等守卫：只打一次，OnInit 复位
+                    // 与 DAILY 同守卫：无日线图层时不碰 Data1（访问非法）→ d1e 保持空、字段自然省略
+                    String d1e = "";
+                    If (DataCount() >= 2)
+                    {
+                        d1e = " d1=" + Text(DailyClose(1), 1);
+                    }
+                    WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " win=" + Text(WinSize()) + " DataCount=" + Text(DataCount())
+                        + " N=" + Text(NVal, 1) + " pos=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
+                        + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
                 }
-                WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " win=" + Text(WinSize()) + " DataCount=" + Text(DataCount())
-                    + " N=" + Text(NVal, 1) + " pos=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
-                    + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
             }
         }
     }
