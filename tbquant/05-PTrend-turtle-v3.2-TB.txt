@@ -6,61 +6,42 @@
 // 输出: Void
 // 移植: joinquant/05-PTrend-turtle-v3.2.py（聚宽 · 棕榈油 P STALL 版）/ tbquant/05-PTrend-turtle-v3.1-TB.txt
 //------------------------------------------------------------------------
-// 策略说明（v3.2-TB = v3.1-TB 交易逻辑原样 + 新增 STALL 极值停滞并行入场；指标/停滞周期均由 data1 图层周期决定——日线默认、30 分钟等日内周期实验）:
-//   N 与四通道从 data1 数据源直读；窗口头恒为最新一根已完成 data1 K线，
-//   每根新 bar 生成时在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 驱动不会重复重算）；
-//   交易机制——手数/unit/共享止损/加仓/出场/台账自愈/移仓——与 v3.1 完全相同。
-//   本版 → 全局状态随 OnInit 复位，重跑无需关闭图表。
-//   日线 data1 下取值与旧版「换日一刷」逐值等价（Data1[1] 日内稳定，探针 M3 实测 43/43）；
-//   30 分钟等日内周期 data1 下每根K收完即推进 → 真 30 分钟海龟口径。
+// v3.2 = v3.1 海龟逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样 + STALL 并行入场。
+// 指标与 STALL 口径 = data1 图层周期（默认日线；30m 等日内周期为实验口径，收完即推进，
+// 且 Data1[0]/[1] 盘中对齐未复验、与聚宽不可比）。窗口头恒为最新一根已完成 data1 K线，
+// 每根新 bar 在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 不重算）；全局状态随 OnInit 复位。
 //
-// STALL 并行入场（v3.2 新增，StallPeriod>0 启用；口径 = data1 图层周期，默认日线）:
-//   - 事件：某根 data1 bar 的 Low 刷新此前 StallPeriod 根最低 = 多头事件；High 刷新此前
-//     StallPeriod 根最高 = 空头事件（严格不等）。
-//   - 计数：最新完成 bar 距最近一次事件的 bar 数（事件当根=0；窗口 2*StallPeriod+5 根内
-//     无事件 = 不可触发）。
-//   - 触发：新 data1 bar 边沿（Data1[1] 的 OHLC 签名变化后的首根 1 分钟 bar）上计数恰等于
-//     StallPeriod，空仓且 FixedDir 允许 → 市价开 1 unit（reason=entry_stall），与突破入场并行、
-//     先达成者先入场；多空同时达成时长优先。
-//   - 边沿每根 data1 bar 只评判一次；首次评判仅建立基线（启动/重启前已达成的不补触发）；
-//     持仓中达成 = 错过。与聚宽 v3.2 的差异：聚宽按属性历史日线可见性在次日 09:01 见新日线，
-//     TB 在 data1 推进后的首根 1m 触发（1d 通常为夜盘 21:01），因此触发价/时点不同。
-//   - 窗口上限：2*StallPeriod+5 必须 ≤ WinSize()（默认 61 → StallPeriod 最大 28），否则
-//     OnInit 自动停用 STALL 并记 ERROR。
+// STALL 并行入场（StallPeriod>0 启用，0=关闭）:
+//   事件：某根 data1 bar 创此前 StallPeriod 根新低（多）/新高（空），严格不等；
+//   触发：data1 推进后的首根 1m 上，最新完成 bar 距最近事件恰 StallPeriod 根 → 市价开 1 unit
+//   （空仓且 FixedDir 允许；与突破并行、先达成先入场；多空同达成多优先）；
+//   边沿每根 data1 bar 只评判一次，首次仅建基线；持仓/挂单/预热期达成 = 错过不补。
+//   与聚宽差异：聚宽次日 09:01 见新日线，TB 在 data1 推进首根 1m 触发（1d 通常夜盘 21:01），价格/时点不同。
+//   窗口上限 2*StallPeriod+5 ≤ WinSize()（默认 61 → 最大 28），超限 OnInit 停用 STALL 并记 ERROR。
 //
-// 挂载（两图层，缺一不可；运行模式「K线收盘模型」）:
-//   data0 = 1 分钟（主商品，如 P2505 / P9888）—— 全部信号/风控/下单在此层执行
-//   data1 = 同合约 日线 —— 纯只读数据源（挂图才暴露 Data1.*，不触发任何执行；代码内 Data1 仅出现在 Defs「数据源约定」段）
-//     也支持 30 分钟等日内周期（实验）：N/四通道与 STALL 计数均随该周期推进（真 30 分钟海龟）；
-//     注意 30 分钟口径下 Data1[0]/[1] 盘中对齐尚未经探针验证（日线已 43/43），上实盘前先复验；
-//     STALL 在 30m 口径下与聚宽 v3.2（固定日线）不可比。
-//   追加方法：策略研究中选中策略单元 → 右键数据源 → 周期选 1d → 追加；
-//   两图层都右键「同步为主商品数据范围」，避免回测起止错位。
-//   单合约切片图 MapToMain=False —— 数据源保持「不复权」（公式不下发复权标志）；
-//   主连图（P9888）MapToMain=True —— 公式开启后复权/映射真实价/自动换仓/委托映射主力（实盘口径）。
+// 挂载（两图层缺一不可；运行模式「K线收盘模型」）:
+//   data0 = 1 分钟：全部信号/风控/下单；data1 = 同合约日线：纯只读指标源。
+//   追加：策略单元右键数据源 → 周期 1d → 追加；两图层都「同步为主商品数据范围」。
+//   MapToMain=True（默认，模拟/实盘安全口径）：主连图，后复权/映射真实价/自动换仓/委托映射主力；
+//   单合约切片回测必须改 False（不复权、不映射，否则委托映射到当前主力）。
+//   模拟/实盘校验：data0=data1=MainContSymbol（默认 p9888.DCE，区分大小写与后缀）且 MapToMain=True，
+//   否则禁开新仓；OnInit 时 data1 未就绪 → 首个齐备 bar 复核一次（MAPPING_RECHECK）。回测不校验合约。
+//   挂单门禁（模拟/实盘）：OnOrder 维护未完成委托集合（Declare/Declared/FillPart/Canceling），
+//   非空时拒发任何新委托（开/平/加/损；STALL 边沿遇挂单则放弃本次边沿）；只拦不撤；回测门禁不生效。
 //
-// 读法红线（PTrendTurtle_MultiSrc_Probe 实测 43/43 锁定，改代码勿破）:
-//   1) N 窗口   = Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点（TR 用 Close[idx+1]）；
+// 读法红线（MultiSrc 探针实测 43/43 锁定，改代码勿破）:
+//   1) N 窗口 = Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点（TR 用 Close[idx+1]）；
 //      入场通道 = Data1.High/Low[1..EntryN]；出场通道 = Data1.High/Low[1..ExitN]。
-//   2) 信号/风控/下单只读 Data1[1] 及更早。Data1[0] 是禁区：
-//      回测=当天完整日K（look-ahead）、实盘/模拟=形成中（逐 tick 变），两边口径不一致；
-//      仅 DAILY 日志在 DEBUG 级保留一行 d0diag 诊断输出（D0 禁区唯一出口 DailyClose0Diag），禁入任何判断。
-//   3) 禁 GetBar（回测返回全 0 Bar）；Data1[1] 恒为最新一根已完成K：日线=昨日（仅换日推进）、
-//      30 分钟等日内周期=上一根已收完K（每根推进）——N/四通道窗口头即取此根。
-//   4) 信号体只放 Range[0:0] 单块：多图层下 Range[0:1] 会把策略体在每个图层上下文各跑一遍
-//      （1分钟上下文 + 日线 look-ahead 上下文）——早期双图层事故即此，勿复现。
-//   5) 代码约定：Data1 仅出现在 Defs「数据源约定」段的 Daily* 访问器内（DailySym/DailyOpen/
-//      DailyHigh/DailyLow/DailyClose/DailyClose0Diag），其余代码一律经访问器读写；层序变动只改该段一处。
+//   2) 信号/风控/下单只读 Data1[1] 及更早。Data1[0] 是禁区（回测=当天完整K=look-ahead，
+//      实盘=形成中逐 tick 变）；仅 DAILY 日志 DEBUG 级 d0diag（DailyClose0Diag）例外，禁入判断。
+//   3) 禁 GetBar（回测返回全 0 Bar）；Data1[1] 恒为最新完成K（日线=昨日；30m=上一根）。
+//   4) 信号体只放 Range[0:0] 单块——Range[0:1] 会每图层各跑一遍（早期双图层事故即此，勿复现）。
+//   5) Data1 仅出现在 Defs「数据源约定」段访问器内，其余代码一律经访问器；层序变动只改该段一处。
 //
-// 预热与历史深度【切片5 事故点】: 日线源在首个目标信号日前必须已有 ≥WinSize+1 根日线！
-//   WinSize=61（≈3 个月交易日）是硬要求，短 1 根都不行（06-01 起图实测：08-01 只有 ~42 根）：
-//   a) 部分不足 → 窗口头部越界读数仍是"有效值"（非 InvalidNumeric）→ 守护不拦截、N 静默偏高
-//      （08-01 N=165.6 vs 正确 148.8；08-22 N=144.6 vs 141.8 → 8月手数偏少）；
-//   b) 严重不足（图表从 TradeStartDate 当天才开始）→ 窗口退化为 1 根K：
-//      EL=XS、ES=XL 全等 + d1=d0diag → 08-02 假突破（-14,500）。
-//   修复=图表数据范围（两图层同步）提前到首个目标信号日前 ≥61 个交易日再跑。
-//   读取确为无效值/0 时守护才生效（记 ERROR 日志、拒绝下单，之后每根新 bar 自动重试；错误日志按交易日节流）。
-//   与 v3.0 同段日志抽查：两侧窗口都填满后逐日全等（实测 2024-08-27 起 N/EL/XL/ES/XS 完全一致）。
+// 预热与历史深度【切片5 事故点】：data1 在首个目标信号日前须已有 ≥61 根日线（WinSize=61，≈3 个月），
+//   短 1 根都不行——不足时窗口头部越界读数仍是"有效值"，守护不拦截 → N 静默偏高甚至假突破。
+//   修复：两图层数据范围同步提前到首个目标信号日前 ≥61 个交易日再跑。
+//   读取确为无效值/0 时守护才生效（ERROR、拒下单、每根新 bar 重试；日志按交易日节流）。
 //
 //------------------------------------------------------------------------
 Params
@@ -83,8 +64,9 @@ Params
     Numeric MultiplierP(10);      // 合约乘数（元/点/手，P=10）
     Numeric MarginRateP(0.12);    // 保证金率
     Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
-    Numeric SlippageTicks(1);     // 滑点（跳；P 一跳=2 元/吨）
-    Bool MapToMain(False);        // False=单合约切片图（不复权、不映射）；True=主连图/实盘（换月全套+委托映射主力）
+    Numeric SlipTicks(1);         // 回测撮合滑点（跳；P 一跳=2 元/吨）；模拟/实盘实际滑点由盘口/柜台成交决定
+    Bool MapToMain(True);         // True=主连图/模拟/实盘（换月全套+委托映射主力）；False=单合约切片图（不复权、不映射）
+    String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（须与日志 data0.Symbol 完全一致，区分大小写）
     // ---- 日志 ----
     Integer LogLevel(2);          // 日志级别阈值：消息级别≤本值才写出（0=仅ERROR 1=+WARNING 2=+INFO正常 3=+DEBUG调试）
     Bool PrintToUI(True);         // 界面镜像：True=同步 Print 到 TB 日志窗口（与文件同阈值过滤）；长回测/批量优化嫌刷屏置 False
@@ -126,14 +108,24 @@ Vars
     Global Integer LastSkipYmd;   // OPEN_SKIP 日志节流：当日已记过即静默（拒因当日不解除）
     Global Integer LastRefreshErrYmd; // N/四通道失败日志节流：失败态每根新 bar 重试下同交易日只记首条（不去重会刷屏）
     Global Bool FinalDone;
+    // ---- 回报事件（OnOrder 维护挂单门禁；OnFill 仅日志）----
+    Global Integer FillCnt;
+    Global Integer OrderCnt;
+    // ---- 模拟/实盘挂图合法性（OnInit：data0/data1 同一主连 + MapToMain=True；回测不校验）----
+    Global Bool MappingOk;
+    Global Bool MappingRecheck;   // OnInit 判定失败时置位：首个 data1 就绪的 bar 复核一次（防 data1 晚挂载误锁）
+    // ---- 挂单门禁（模拟/实盘：OnOrder 维护；回测不触发事件，集合恒空）----
+    Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（Declare/Declared/FillPart/Canceling）
+    Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
 
 Defs
     // ---------- 基础辅助 ----------
 
-    // 日志路径：LogDir（可空=平台运行目录）+ 公式名 + 平台当前日期（实盘按物理日分文件；回测整次运行同一文件）
+    // 日志路径：LogDir（可空=平台运行目录）+ 公式名 + data0 合约 + 平台当前日期
+    // （实盘按物理日分文件；回测整次运行同一文件；P/RU 多实例同目录也不混）
     String LogPath()
     {
-        Return LogDir + FormulaName() + "_日志_" + Text(CurrentDate());
+        Return LogDir + FormulaName() + "_" + Symbol + "_日志_" + Text(CurrentDate());
     }
 
     // 时间戳：WLog*（bar 上下文）用 bar 日期时间；OnInit 阶段无 bar 时间 → 只能用 WLogInit*，取平台当前时间
@@ -194,6 +186,12 @@ Defs
     Integer WLogInit(String s)
     {
         Return WLogCore(2, "[Info]", InitStamp(), s);
+    }
+
+    // 回报事件日志：事件在 bar 上下文外驱动，时间戳取平台时钟（Date()/Time() 可能为旧值）
+    Integer WLogEvt(String s)
+    {
+        Return WLogCore(2, "[Event]", DateTimeToString(SystemDateTime()), s);
     }
 
     Integer YMD()
@@ -480,12 +478,94 @@ Defs
         Return refPrice;   // 无跳空：按触发价
     }
 
+    // ---------- 挂单门禁（模拟/实盘）----------
+    // OnOrder 是唯一能拿到未完成委托的回报入口（A_SendOrderEx 可直取 orderId，本策略用
+    // Buy/SellShort 只能靠事件）。活跃状态入集合，其余状态（含未知）一律视为终态移除，
+    // 避免状态枚举扩展时出现永不解除的死锁。回测不触发事件 → 集合恒空。
+    Bool OrderIsPending(Integer st)
+    {
+        Return (st == Enum_Declare || st == Enum_Declared || st == Enum_FillPart || st == Enum_Canceling);
+    }
+
+    Integer PendingIndex(Integer oid)
+    {
+        Integer n = GetArraySize(PendingIds);
+        Integer i;
+        For i = 0 To n - 1
+        {
+            If (IntPart(PendingIds[i]) == oid)
+            {
+                Return i;
+            }
+        }
+        Return -1;
+    }
+
+    Integer PendingAdd(Integer oid)
+    {
+        If (PendingIndex(oid) < 0)
+        {
+            ArrayPushBack(PendingIds, oid);
+        }
+        Return 0;
+    }
+
+    Integer PendingRemove(Integer oid)
+    {
+        Integer idx = PendingIndex(oid);
+        If (idx >= 0)
+        {
+            ArrayErase(PendingIds, idx, 1);
+        }
+        Return 0;
+    }
+
+    Integer PendingClear()
+    {
+        Integer n = GetArraySize(PendingIds);
+        Integer i;
+        For i = 1 To n
+        {
+            ArrayErase(PendingIds, 0, 1);
+        }
+        Return 0;
+    }
+
+    String PendingStr()
+    {
+        String s = "";
+        Integer n = GetArraySize(PendingIds);
+        Integer i;
+        For i = 0 To n - 1
+        {
+            If (s <> "")
+            {
+                s = s + ",";
+            }
+            s = s + Text(IntPart(PendingIds[i]));
+        }
+        Return s;
+    }
+
     // 发送委托：开仓/平仓共用入口；失败记 FAIL 日志并返回 False（调用方放弃本次动作）。
     // orderDir = 委托方向（+1 买 / -1 卖）；isClose=True 平仓（卖平/买平），False 开仓（买开/卖开）。
     // 日志中 dir= 恒为委托方向（平仓被拒时与持仓方向符号相反，便于对照委托本身）。
     // 注意：分发必须用 If 块——IIF 两侧都会求值，会把两种指令都发出去。
     Bool DoSendOrder(Integer orderDir, Integer lots, Numeric price, Bool isClose, String reason)
     {
+        // 挂单门禁：存在未完成委托 → 一律不发新单（开/平/加/损同规则；回测集合恒空）
+        If (GetArraySize(PendingIds) > 0)
+        {
+            If (LastGateYmd <> YMD())
+            {
+                LastGateYmd = YMD();
+                WLogW("ORDER_GATE 未完成委托=" + Text(GetArraySize(PendingIds))
+                    + " ids=" + PendingStr() + "，禁发新单 reason=" + reason
+                    + " dir=" + Text(orderDir) + " lots=" + Text(lots)
+                    + " close=" + IIFString(isClose, "True", "False"));
+            }
+            Return False;
+        }
         Bool ok = False;
         If (isClose)
         {
@@ -691,8 +771,47 @@ Defs
 
     // ---------- 信号逻辑 ----------
 
+    // OnInit 时 data1 可能尚未就绪 → MappingOk 误锁。首个 data1 齐备的 bar 复核一次：
+    // 数据层就绪后仍不符（合约错位/非主连/MapToMain=False）则保持锁定并记 ERROR（静态配置，不会运行中变化）。
+    Integer RecheckMapping()
+    {
+        If (MappingRecheck == False)
+        {
+            Return 0;
+        }
+        If (StrategyMode() <> Enum_Mode_Strategy_Trade())
+        {
+            MappingRecheck = False;
+            Return 0;
+        }
+        If (DataCount() < 2)
+        {
+            Return 0;   // data1 尚未挂载/就绪，下一 bar 再试
+        }
+        MappingRecheck = False;
+        Bool isMainCont = (Symbol == MainContSymbol);
+        Bool layerOk = (DailySym() == Symbol);
+        If (isMainCont And layerOk And MapToMain)
+        {
+            MappingOk = True;
+            WLog("MAPPING_RECHECK ok=True data0=" + Symbol + " data1=" + DailySym()
+                + "（OnInit 时 data1 未就绪，已解锁开仓）");
+        }
+        Else
+        {
+            WLogE("MAPPING_RECHECK ok=False data0=" + Symbol + " data1=" + DailySym()
+                + " mainC=" + MainContSymbol + " MapToMain=" + IIFString(MapToMain, "True", "False"));
+        }
+        Return 0;
+    }
+
     Bool CanTradeNow()
     {
+        // 模拟/实盘挂图不合法（非主连/两图层不一致/MapToMain=False）→ 禁止开新仓
+        If (MappingOk == False)
+        {
+            Return False;
+        }
         If (YMD() < TradeStartDate)
         {
             Return False;
@@ -900,6 +1019,12 @@ Defs
             WLog("STALL_MISS side=" + sideTxt + " reason=holding stall=" + Text(StallPeriod));
             Return False;
         }
+        // 已有未完成委托（开/平/加/损）→ 本边沿放弃，不补触发；避免先记 STALL_FIRE 再被门禁拦
+        If (GetArraySize(PendingIds) > 0)
+        {
+            WLog("STALL_MISS side=" + sideTxt + " reason=pending ids=" + PendingStr());
+            Return False;
+        }
         // 平台空仓但台账残留：先清再开（与 ManagePosition 空仓分支同口径）
         If (PLots <> 0 Or UnitCount <> 0)
         {
@@ -989,9 +1114,9 @@ Defs
 
     // data1 失效时的仅止损兜底（只对实盘/模拟启用）：
     // N/四通道归 0 后 CanTradeNow=False，不能走 ManagePosition
-    // （重建会把 StopLine 推到均价，零通道也会误判出场/加仓）。
+    // （重建会把 StopLine 推到末次入场价（NVal=0 按保本线兜底），零通道也会误判出场/加仓）。
     // 只用最后一次有效 StopLine 保护已有持仓；台账缺失（PLots<=0）时不动作。
-    // 注意：失效期间若恰逢换月，UpdateMainSymbol 的重建会把 StopLine 推到均价（按保本线兜底）。
+    // 注意：失效期间若恰逢换月，UpdateMainSymbol 的重建会把 StopLine 推到末次入场价（NVal=0 → 按保本线兜底）。
     Integer ManageStopOnly()
     {
         If (MarketPosition() == 0 Or PLots <= 0 Or StopLine <= 0)
@@ -1046,12 +1171,18 @@ Events
         StallShortCnt = -1;
         StallRefSym = "";
         FinalDone = False;
+        FillCnt = 0;
+        OrderCnt = 0;
+        LastGateYmd = 0;
+        PendingClear();                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
+        MappingOk = False;
+        MappingRecheck = False;
         ResetChannels();
         ResetLedger();
         SetInitCapital(InitCapital);
         Bool okMargin = SetMarginRate(MarginRateP);
         Bool okComm = SetCommissionRate(Enum_Rate_ByFillAmount(), CommissionRateP);
-        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlippageTicks);
+        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlipTicks);
         SetConsecEntries(-1);          // 平台不限建仓次数，加仓由 UnitCount<MaxUnits 控制
         // STALL 参数校验：2*StallPeriod+5 必须在 WinSize 预算内（不扩展 WinSize，避免改变 N 递归窗口）
         If (StallPeriod > 0)
@@ -1066,11 +1197,40 @@ Events
                 StallEnabled = True;
             }
         }
+        // 模拟/实盘校验：data0 与 data1 必须是同一主连合约（MainContSymbol），且 MapToMain=True；回测不校验。
+        // TB 公式无法直接查询"图表是否主连"，以 Symbol 与主连代码参数精确匹配判定。
+        // 不满足 → CanTradeNow 恒 False（不开新仓）；映射/换月只按 data0 是否主连 + MapToMain 下发。
+        // 判定必须先于下方 Range 内的换月/映射设置。
+        Bool isMainCont = False;
+        Bool layerOk = False;
+        MappingOk = True;
+        If (StrategyMode() == Enum_Mode_Strategy_Trade())
+        {
+            MappingOk = False;
+            isMainCont = (Symbol == MainContSymbol);
+            If (DataCount() >= 2)
+            {
+                If (DailySym() == Symbol)
+                {
+                    layerOk = True;
+                }
+            }
+            If (isMainCont And layerOk And MapToMain)
+            {
+                MappingOk = True;
+            }
+            // data1 可能晚于 OnInit 就绪 → 首个数据齐备的 bar 复核一次（仅解锁，不重设映射标志）
+            If (MappingOk == False)
+            {
+                MappingRecheck = True;
+            }
+        }
         // 换月全套（后复权/映射真实价/自动换仓/委托映射主力）只在主连图/实盘（MapToMain=True）开启；
         // 单合约切片图保持不复权（原始价口径）——与切片5 假突破无因果（真因=图表范围缺历史，见文件头「预热与历史深度」）
+        // 判定只依赖 data0 是否主连（Symbol 静态已知），不依赖 data1 就绪：data1 仅是只读指标源。
         Range[0:DataCount-1]
         {
-            If (MapToMain)
+            If (MapToMain And (StrategyMode() <> Enum_Mode_Strategy_Trade() Or isMainCont))
             {
                 AddDataFlag(Enum_Data_RolloverBackWard());
                 AddDataFlag(Enum_Data_RolloverRealPrice());
@@ -1099,9 +1259,45 @@ Events
             + " BigPointValue=" + Text(BigPointValue(), 1)
             + " MinMove=" + Text(MinMove()) + " PriceScale=" + Text(PriceScale(), 2)
             + " MarginRatio=" + Text(MarginRatio(), 3));
+        If (StrategyMode() == Enum_Mode_Strategy_Trade())
+        {
+            WLogInit("MAPPING: data0=" + Symbol + " layers=" + Text(DataCount())
+                + " data1Same=" + IIFString(layerOk, "True", "False")
+                + " isMainCont=" + IIFString(isMainCont, "True", "False")
+                + " MapToMain=" + IIFString(MapToMain, "True", "False")
+                + " mainC=" + MainContSymbol
+                + " ok=" + IIFString(MappingOk, "True", "False"));
+            If (MappingOk == False)
+            {
+                If (isMainCont == False)
+                {
+                    WLogInitE("MAP_FAIL data0.Symbol=" + Symbol + " 不是主连合约（期望 " + MainContSymbol + "）；模拟/实盘要求 data0/data1 均为同一主连，MapToMain=True");
+                }
+                If (layerOk == False)
+                {
+                    If (DataCount() >= 2)
+                    {
+                        WLogInitE("MAP_FAIL data1 与 data0 不一致（data0=" + Symbol + "，data1=" + DailySym() + "）；模拟/实盘要求两图层同一主连合约");
+                    }
+                    Else
+                    {
+                        WLogInitE("MAP_FAIL data1 图层缺失；模拟/实盘要求 data0/data1 均为同一主连合约");
+                    }
+                }
+                If (MapToMain == False)
+                {
+                    WLogInitE("MAP_FAIL 模拟/实盘 MapToMain 必须 True（当前 False）→ 禁止开新仓");
+                }
+            }
+        }
+        Else
+        {
+            WLogInit("MAPPING: 回测模式不校验（主连回测建议 MapToMain=True）");
+        }
         WLogInit("模式: StrategyMode=" + Text(StrategyMode())
             + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
             + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + " Chart=" + Text(Enum_Mode_Strategy_Chart()));
+        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合（模拟/实盘）；回测不触发事件→不生效");
         WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
             + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " StallPeriod=" + Text(StallPeriod)
             + " MaxUnits=" + Text(MaxUnits));
@@ -1117,7 +1313,7 @@ Events
             + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2) + " S1Skip=" + Text(S1Skip));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
-            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlippageTicks=" + Text(SlippageTicks, 2));
+            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2));
         WLogInit("设置(原始返回): SetMarginRate=" + IIFString(okMargin, "True", "False")
             + " SetCommissionRate=" + IIFString(okComm, "True", "False")
             + " SetSlippage=" + IIFString(okSlip, "True", "False")
@@ -1145,6 +1341,12 @@ Events
         {
             BarCnt = BarCnt + 1;
 
+            // 首 bar 再清一次挂单集合：OnInit 内的数组操作若未生效，避免上次运行的 orderId 残留致门禁死锁
+            If (BarCnt == 1)
+            {
+                PendingClear();
+            }
+
             // 实盘防呆：TradeStartDate 未到时 CanTradeNow 恒 False、静默不交易 → 首 bar 警告一次（重启复现）。
             // 放在首 bar 而非 OnInit：YMD() 依赖 bar 上下文，OnInit 里判不了；挂上策略的第一分钟即可见。
             If (BarCnt == 1 And IsLiveTrade() And YMD() < TradeStartDate)
@@ -1154,6 +1356,8 @@ Events
 
             // ---- 1. 主力移仓检测（原生自动换仓）----
             UpdateMainSymbol();
+            // 1b. 挂图合法性复核：OnInit 时 data1 可能未就绪，首个数据齐备的 bar 解锁一次
+            RecheckMapping();
 
             // ---- 2. STALL 并行入场（先于常规海龟检查）----
             // True=边沿上确实尝试了开仓 → 本 bar 跳过常规检查（对齐聚宽 stall 分支的 elif）；
@@ -1183,6 +1387,7 @@ Events
                 LastLogYmd = YMD();
                 String d1s = "na";
                 String d0seg = "";
+                String pendseg = "";
                 If (DataCount() >= 2)
                 {
                     d1s = Text(DailyClose(1), 1);
@@ -1192,12 +1397,17 @@ Events
                         d0seg = " d0diag=" + Text(DailyClose0Diag(), 1);
                     }
                 }
+                // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空 → 日志与 v3.1 一致）
+                If (GetArraySize(PendingIds) > 0)
+                {
+                    pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr();
+                }
                 WLog("DAILY " + MainSymbol()
                     + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
                     + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
                     + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
                     + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
-                    + " d1=" + d1s + d0seg);
+                    + " d1=" + d1s + d0seg + pendseg);
             }
 
             // ---- 4. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
@@ -1223,6 +1433,67 @@ Events
                         + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
                 }
             }
+        }
+    }
+
+    // ==================== 回报事件 ====================
+    // 回测不触发（EventProbe 实测 0 次）；模拟/实盘是否回调由柜台决定。
+    // OnOrder 维护挂单门禁（PendingIds），不改台账；OnFill 仅日志，不动 PLots/PCost/StopLine。
+
+    OnFill(FillRef ordFill)
+    {
+        FillCnt = FillCnt + 1;
+        WLogEvt("FILL #" + Text(FillCnt)
+            + " side=" + IIFString(ordFill.side == Enum_Buy, "Buy", "Sell")
+            + " off=" + IIFString(ordFill.combOffset == Enum_Entry, "Entry", "Exit")
+            + " vol=" + Text(ordFill.volume)
+            + " price=" + Text(ordFill.price, 1)
+            + " fillPrice=" + Text(ordFill.fillPrice, 1)
+            + " lots=" + Text(PLots) + " units=" + Text(UnitCount)
+            + " stop=" + Text(StopLine, 1));
+    }
+
+    OnOrder(OrderRef ord)
+    {
+        OrderCnt = OrderCnt + 1;
+        // 挂单门禁维护：活跃状态入集合；其余（Filled/Canceled/Deleted/未知）视为终态移除
+        Integer oid = ord.orderId;
+        String ptxt = "";
+        If (OrderIsPending(ord.status))
+        {
+            If (PendingIndex(oid) < 0)
+            {
+                PendingAdd(oid);
+                ptxt = " PEND_ADD";
+            }
+        }
+        Else
+        {
+            If (PendingIndex(oid) >= 0)
+            {
+                PendingRemove(oid);
+                ptxt = " PEND_DEL";
+            }
+        }
+        WLogEvt("ORDER #" + Text(OrderCnt)
+            + " id=" + Text(ord.orderId)
+            + " status=" + Text(ord.status)
+            + " side=" + IIFString(ord.side == Enum_Buy, "Buy", "Sell")
+            + " off=" + IIFString(ord.combOffset == Enum_Entry, "Entry", "Exit")
+            + " vol=" + Text(ord.volume)
+            + " fvol=" + Text(ord.fillVolume)
+            + " px=" + Text(ord.price, 1)
+            + " lots=" + Text(PLots) + " units=" + Text(UnitCount)
+            + " pending=" + Text(GetArraySize(PendingIds)) + ptxt);
+    }
+
+    // 停止策略单元时汇总事件到达情况（回测不输出，保持回归日志不变）
+    OnExit()
+    {
+        If (StrategyMode() == Enum_Mode_Strategy_Trade())
+        {
+            WLogEvt("EXIT fill=" + Text(FillCnt) + " order=" + Text(OrderCnt)
+                + " pending=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr());
         }
     }
 
