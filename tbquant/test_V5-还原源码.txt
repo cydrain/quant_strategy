@@ -1,0 +1,338 @@
+//------------------------------------------------------------------------
+// 简称: test_V5
+// 名称: test_V5 日内策略（逆向还原版）
+// 类别: 日内交易
+// 类型: 用户应用
+// 输出: Void
+//------------------------------------------------------------------------
+// 来源文件: test_V5-250911.nef（ZIP：test_V5.xml 3DES 加密元数据 + test_V5.dll）
+// 还原手段: Ghidra 12.1.4 headless 反编译 test_V5.dll（全量 1589 个函数），
+//           伪 C 逐段翻译回 TB 公式；关键常量/字符串/调用约定均经反汇编字节级复核。
+// 公式名  : test_V5（执行体 +0x208 字符串实锤；含 "非日内"/"日内交易" 模式串）
+//
+// 【重要说明，请先阅读】
+//   1. 本文件为逆向还原结果，非原始源码。除字符串表实锤的标识符（6 个 Params 名、
+//      日志/注释文本、绘图线名 JMA01/JMA02、"非日内"/"日内交易" 等）之外，其余标识符名
+//      为按语义命名（原源码变量名不保留于 .dll）。
+//   2. JMA_T / C_JMA 为用户函数库中的外部函数（非 TB 内置，tbquant_doc 无条目）；
+//      本文件按调用形式给出，算法见 Defs 段注释（由反编译 FUN_180021660 /
+//      FUN_1800225a0 函数体提炼）。
+//   3. 浮点常量 1E-07 为编译器生成的 epsilon（非源码字面量）；时间常量形如 0.1445
+//      即 14:45（编码 = HHMM/10000）。
+//   4. 本策略为双图层结构（data0 执行 + data1 数据源），Range 双块语义见假设 c-2。
+//   5. 未能从二进制完全确证之处集中列于文末「假设标注清单」（10 项）。
+//------------------------------------------------------------------------
+
+Params
+    // 名称/类型/默认值均为二进制实锤（字符串表 + SetDefaultValue 注册 + 执行体构造器默认值）
+    Integer switchs0(0);      // 方向开关: 1=只做多 / -1=只做空 / 0=双向（执行体 +0x80）
+    Integer frequency1(30);   // 【用途未定位】已注册但交易路径中未见读取（假设 b；+0x88）
+    Integer length(10);       // JMA 周期参数（JMA_T / C_JMA 共用；+0x90）
+    Numeric slip(0);          // 滑点（经参数应用函数下发，假设 a/g；+0x98）
+    Numeric rate(1);          // 手续费率（同上；+0xa0）
+    Numeric lots_v2(1);       // 固定手数输入（"2固定手数输入"模式下使用；+0xa8）
+
+Vars
+    // ── 绘图/信号序列（层对象序列区，每槽 0x68 字节）────────────────────
+    NumericSeries JMA01;        // +0x230 快线（黄线）   = JMA_T(Close, length, 0.5)
+    NumericSeries JMA02;        // +0x298 慢线（品红线） = C_JMA(Close, length)
+    NumericSeries true_h;       // +0xa70 高点基准（绿线）
+    NumericSeries true_l;       // +0xa08 低点基准（白线）
+    NumericSeries True_H1;      // 【推断名】白线
+    NumericSeries True_L1;      // 【推断名】红线
+    NumericSeries BK_Gap;       // +0x670 【公式未完整定位，假设 c】
+    NumericSeries SK_Gap;       // +0x6d8 【公式未完整定位，假设 c】
+    NumericSeries 止损距;       // +0x4d0
+    NumericSeries 止损线;       // +0x538 = Open ∓ 止损距 × 5.0
+    NumericSeries 平多记录bar;  // +0x5a0 平多成交时记 CurrentBar
+    NumericSeries 平空记录bar;  // +0x608 平空成交时记 CurrentBar
+    // 【未识别序列槽（假设 c）】+0x300, +0x398, +0x400, +0x468, +0x740,
+    //                           +0x868, +0x8d0, +0xbf0, +0xc88
+    // 【真实价序列】+0x938（真实true_l）/ +0x9a0（真实true_h）——含义推断，假设 c
+
+    Integer Today_barNo;        // 当日 bar 计数：Time==0.1501 → 0；TrueDate 变化 → CurrentBar
+
+    // ── 信号布尔（位序列，每槽 0x60 字节；执行时读上一根 bar 已提交值 信号[1]）──
+    Bool 开多信号;              // +0x0a8
+    Bool 开空信号;              // +0x108
+    Bool 平多信号;              // +0x168
+    Bool 平空信号;              // +0x1c8
+    // 【未识别布尔槽（假设 c）】+0x7a8、+0x808（疑含"过滤开关"等属性）
+
+    // ── 数组变量（ArrayVar<double>）──
+    ArrayVar<Numeric> 缓冲价格A;    // +0xaf0
+    ArrayVar<Numeric> 缓冲价格B;    // +0xb70
+
+    // ── 层对象全局标量 ──
+    Numeric 隔夜收盘档;         // +0x2F0 OnReady 按品种写入 0.23 / 0.01 / 0.023
+    Numeric 禁开仓窗;           // +0x228 Time∈[08:50,09:00)∪[20:50,21:00) 时为 1
+    Numeric 手数结果;           // +0x80  开仓手数（整型）
+    Bool 可开仓;                // 【推断存储】a2：时间窗开仓允许（三档分支计算）
+    Bool 可平仓;                // 【推断存储】a1：时间窗收盘平仓允许
+
+    // ── 层公式属性（默认值实锤；源级声明形式未定位，假设 a）──
+    // +0x48  String  "2固定手数输入"（手数模式下拉，字符串比较实锤）
+    // +0x68  100.0   资金（万元）
+    // +0x70  2.0     【含义未定位】
+    // +0x88  1.0     【含义未定位】
+    // +0x90  0.5     JMA_T 第 3 参（divisor）
+    // +0x98  0.1     【疑保证金率，可能参与手数计算，假设 g】
+
+Defs
+    // ── 外部函数库函数（调用形式实锤；函数体由反编译提炼）────────────────
+    //
+    // JMA_T(price, length, divisor) —— 用户库函数
+    //   反编译 FUN_180021660 算法：
+    //     if (length > 1)
+    //     {
+    //         base = SMA(price, length, 1);          // 前值加权均线（内部实例）
+    //         raw  = <库内 JMA 迭代>(price, length);  // FUN_180024890
+    //         result = base + (raw - base) / divisor; // divisor = 层属性 +0x90（默认 0.5）
+    //     }
+    //   （NaN / DBL_MAX 保护在库内完成）
+    //   公式内调用：JMA01 = JMA_T(Close, length, 0.5);
+    //
+    // C_JMA(price, length) —— 用户库函数（标准 JMA / Jurik Moving Average）
+    //   反编译 FUN_1800225a0：内部维护价格序列缓冲（+0xb0 vector 经 FUN_180022150
+    //   逐 bar 推入 (BarIndex, price)），返回平滑值。
+    //   公式内调用：JMA02 = C_JMA(Close, length);
+    //   注：二进制调用点另传第 4 寄存器 r9 = IntPart(层属性 +0x98) 但函数体未消费
+    //       （死参，假设 f）。
+    //
+    // 内置函数使用（据调用槽位与字符串实锤）：Max / Min / IntPart / Round / Text /
+    //   IIF / Commentary / BarsSinceEntry() / MarketPosition() / AvgEntryPrice() /
+    //   PositionProfit() / longCurrentContracts() / CurrentBar() / TrueDate() /
+    //   BigPointValue() / ContractUnit() / Rollover / SymbolType() 等
+
+Events
+    OnInit()
+    {
+        // 反编译 FUN_180013840（580 行），实锤要点：
+        //   - 行情订阅、SymbolType 判定
+        //   - 主力合约映射字符串："999" / "888" / "000" / "777"
+        //   - 启动日志："获取账户：" / "Data0.品种主代码 :  " / "交易所: " / "0#交易合约："
+        //   - 交易模式打印："非日内" / "日内交易"
+        //   - SetInitCapital / SetSlippage(slip) / SetCommissionRate(rate) /
+        //     AddTradeFlag ×4 / Hide
+        //   上述 Set*/Add* 为框架 vtable 桩调用（实参经参数应用函数 FUN_18000c180
+        //   按名字 lowercase 匹配后下发），细节见假设 a/g。
+    }
+
+    OnReady()
+    {
+        // 按品种设置夜盘收盘档（+0x2F0），实锤三分支：
+        If (SymbolType() == "sc" Or SymbolType() == "ag" Or SymbolType() == "au")
+            隔夜收盘档 = 0.023;              // 夜盘至 02:30
+        Else If (SymbolType() == "ss" Or SymbolType() == "cu" Or SymbolType() == "al"
+            Or SymbolType() == "ni" Or SymbolType() == "zn" Or SymbolType() == "sn"
+            Or SymbolType() == "pb" Or SymbolType() == "ao" Or SymbolType() == "bc")
+            隔夜收盘档 = 0.01;               // 夜盘至 01:00
+        Else
+            隔夜收盘档 = 0.23;               // 夜盘至 23:00
+
+        // 最小变动额 = PriceScale × MinMove（+0x300，实锤；等价文档中的 MinPoint）
+    }
+
+    OnBar(ArrayRef<Integer> indexs)
+    {
+        Range[1:1]
+        {
+            // 在上一根已收盘 bar 上计算并提交指标（信号延迟一根 bar 执行；
+            // Range 双块与多图层语义见假设 c-2）
+            JMA01 = JMA_T(Close, length, 0.5);
+            JMA02 = C_JMA(Close, length);
+        }
+
+        Range[0:0]
+        {
+            // ── 1. 时间窗（隔夜收盘档三档分支；Time 编码 = HHMM/10000）──────
+            可开仓 = False;
+            可平仓 = False;
+            If (隔夜收盘档 == 0.23)
+            {
+                可开仓 = (Time() >= 0.0900 And Time() < 0.1445) Or (Time() >= 0.2100 And Time() < 0.2245);
+                可平仓 = (Time() >= 0.1455 And Time() <= 0.1500) Or (Time() >= 0.2255 And Time() <= 0.2300);
+            }
+            Else If (隔夜收盘档 == 0.01)
+            {
+                可开仓 = (Time() >= 0.0900 And Time() < 0.1125) Or (Time() >= 0.1300 And Time() < 0.1445) Or Time() >= 0.2100 Or Time() < 0.0045;
+                可平仓 = (Time() >= 0.1125 And Time() <= 0.1130) Or (Time() >= 0.1455 And Time() <= 0.1500) Or (Time() >= 0.0055 And Time() <= 0.0100);
+            }
+            Else If (隔夜收盘档 == 0.023)
+            {
+                可开仓 = (Time() >= 0.0900 And Time() < 0.1125) Or (Time() >= 0.1300 And Time() < 0.1445) Or Time() >= 0.2100 Or Time() < 0.0215;
+                可平仓 = (Time() >= 0.1125 And Time() <= 0.1130) Or (Time() >= 0.1455 And Time() <= 0.1500) Or (Time() >= 0.0225 And Time() <= 0.0230);
+            }
+
+            // ── 2. 收盘平仓 ─────────────────────────────────────────────
+            If (可平仓)
+            {
+                If (MarketPosition() == 1)
+                {
+                    Sell(0, Open, Enum_Signal_NotSend);       // 0 手 = 全部平仓
+                    Commentary("收盘平仓");
+                }
+                If (MarketPosition() == -1)
+                {
+                    BuyToCover(0, Open, Enum_Signal_NotSend);
+                    Commentary("收盘平仓");
+                }
+            }
+
+            // ── 3. 当日 bar 计数 ────────────────────────────────────────
+            If (Time() == 0.1501)
+                Today_barNo = 0;
+            If (TrueDate() != TrueDate(1))    // 【调用形式推断：取前一 bar 的真实交易日】
+            {
+                Today_barNo = CurrentBar();
+                Commentary("Today_barNo");
+            }
+
+            // ── 4. 禁开仓窗 ─────────────────────────────────────────────
+            禁开仓窗 = IIF((Time() >= 0.0850 And Time() < 0.0900) Or (Time() >= 0.2050 And Time() < 0.2100), 1, 0);
+
+            // ── 5. 跨层复制（Data1 → 当前层，实锤四序列）─────────────────
+            JMA01  = Data1.JMA01;
+            JMA02  = Data1.JMA02;
+            true_h = Data1.true_h;
+            true_l = Data1.true_l;
+
+            // ── 6. 平多 / 平空（读上一根 bar 已提交的信号）───────────────
+            If (平多信号[1] And 禁开仓窗 == 0 And BarsSinceEntry() > 0 And MarketPosition() == 1)
+            {
+                Sell(0, Open, Enum_Signal_NotSend);
+                平多记录bar = CurrentBar();
+            }
+            If (平空信号[1] And 禁开仓窗 == 0 And BarsSinceEntry() > 0 And MarketPosition() == -1)
+            {
+                BuyToCover(0, Open, Enum_Signal_NotSend);
+                平空记录bar = CurrentBar();
+            }
+
+            // ── 7. BK_Gap / SK_Gap（公式未完整定位，假设 c；占位）────────
+            // BK_Gap = ...;
+            // SK_Gap = ...;
+
+            // ── 8. 绘图（六线，色值实锤）────────────────────────────────
+            PlotNumeric("JMA01",  JMA01,  Yellow);      // 0x510 黄
+            PlotNumeric("JMA02",  JMA02,  Magenta);     // 0x500 品红
+            PlotNumeric("true_h", true_h, Green);       // 0x4f8 绿
+            PlotNumeric("true_l", true_l, White);       // 0x4e0 白
+            PlotNumeric("True_H1", True_H1, White);     // 0x4e0 白
+            PlotNumeric("True_L1", True_L1, Red);       // 0x508 红
+            // JMA01/JMA02 另有二次绘制（IIF 条件 0x11f0，假设 c-2）
+
+            // ── 9. 信号矩阵 ─────────────────────────────────────────────
+            // 基础（过滤关闭）：双线状态；过滤开启：附加价格条件
+            If (过滤开关)                                   // 【属性名推断，假设 c】
+            {
+                If (入场价格模式 == "Close")                 // 【属性名推断，假设 c】
+                {
+                    开多信号 = JMA01 > JMA02 And Close >= true_h;
+                    开空信号 = JMA02 > JMA01 And Close <= true_l;
+                }
+                Else                                        // HighLow 模式
+                {
+                    开多信号 = JMA01 > JMA02 And High >= true_h;
+                    开空信号 = JMA02 > JMA01 And Low  <= true_l;
+                }
+            }
+            Else
+            {
+                开多信号 = JMA01 > JMA02;
+                开空信号 = JMA02 > JMA01;
+            }
+            平多信号 = JMA02 > JMA01;
+            平空信号 = JMA01 > JMA02;
+
+            // ── 10. 手数计算 ────────────────────────────────────────────
+            If (手数模式 == "2固定手数输入")                  // 层属性 +0x48 字符串比较实锤
+                手数结果 = IntPart(lots_v2);
+            Else
+            {
+                // 资金(万元)×10000 ÷ [BigPointValue()×ContractUnit()×(Close÷Rollover)]
+                // 安全除法（NaN/溢出 → ±DBL_MAX 保护）；IntPart 取整、与下限 1 取大、
+                // 再 IntPart（嵌套顺序按反汇编）
+                手数结果 = IntPart(Max(IntPart(资金 * 10000 / (BigPointValue() * ContractUnit() * (Close / Rollover))), 1));
+            }
+
+            // ── 11. 开多（方向门 switchs0∈{0,1}，无符号比较；信号延迟一根 bar）──
+            If (开多信号[1] And 禁开仓窗 == 0 And 可开仓 And switchs0 < 2)
+            {
+                If (入场价格模式 == "Close")
+                    Buy(手数结果, Open, Enum_Signal_NotSend);
+                Else
+                    Buy(手数结果, Max(Open, true_h), Enum_Signal_NotSend);
+                止损线 = Open - 止损距 * 5.0;
+                Commentary("开多单后 后复权价: " + Text(Round(Open)) + " 真实价: " + Text(Round(Open / Rollover)));
+            }
+
+            // ── 12. 开空（方向门 switchs0∈{0,-1}）───────────────────────
+            If (开空信号[1] And 禁开仓窗 == 0 And 可开仓 And switchs0 + 1 < 2)
+            {
+                If (入场价格模式 == "Close")
+                    SellShort(手数结果, Open, Enum_Signal_NotSend);
+                Else
+                    SellShort(手数结果, Min(Open, true_l), Enum_Signal_NotSend);
+                止损线 = Open + 止损距 * 5.0;
+                Commentary("开空单后 后复权价: " + Text(Round(Open)) + " 真实价: " + Text(Round(Open / Rollover)));
+            }
+
+            // ── 13. 状态栏输出 ──────────────────────────────────────────
+            Commentary("<D0持仓[" + Text(longCurrentContracts()) + "]手 " + "  均价["
+                + Text(IntPart(AvgEntryPrice())) + "]  利润[" + Text(IntPart(PositionProfit()))
+                + "]元" + "  D0主力合约[" + 主力合约 + "]>  ");
+            Commentary("主力合约[" + 主力合约 + "]  最新中间价[" + Text(Close) + "]<D0持仓["
+                + Text(持仓手数) + "]手 " + "  利润[" + Text(IntPart(PositionProfit())) + "]元> ");
+            // 尾块持仓数 long/short 归属存疑，假设 e
+
+            // 【兜底分支（触发条件未定位，假设 i）】
+            // Else
+            // {
+            //     Sell(0, 0);
+            //     BuyToCover(0, 0);
+            // }
+        }
+    }
+
+//===========================================================================
+// 假设标注清单（无法从二进制完全确证之处）
+//---------------------------------------------------------------------------
+// (a) 层公式属性的源级声明形式未定位：+0x90=0.5 / +0x98=0.1 / +0x70=2.0 /
+//     +0x88=1.0 / +0x68=100(万元) / +0x48="2固定手数输入"（默认值构造实锤）；
+//     slip/rate 的参数应用点位于 FUN_18000c180（名字 lowercase 匹配后经 vtable
+//     下发 SetSlippage 等）。
+// (b) frequency1(30)：已注册但已验证交易路径无读取点，实际用途未知。
+// (c) 未完整定位：true_h/true_l/True_H1/True_L1 与 BK_Gap/SK_Gap 的完整计算式；
+//     未识别序列槽 +0x300/+0x398/+0x400/+0x468/+0x740/+0x868/+0x8d0/+0xbf0/+0xc88；
+//     未识别布尔槽 +0x7a8/+0x808；"过滤开关"/"入场价格模式"的属性名与来源；
+//     JMA01/JMA02 二次绘制 IIF 条件（0x11f0）。
+// (c-2) Range[1:1]/[0:0] 双块在多图层（data0 执行 + data1 数据源）下的精确语义，
+//     以及 Data1.* 跨层读取时机（按"上一根已收盘 bar"重构，方向实锤）。
+// (d) OnReady 品种集合判断的槽位名（0x2248 槽，置信约 90%）与 SymbolType() 返回
+//     串的大小写（实锤为 sc/ag/au/ss/cu/al/ni/zn/sn/pb/ao/bc 十二个）。
+// (e) 状态栏尾块 Commentary 持仓手数 long/short 归属存疑。
+// (f) C_JMA 调用点第 4 寄存器 r9=IntPart(层属性 +0x98)=0.1 为死参（函数体未消费）；
+//     不能排除存在第 4 源参数的变体。
+// (g) 手数公式细节：资金×10000 除链是否含保证金率因子（+0x98=0.1）；SetInitCapital
+//     实参换算（历史记录"资金×300000"待核）。
+// (h) CrossOver/CrossUnder 实例调用点未定位，信号矩阵按比较式还原。
+// (i) 兜底 Else（Sell(0,0); BuyToCover(0,0);）触发条件未定位；开仓门是否含持仓限制
+//     未定位（现按无持仓限制还原）。
+// (j) 前缀常量 0x5f5f345f6c6a5f5f（"__4_lj__"）用途未知（疑编译期内部符号/缓存键）。
+//---------------------------------------------------------------------------
+// 附录：关键槽位对照表
+//   执行体参数区 : +0x80 switchs0 / +0x88 frequency1 / +0x90 length / +0x98 slip
+//                  / +0xa0 rate / +0xa8 lots_v2；公式名 +0x208
+//   层对象序列区 : +0x230 JMA01 / +0x298 JMA02 / +0x4d0 止损距 / +0x538 止损线
+//                  / +0x5a0 平多记录bar / +0x608 平空记录bar / +0x670 BK_Gap
+//                  / +0x6d8 SK_Gap / +0x938 真实true_l / +0x9a0 真实true_h
+//                  / +0xa08 true_l / +0xa70 true_h
+//   层对象布尔区 : +0x0a8 开多 / +0x108 开空 / +0x168 平多 / +0x1c8 平空（stride 0x60）
+//   层对象标量区 : +0x68 资金 / +0x80 手数结果 / +0x228 禁开仓窗 / +0x2F0 隔夜收盘档
+//                  / +0x300 最小变动额
+//   常量         : 0x35AD0=0.0225(02:25) / 0x35AD8=0.023(02:30) / 0x35B60=5.0
+//                  / 0x35B70=10000 / 0x35AA0=1E-07（编译器 epsilon）
+//                  / 0x35B58=1.0（手数下限）
+//   订单枚举     : 每次下单前置 Enum_Signal_NotSend（vtable 0x748）
+//===========================================================================
