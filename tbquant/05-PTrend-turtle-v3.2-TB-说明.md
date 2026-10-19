@@ -210,18 +210,20 @@
 - **只拦不撤**：当前没有撤单、重试或超时。若柜台漏报终态，策略会持续禁发；
 - 启动前已经在场的委托不会入集合；重启时 OnInit 清空集合（首 bar 再兜底清一次），
   旧委托若随后成交由 `STATE_REBUILD` 按平台持仓自愈；
-- 若 OnOrder 在模拟/实盘完全不回调，门禁 fail-open（不会死锁），但也没有保护；
+- 模拟盘已实测回调（RateCheckProbe 2026-10-19）；若实盘柜台完全不回调，门禁 fail-open
+  （不会死锁），但也没有保护；
 - 因此：**模拟可先跑；实盘前必须先验证 PEND_ADD/PEND_DEL 全链路，并补撤单/超时兜底。**
 
 ### 7.2 已知风险（按严重度）
 
 1. 门禁连止损一起拦，且无撤单/超时 —— 实盘最大风险；
-2. OnOrder/OnFill 仅在回测探针中确认“不回调”，模拟/实盘是否回调未验证；
+2. OnOrder/OnFill 回测确认不回调（EventProbe）；模拟盘已由 RateCheckProbe 实测回调正常
+   （2026-10-19，p2701，Declare→Declared→Filled + OnFill 字段完整）；实盘柜台是否回调仍未验证；
 3. 乐观台账 + 成交跨 bar：先 `LEDGER_CLEAN` 后 `STATE_REBUILD`，数量可恢复；
    UnitCount 按平台建仓次数恢复，止损按重建时的 N 重推，可能与入场时略有偏差；
 4. `MAPPING ok=False` 若由 data1 晚就绪导致，首 bar 会复核；若仍 False，检查合约/图层/参数；
-5. OnFill 新增 `vol=`（`FillRef.volume` 字段名）：`OrderRef.volume` 已在探针编译实证，
-   `FillRef.volume` 同名字段尚未——待下次编译确认（回测不触发 OnFill，编译过即验证字段名可用）。
+5. ~~OnFill `FillRef.volume` 字段未验证~~ **已消除**：2026-10-19 模拟实测
+   `volume/price/fillPrice` 均有效。
 
 ---
 
@@ -242,9 +244,16 @@
    - 委托被拒（停板等）→ `OPEN_FAIL/CLOSE_FAIL`，下一 bar 自动重试（但可能被门禁拦）；
    - 海龟是趋势跟踪策略，历史切片属于“已知行情”的参数验证，实盘前务必先模拟。
 5. **日志**：模拟/实盘按物理日分文件，同日续写不清空；回测 OnInit 会删除当日文件。
-   文件名格式 `公式名_合约_日志_yyyyMMdd`（合约取 data0 的 `Symbol`，如
-   `PTrendTurtle_v32_p9888.DCE_日志_20261018.txt`），同目录跑 P/RU 两个实例也不会混。
+   文件名格式 `公式名_合约_日志_yyyyMMdd.tbf`（合约取 data0 的 `Symbol`，如
+   `PTrendTurtle_v32_p9888.DCE_日志_20261018.tbf`），同目录跑 P/RU 两个实例也不会混。
+   `.tbf` 不是纯文本，用 TB 的「数据中心 → 文件查看器」打开，或
+   `python tbquant/tools/read_tbf.py <日志.tbf> <导出.txt>` 导出。
    同一台机器同日跑回测与实盘、且合约相同时，仍请设置不同的 `LogDir` 或公式名。
+6. **无图表数据源**：`Print` 只在 K 线图控制台可见，无图表策略单元没有界面输出
+   （右下角消息中心只显示委托/账户事件，不含 `Print`）；本策略的日志主体走 `FileAppend`，
+   无图表照样写入。默认 `LogDir=""` 落在平台运行目录（本机实测为
+   `C:\Users\MI\AppData\Roaming\TBQuant\`）；建议给无图表实例单独设绝对路径 `LogDir`
+   （以 `/` 结尾），避免和图表/回测实例混写。
 
 ---
 
@@ -273,7 +282,7 @@
 | MapToMain | True | True=主连/模拟/实盘（换月全套+委托映射主力）；False=单合约切片（不复权、不映射） |
 | MainContSymbol | p9888.DCE | 模拟/实盘唯一允许的主连合约；须与日志 data0.Symbol 完全一致 |
 | LogLevel | 2 | 日志阈值：0=仅ERROR 1=+WARNING 2=+INFO 3=+DEBUG |
-| PrintToUI | True | True=同步 Print 到 TB 日志窗口；长回测/批量优化建议 False |
+| PrintToUI | True | True=同步 Print 到 K 线图控制台；无图表单元无界面输出（文件日志不受影响）；长回测/批量优化建议 False |
 | LogDir | "" | 日志目录；留空=平台运行目录；填全路径须以 / 结尾 |
 | LogHour / LogMinute | 14 / 45 | 每日定时日志时刻 |
 
@@ -343,8 +352,11 @@
 
 - 代码：静态复查（花括号平衡、Global 声明、Data1 访问仅限访问器段、日志关键字、UTF-8+CRLF）；
   7 个聚宽 STALL 触发日已用 awk 按同口径复算全部命中。
-- TB 侧：**编译已通过（2026-10-18）；尚未实跑**（回测/模拟未执行）；第 6.3 节 TB 触发时点为预期值，不是实测值；
+- TB 侧：**编译已通过（2026-10-18）；v3.2 本体尚未实跑**（回测/模拟未执行）；第 6.3 节 TB 触发时点为预期值，不是实测值；
   第 5.2 节 v3.2 收益为聚宽实测基准，不是 TB 结果。
+- 事件链探针（RateCheckProbe，2026-10-19，TB 期货模拟 p2701，1 手开平）：
+  OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
+  MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
 - 首轮 TB 验收顺序：
   1. 跑首轮回测时检查 `data1.Symbol`、`MAPPING ok=True`、`STALL: enabled=True need=25`；
   2. `StallPeriod=0` 跑切片 4/5/6，与 v3.1 的 trades/DAILY 对齐；
@@ -357,4 +369,4 @@
 
 ---
 
-*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
+*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证注释）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
