@@ -248,12 +248,14 @@
    `PTrendTurtle_v32_p9888.DCE_日志_20261018.tbf`），同目录跑 P/RU 两个实例也不会混。
    `.tbf` 不是纯文本，用 TB 的「数据中心 → 文件查看器」打开，或
    `python tbquant/tools/read_tbf.py <日志.tbf> <导出.txt>` 导出。
+   OnInit 会写一行 `日志: LogDir=[...] 实际目录=... 文件=...`；`LogDir` 非空但末位漏写
+   `/` 时代码自动补齐，可先用该行确认实际落盘位置。
    同一台机器同日跑回测与实盘、且合约相同时，仍请设置不同的 `LogDir` 或公式名。
 6. **无图表数据源**：`Print` 只在 K 线图控制台可见，无图表策略单元没有界面输出
    （右下角消息中心只显示委托/账户事件，不含 `Print`）；本策略的日志主体走 `FileAppend`，
-   无图表照样写入。默认 `LogDir=""` 落在平台运行目录（本机实测为
-   `C:\Users\MI\AppData\Roaming\TBQuant\`）；建议给无图表实例单独设绝对路径 `LogDir`
-   （以 `/` 结尾），避免和图表/回测实例混写。
+   无图表照样写入。默认 `LogDir` 指向仓库内 `tbquant/logs/`（本机绝对路径，换机器/云端需改）；
+   留空才落在平台运行目录（本机实测为 `C:\Users\MI\AppData\Roaming\TBQuant\`）。
+   末位 `/` 可省略，代码自动补；已挂图表实例仍沿用各自保存的参数，需手动改成同一路径。
 
 ---
 
@@ -283,7 +285,7 @@
 | MainContSymbol | p9888.DCE | 模拟/实盘唯一允许的主连合约；须与日志 data0.Symbol 完全一致 |
 | LogLevel | 2 | 日志阈值：0=仅ERROR 1=+WARNING 2=+INFO 3=+DEBUG |
 | PrintToUI | True | True=同步 Print 到 K 线图控制台；无图表单元无界面输出（文件日志不受影响）；长回测/批量优化建议 False |
-| LogDir | "" | 日志目录；留空=平台运行目录；填全路径须以 / 结尾 |
+| LogDir | C:/Users/MI/work/quant_strategy/tbquant/logs/ | 日志目录（本机绝对路径，换机器/云需改）；留空/相对路径=平台运行目录；末位缺 / 自动补；OnInit 日志打印实际路径 |
 | LogHour / LogMinute | 14 / 45 | 每日定时日志时刻 |
 
 ---
@@ -309,6 +311,7 @@
 | `PEND_ADD` / `PEND_DEL` | 未完成委托集合增加/移除 |
 | `ORDER_GATE` | 有未完成委托，拒发新单（按交易日首条） |
 | `MAPPING` / `MAPPING_RECHECK` | 模拟/实盘挂图合法性（data0/data1/主连/MapToMain） |
+| `日志:` | OnInit 打印 `LogDir` 原值、实际目录与文件名（确认路径是否生效） |
 | `N/四通道刷新失败` | ERROR：data1 缺失/合约错位/历史不足/参数越界 → 拒绝开新仓与常规管理（实盘仍走 STOP_ONLY 止损兜底），逐 bar 重试 |
 | `TRADE_GATE` | 未到 TradeStartDate，不会产生交易动作 |
 | `EXIT fill=... order=... pending=...` | 停止策略单元时的事件计数汇总 |
@@ -354,6 +357,8 @@
   7 个聚宽 STALL 触发日已用 awk 按同口径复算全部命中。
 - TB 侧：**编译已通过（2026-10-18）；v3.2 本体尚未实跑**（回测/模拟未执行）；第 6.3 节 TB 触发时点为预期值，不是实测值；
   第 5.2 节 v3.2 收益为聚宽实测基准，不是 TB 结果。
+- 2026-10-19 日志路径自愈：新增 `EffectiveLogDir()`（末位缺 `/` 自动补）与 OnInit `日志:` 行；
+  其中 `Right()` 来自官方函数摘要，**待下次 TB 编译确认**。
 - 事件链探针（RateCheckProbe，2026-10-19，TB 期货模拟 p2701，1 手开平）：
   OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
   MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
@@ -369,4 +374,4 @@
 
 ---
 
-*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证注释）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
+*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
