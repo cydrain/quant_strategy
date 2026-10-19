@@ -1,0 +1,490 @@
+//------------------------------------------------------------------------
+// 简称: RateCheckProbe
+// 名称: TBQuant 保证金/手续费读取 + OnOrder/OnFill 回调探针
+// 类别: 工具
+// 类型: 用户应用
+// 输出: Void
+//------------------------------------------------------------------------
+// 用途：
+//   A. 验证模拟/实盘下能否读取保证金率、手续费率，以及 Get* 与 Set* 的先后关系；
+//   B. 验证 OnOrder/OnFill 在模拟盘是否回调、状态序列与可用字段。
+// 用法：
+//   1) 挂 1 分钟图即可（单图层，不需要 data1）；运行模式「K线收盘模型」。
+//   2) 建议用模拟账户，夜盘开盘前挂上；OnInit 打 INIT_PRE/INIT_POST，首两根 bar 打 BAR1/BAR2。
+//   3) 看 [RATE_PROBE] 行；有图表看 K 线图控制台，无图表看同内容 .tbf 文件。
+//   4) 回调测试：ProbeOrder 默认 True（仅限模拟账户！），只做 1 手开平：
+//      开平仓都在 OnBarClose（bar 收盘评估点，每根 bar 只驱动一次）发单，
+//      避免 OnBar 每 tick 重跑导致的一次性信号消失/信号闪烁（平仓会被静默丢弃）。
+//      OnTimer 心跳确认实时后，以可成交限价买开（盘口有效=卖一+2跳；无效=Close+5跳）；
+//      下一根 bar 收盘再平仓，平仓价=买一-2跳（无效=Close-5跳）。
+//      关键字：LIVE / QUOTE / ORDER_SEND / ONORDER / ONFILL / ONFILL_MISSING /
+//              ORDER_TIMEOUT / CLOSE_TIMEOUT / PROBE_DONE / PROBE_EXIT。
+//      若一轮下来 ONORDER/ONFILL 一行都没有 = 模拟盘不回调（v3.2 挂单门禁 fail-open）。
+// 读法：
+//   - INIT_PRE  = OnInit 内、任何 Set 之前读（看平台/策略单元初始值）；
+//   - INIT_POST = OnInit 内、SetMarginRate/SetCommissionRate 之后读（看 Get 是否回显 Set 值）；
+//   - BAR1/BAR2 = OnInit 之后再读（看就绪后的值），并打印 A_GetAccount/A_GetPosition。
+// 注意：
+//   - ProbeOrder=True 会真实发单（模拟账户也会产生模拟成交与手续费）。实盘账户严禁！
+//     测试前账户须空仓（有仓会 ORDER_SKIP）；用独立模拟账户，避免影响其他策略持仓。
+//   - 发单前必须 ProbeLiveSeen（OnTimer 首次触发；历史回放期 OnTimer 不驱动），
+//     防止在回放的历史 bar 上下单。开平仓只在 OnBarClose 发单；回调超时按 OnTimer
+//     秒数累计、在该事件里检查（1 分钟图 = 每个 bar 收盘检查一次，等待会向上取整到收盘）。
+//   - 若 GetMarginRate/GetCommissionRate 或结构体字段在你的 TB 版本编译不过，删掉对应段，
+//     保留 MarginRatio()、Set* 与 Account/OnOrder/OnFill 日志即可（那也是有价值的对照）。
+//   - 本探针默认 ProbeOrder=True，会发 1 手模拟开平单；仅限独立空仓模拟账户。实盘账户务必改回 False。
+//   - 文件日志：平台运行目录（本机 C:\Users\MI\AppData\Roaming\TBQuant\）下
+//     RateCheckProbe_日志_yyyyMMdd.tbf；用「数据中心 → 文件查看器」打开，
+//     或 python tbquant/tools/read_tbf.py <日志.tbf> <导出.txt>。
+//------------------------------------------------------------------------
+Params
+    Bool ProbeSet(True);          // True=OnInit 先读 → Set → 再读（验证 Get 是否回显 Set 值）
+    Numeric ProbeMargin(0.12);    // 与主策略 MarginRateP 一致
+    Numeric ProbeComm(0.000023);  // 与主策略 CommissionRateP 一致
+    Bool ProbeOrder(True);        // True=做一轮 1 手模拟开平（仅限模拟账户；实盘严禁）
+    Integer ProbeLots(1);         // 测试手数
+    Integer ProbeTimeoutSec(10);  // 回调等待秒数（OnTimer 秒计数；在 OnBarClose 检查）
+
+Vars
+    Global Integer BarCnt;
+    // ---- OnOrder/OnFill 测试状态 ----
+    Global Integer ProbeTimerId;
+    Global Integer ProbeTimerCnt;
+    Global Bool ProbeLiveSeen;      // OnTimer 已触发 = 进入实时（回放期不驱动）
+    Global Integer ProbeStage;      // 0=等待 1=开仓已发 2=开仓成交待平 3=平仓已发 4=结束
+    Global Integer ProbeSendTick;   // 发单时的 ProbeTimerCnt
+    Global Bool ProbeSentEntry;     // 本探针确实发过开仓单（防串入别人的成交事件）
+    Global Bool ProbeEntryFillSeen;
+    Global Bool ProbeCloseFillSeen;
+    Global Bool ProbeEntryOrderFilled;
+    Global Bool ProbeCloseOrderFilled;
+    Global Integer ProbeOrderEvtCnt;
+    Global Integer ProbeFillEvtCnt;
+    Global Bool ProbeHasPending;
+
+Defs
+    String NumStr(Numeric v) {
+        If (v == InvalidNumeric) {
+            Return "invalid";
+        }
+        Return Text(v, 8);
+    }
+
+    String ProbeLogPath() {
+        Return FormulaName() + "_日志_" + Text(CurrentDate());
+    }
+
+    Integer PL(String s) {
+        String line = "[RATE_PROBE] " + DateTimeToString(SystemDateTime()) + " | " + s;
+        Print(line);
+        FileAppend(ProbeLogPath(), line, False);
+        Return 0;
+    }
+
+    Numeric TickSz() {
+        Numeric t = MinMove() * PriceScale();
+        If (t <= 0) {
+            t = 1;
+        }
+        Return t;
+    }
+
+    String PosStr() {
+        Position p;
+        String s = "mp=" + Text(MarketPosition());
+        If (A_GetPosition(p)) {
+            s = s + " long=" + Text(p.longCurrentVolume)
+                + " short=" + Text(p.shortCurrentVolume);
+        }
+        Else {
+            s = s + " pos=na";
+        }
+        Return s;
+    }
+
+    Bool ProbeFlat() {
+        Position p;
+        If (A_GetPosition(p)) {
+            Return (p.longCurrentVolume == 0 And p.shortCurrentVolume == 0);
+        }
+        Return (MarketPosition() == 0);
+    }
+
+    Bool ProbeHasLong() {
+        Position p;
+        If (A_GetPosition(p)) {
+            If (p.longCurrentVolume > 0) {
+                Return True;
+            }
+        }
+        Return (MarketPosition() > 0);
+    }
+
+    Integer DumpRates(String phase) {
+        PL(phase + " MarginRatio=" + NumStr(MarginRatio()));
+        MarginRate mr;
+        GetMarginRate(mr);   // 若编译失败：删掉本段
+        PL(phase + " GetMargin long=" + NumStr(mr.longMarginRatio)
+            + " short=" + NumStr(mr.shortMarginRatio));
+        CommissionRate cr;
+        GetCommissionRate(cr);   // 若编译失败：删掉本段
+        String rt = Text(cr.ratioType);
+        If (cr.ratioType == Enum_Rate_AmountPerHand) {
+            rt = "AmountPerHand";
+        }
+        If (cr.ratioType == Enum_Rate_ByFillAmount) {
+            rt = "ByFillAmount";
+        }
+        If (cr.ratioType == Enum_Rate_PointPerHand) {
+            rt = "PointPerHand";
+        }
+        PL(phase + " GetComm openRatio=" + NumStr(cr.openRatio)
+            + " closeRatio=" + NumStr(cr.closeRatio)
+            + " closeTodayRatio=" + NumStr(cr.closeTodayRatio)
+            + " ratioType=" + rt);
+        Return 0;
+    }
+
+    // 1 手开平闭环：验证 OnOrder 状态序列与 OnFill 是否回调
+    Integer ProbeOrderStep() {
+        If (ProbeStage == 0) {
+            // 只认 OnTimer：历史回放期不驱动，避免在回放 bar 上发单
+            If (ProbeLiveSeen == False Or BarCnt < 2) {
+                Return 0;
+            }
+            If (Date() <> CurrentDate()) {
+                Return 0;
+            }
+            If (ProbeLots < 1) {
+                PL("ORDER_SKIP lots<1");
+                ProbeStage = 4;
+                Return 0;
+            }
+            If (ProbeFlat() == False) {
+                PL("ORDER_SKIP 账户非空仓 " + PosStr() + "（请先手工平仓再测）");
+                ProbeStage = 4;
+                Return 0;
+            }
+            Numeric ask = Q_AskPrice();
+            Numeric ask0 = Q_AskPrice(0);
+            Numeric bid = Q_BidPrice();
+            Numeric bid0 = Q_BidPrice(0);
+            Numeric px = Close() + 5 * TickSz();
+            Bool entryQuoteOk = False;
+            If (ask != InvalidNumeric) {
+                If (ask > 0) {
+                    px = ask + 2 * TickSz();
+                    entryQuoteOk = True;
+                }
+            }
+            If (entryQuoteOk == False) {
+                If (ask0 != InvalidNumeric) {
+                    If (ask0 > 0) {
+                        px = ask0 + 2 * TickSz();
+                        entryQuoteOk = True;
+                    }
+                }
+            }
+            PL("QUOTE ask()=" + NumStr(ask) + " ask(0)=" + NumStr(ask0)
+                + " bid()=" + NumStr(bid) + " bid(0)=" + NumStr(bid0)
+                + " close=" + NumStr(Close())
+                + " tick=" + NumStr(TickSz()) + " barStatus=" + Text(BarStatus)
+                + " useQuote=" + IIFString(entryQuoteOk, "True", "False"));
+            If (px == InvalidNumeric) {
+                PL("ORDER_SKIP 无效委托价 close=" + NumStr(Close()));
+                ProbeStage = 4;
+                Return 0;
+            }
+            If (px <= 0) {
+                PL("ORDER_SKIP 委托价<=0 px=" + NumStr(px));
+                ProbeStage = 4;
+                Return 0;
+            }
+            Bool ok = Buy(ProbeLots, px);
+            ProbeSendTick = ProbeTimerCnt;
+            PL("ORDER_SEND Buy lots=" + Text(ProbeLots)
+                + " px=" + Text(px, 1) + " ask=" + Text(ask, 1)
+                + " ok=" + IIFString(ok, "True", "False")
+                + " live=" + IIFString(ProbeLiveSeen, "True", "False")
+                + " date=" + Text(Date()) + " time=" + Text(Time())
+                + " " + PosStr());
+            If (ok) {
+                ProbeSentEntry = True;
+                ProbeStage = 1;
+            }
+            Else {
+                ProbeStage = 4;
+            }
+        }
+        Else If (ProbeStage == 1) {
+            If (ProbeTimerCnt - ProbeSendTick >= ProbeTimeoutSec) {
+                If (ProbeHasLong()) {
+                    PL("ONFILL_MISSING 开仓已成交但未见 OnFill " + PosStr());
+                    ProbeStage = 2;
+                }
+                Else If (ProbeEntryOrderFilled) {
+                    PL("ONFILL_MISSING 开仓委托已 Filled 但持仓接口未反映 " + PosStr());
+                    ProbeStage = 2;
+                }
+                Else {
+                    PL("ORDER_TIMEOUT 开仓未成交 onorder=" + Text(ProbeOrderEvtCnt)
+                        + " pending=" + IIFString(ProbeHasPending, "True", "False")
+                        + " " + PosStr());
+                    ProbeStage = 4;
+                }
+            }
+        }
+        Else If (ProbeStage == 2) {
+            // OnBarClose 每根 bar 只驱动一次：入场在上一个收盘点发出，
+            // 走到这里已是下一根 bar 收盘，信号位置已稳定，可直接发平仓。
+            If (ProbeHasLong() == False) {
+                PL("CLOSE_SKIP 无多头持仓 " + PosStr());
+                ProbeStage = 4;
+                Return 0;
+            }
+            Numeric bid = Q_BidPrice();
+            Numeric bid0 = Q_BidPrice(0);
+            Numeric px = Close() - 5 * TickSz();
+            Bool closeQuoteOk = False;
+            If (bid != InvalidNumeric) {
+                If (bid > 0) {
+                    px = bid - 2 * TickSz();
+                    closeQuoteOk = True;
+                }
+            }
+            If (closeQuoteOk == False) {
+                If (bid0 != InvalidNumeric) {
+                    If (bid0 > 0) {
+                        px = bid0 - 2 * TickSz();
+                        closeQuoteOk = True;
+                    }
+                }
+            }
+            PL("QUOTE_CLOSE date=" + Text(Date()) + " time=" + Text(Time())
+                + " barCnt=" + Text(BarCnt) + " status=" + Text(BarStatus)
+                + " bid()=" + NumStr(bid) + " bid(0)=" + NumStr(bid0)
+                + " close=" + NumStr(Close()) + " px=" + NumStr(px)
+                + " useQuote=" + IIFString(closeQuoteOk, "True", "False"));
+            If (px == InvalidNumeric) {
+                PL("CLOSE_SKIP 无效委托价 close=" + NumStr(Close()));
+                ProbeStage = 4;
+                Return 0;
+            }
+            If (px <= 0) {
+                PL("CLOSE_SKIP 委托价<=0 px=" + NumStr(px));
+                ProbeStage = 4;
+                Return 0;
+            }
+            Bool ok = Sell(ProbeLots, px);
+            ProbeSendTick = ProbeTimerCnt;
+            PL("ORDER_SEND Sell lots=" + Text(ProbeLots)
+                + " px=" + Text(px, 1) + " bid=" + Text(bid, 1)
+                + " ok=" + IIFString(ok, "True", "False")
+                + " date=" + Text(Date()) + " time=" + Text(Time())
+                + " " + PosStr());
+            If (ok) {
+                ProbeStage = 3;
+            }
+            Else {
+                ProbeStage = 4;
+            }
+        }
+        Else If (ProbeStage == 3) {
+            String doneBy = "";
+            If (ProbeCloseFillSeen) {
+                doneBy = "OnFill";
+            }
+            Else If (ProbeCloseOrderFilled) {
+                doneBy = "OnOrderFilled";
+            }
+            Else If (ProbeFlat()) {
+                doneBy = "FlatApi";
+            }
+            If (doneBy <> "") {
+                PL("PROBE_DONE by=" + doneBy
+                    + " onorder=" + Text(ProbeOrderEvtCnt)
+                    + " onfill=" + Text(ProbeFillEvtCnt)
+                    + " entryFill=" + IIFString(ProbeEntryFillSeen, "True", "False")
+                    + " closeFill=" + IIFString(ProbeCloseFillSeen, "True", "False")
+                    + " " + PosStr());
+                ProbeStage = 4;
+            }
+            Else If (ProbeTimerCnt - ProbeSendTick >= ProbeTimeoutSec) {
+                PL("CLOSE_TIMEOUT 平仓未完成 " + PosStr());
+                ProbeStage = 4;
+            }
+        }
+        Return 0;
+    }
+
+Events
+    OnInit() {
+        BarCnt = 0;
+        ProbeTimerCnt = 0;
+        ProbeLiveSeen = False;
+        ProbeStage = 0;
+        ProbeSendTick = 0;
+        ProbeSentEntry = False;
+        ProbeEntryFillSeen = False;
+        ProbeCloseFillSeen = False;
+        ProbeEntryOrderFilled = False;
+        ProbeCloseOrderFilled = False;
+        ProbeOrderEvtCnt = 0;
+        ProbeFillEvtCnt = 0;
+        ProbeHasPending = False;
+        ProbeTimerId = CreateTimer(1000);   // 实时心跳；历史回放期不驱动
+        PL("===== RateCheckProbe v6 =====");
+        PL("symbol=" + Symbol + " freq=" + Frequency() + " mode=" + Text(StrategyMode()));
+        PL("accountExist=" + IIFString(A_AccountDataExist(0), "True", "False")
+            + " accountId=" + A_AccountID(0)
+            + " equity=" + NumStr(A_CurrentEquity(0))
+            + " freeMargin=" + NumStr(A_FreeMargin(0)));
+        PL("PROBE_CFG order=" + IIFString(ProbeOrder, "True", "False")
+            + " lots=" + Text(ProbeLots) + " timeoutSec=" + Text(ProbeTimeoutSec)
+            + " timerId=" + Text(ProbeTimerId) + " " + PosStr());
+        DumpRates("INIT_PRE");
+        If (ProbeSet) {
+            Bool okM = SetMarginRate(ProbeMargin);
+            Bool okC = SetCommissionRate(Enum_Rate_ByFillAmount(), ProbeComm);
+            PL("SET margin ok=" + IIFString(okM, "True", "False")
+                + " comm ok=" + IIFString(okC, "True", "False")
+                + " paramMargin=" + Text(ProbeMargin, 8)
+                + " paramComm=" + Text(ProbeComm, 8));
+            DumpRates("INIT_POST");
+        }
+    }
+
+    OnTimer(Integer id, Integer millsecs) {
+        ProbeTimerCnt = ProbeTimerCnt + 1;
+        If (ProbeLiveSeen == False) {
+            ProbeLiveSeen = True;
+            PL("LIVE timer #" + Text(ProbeTimerCnt) + " id=" + Text(id)
+                + " ms=" + Text(millsecs) + " bar=" + Text(BarCnt)
+                + " sys=" + Text(SystemDateTime()));
+        }
+    }
+
+    OnBar(ArrayRef<Integer> indexs) {
+        Range[0:0] {
+            BarCnt = BarCnt + 1;
+            If (BarCnt <= 2) {
+                PL("BAR" + Text(BarCnt)
+                    + " exist=" + IIFString(A_AccountDataExist(0), "True", "False")
+                    + " id=" + A_AccountID(0)
+                    + " equity=" + NumStr(A_CurrentEquity(0))
+                    + " freeMargin=" + NumStr(A_FreeMargin(0)));
+                DumpRates("BAR" + Text(BarCnt));
+                If (BarCnt == 1) {
+                    Account acc;
+                    If (A_GetAccount(acc)) {
+                        PL("ACCOUNT " + Text(acc));
+                        PL("ACCOUNT dynamic=" + NumStr(acc.dynamicAmount)
+                            + " posProfit=" + NumStr(acc.positionProfitO)
+                            + " available=" + NumStr(acc.available));
+                    }
+                    Else {
+                        PL("ACCOUNT get failed");
+                    }
+                    Position pos;
+                    If (A_GetPosition(pos)) {
+                        PL("POSITION longVol=" + Text(pos.longCurrentVolume)
+                            + " longAvg=" + NumStr(pos.longAvgPriceO)
+                            + " shortVol=" + Text(pos.shortCurrentVolume)
+                            + " shortAvg=" + NumStr(pos.shortAvgPriceO));
+                    }
+                    Else {
+                        PL("POSITION get failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // 下一根 bar 开始前，当前 bar 最后一次驱动；开平仓在这里发单
+    OnBarClose(ArrayRef<Integer> indexs) {
+        Range[0:0] {
+            If (ProbeOrder) {
+                ProbeOrderStep();
+            }
+        }
+    }
+
+    OnOrder(OrderRef ord) {
+        ProbeOrderEvtCnt = ProbeOrderEvtCnt + 1;
+        String st = Text(ord.status);
+        If (ord.status == Enum_Declare) {
+            st = "Declare";
+        }
+        If (ord.status == Enum_Declared) {
+            st = "Declared";
+        }
+        If (ord.status == Enum_FillPart) {
+            st = "FillPart";
+        }
+        If (ord.status == Enum_Filled) {
+            st = "Filled";
+        }
+        If (ord.status == Enum_Canceling) {
+            st = "Canceling";
+        }
+        If (ord.status == Enum_Canceled) {
+            st = "Canceled";
+        }
+        Bool active = (ord.status == Enum_Declare || ord.status == Enum_Declared
+            || ord.status == Enum_FillPart || ord.status == Enum_Canceling);
+        ProbeHasPending = active;
+        If (ord.status == Enum_Filled) {
+            If (ord.combOffset == Enum_Entry) {
+                ProbeEntryOrderFilled = True;
+            }
+            Else {
+                ProbeCloseOrderFilled = True;
+            }
+        }
+        PL("ONORDER #" + Text(ProbeOrderEvtCnt)
+            + " id=" + Text(ord.orderId)
+            + " status=" + Text(ord.status) + "(" + st + ")"
+            + " active=" + IIFString(active, "True", "False")
+            + " side=" + IIFString(ord.side == Enum_Buy, "Buy", "Sell")
+            + " off=" + IIFString(ord.combOffset == Enum_Entry, "Entry", "Exit")
+            + " vol=" + Text(ord.volume)
+            + " fvol=" + Text(ord.fillVolume)
+            + " px=" + Text(ord.price, 1)
+            + " sys=" + Text(SystemDateTime()));
+    }
+
+    OnFill(FillRef ordFill) {
+        ProbeFillEvtCnt = ProbeFillEvtCnt + 1;
+        Bool isBuy = (ordFill.side == Enum_Buy);
+        Bool isEntry = (ordFill.combOffset == Enum_Entry);
+        PL("ONFILL #" + Text(ProbeFillEvtCnt)
+            + " side=" + IIFString(isBuy, "Buy", "Sell")
+            + " off=" + IIFString(isEntry, "Entry", "Exit")
+            + " vol=" + Text(ordFill.volume)
+            + " px=" + Text(ordFill.price, 1)
+            + " fillPx=" + Text(ordFill.fillPrice, 1)
+            + " sys=" + Text(SystemDateTime()) + " " + PosStr());
+        If (ProbeSentEntry) {
+            If (isBuy And isEntry) {
+                ProbeEntryFillSeen = True;
+                If (ProbeStage <> 3) {
+                    ProbeStage = 2;
+                }
+            }
+            Else If (isBuy == False And isEntry == False) {
+                ProbeCloseFillSeen = True;
+            }
+        }
+    }
+
+    OnExit() {
+        PL("PROBE_EXIT stage=" + Text(ProbeStage)
+            + " onorder=" + Text(ProbeOrderEvtCnt)
+            + " onfill=" + Text(ProbeFillEvtCnt)
+            + " entryFill=" + IIFString(ProbeEntryFillSeen, "True", "False")
+            + " closeFill=" + IIFString(ProbeCloseFillSeen, "True", "False")
+            + " entryOrdFilled=" + IIFString(ProbeEntryOrderFilled, "True", "False")
+            + " closeOrdFilled=" + IIFString(ProbeCloseOrderFilled, "True", "False")
+            + " live=" + IIFString(ProbeLiveSeen, "True", "False")
+            + " " + PosStr());
+    }

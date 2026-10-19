@@ -28,6 +28,8 @@
 //   否则禁开新仓；OnInit 时 data1 未就绪 → 首个齐备 bar 复核一次（MAPPING_RECHECK）。回测不校验合约。
 //   挂单门禁（模拟/实盘）：OnOrder 维护未完成委托集合（Declare/Declared/FillPart/Canceling），
 //   非空时拒发任何新委托（开/平/加/损；STALL 边沿遇挂单则放弃本次边沿）；只拦不撤；回测门禁不生效。
+//   回调实证（2026-10-19 RateCheckProbe，TB 期货模拟 p2701）：OnOrder 稳定 1→2→5，
+//   OnFill 的 side/combOffset/volume/price/fillPrice 有效；实盘柜台是否回调仍未验证。
 //
 // 读法红线（MultiSrc 探针实测 43/43 锁定，改代码勿破）:
 //   1) N 窗口 = Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点（TR 用 Close[idx+1]）；
@@ -69,7 +71,7 @@ Params
     String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（须与日志 data0.Symbol 完全一致，区分大小写）
     // ---- 日志 ----
     Integer LogLevel(2);          // 日志级别阈值：消息级别≤本值才写出（0=仅ERROR 1=+WARNING 2=+INFO正常 3=+DEBUG调试）
-    Bool PrintToUI(True);         // 界面镜像：True=同步 Print 到 TB 日志窗口（与文件同阈值过滤）；长回测/批量优化嫌刷屏置 False
+    Bool PrintToUI(True);         // 界面镜像：True=同步 Print 到 K 线图控制台（与文件同阈值）；无图表单元无控制台，只能看日志文件；长回测/批量优化嫌刷屏置 False
     String LogDir("");            // 日志目录：留空=相对平台运行目录（本地/云通用，勿填机器私有路径）；填全路径须以 / 结尾
     Integer LogHour(14);          // 每日定时日志时刻
     Integer LogMinute(45);
@@ -139,8 +141,8 @@ Defs
     // 日志核心：Param LogLevel 阈值过滤（消息级别 ≤ LogLevel 才写出），行首标记=级别：
     //   !!! [Error] !!! 策略无法按预期工作（数据缺失/委托被拒） · [Warn] 异常已自愈/机会丢失/换月
     //   [Info] 正常心跳与成交 · [Debug] 诊断细节
-    //   （.tbf=GBK 纯文本无颜色通道，ERROR 以 !!! [Error] !!! 醒目化替代红色）
-    // 双写：文件恒写；PrintToUI=True 时同一行再 Print 到 TB 日志窗口（同一阈值，界面所见=文件内容）
+    //   （.tbf 为 TB 加密日志文件（非纯文本），无颜色通道，ERROR 以 !!! [Error] !!! 醒目化替代红色）
+    // 双写：文件恒写（图表/无图表一致）；PrintToUI=True 时同一行再 Print 到 K 线图控制台（同一阈值）
     Integer WLogCore(Integer need, String tag, String ts, String s) {
         If (LogLevel >= need) {
             String msg = ts + " | " + tag + " " + s;
@@ -1237,7 +1239,8 @@ Events
     }
 
     // ==================== 回报事件 ====================
-    // 回测不触发（EventProbe 实测 0 次）；模拟/实盘是否回调由柜台决定。
+    // 回测不触发（EventProbe 实测 0 次）；模拟盘实测回调正常（RateCheckProbe 2026-10-19：
+    // OnOrder 1(Declare)→2(Declared)→5(Filled)，OnFill 各字段有效）；实盘是否回调仍由柜台决定。
     // OnOrder 维护挂单门禁（PendingIds），不改台账；OnFill 仅日志，不动 PLots/PCost/StopLine。
 
     OnFill(FillRef ordFill) {
