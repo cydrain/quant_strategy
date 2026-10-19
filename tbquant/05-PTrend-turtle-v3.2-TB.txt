@@ -119,6 +119,7 @@ Vars
     // ---- 挂单门禁（模拟/实盘：OnOrder 维护；回测不触发事件，集合恒空）----
     Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（Declare/Declared/FillPart/Canceling）
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
+    Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流：每交易日仅首条
 
 Defs
     // ---------- 基础辅助 ----------
@@ -424,10 +425,12 @@ Defs
             If (orderDir > 0) {
                 qp = Q_AskPrice(0);   // 买方向改取卖一（对手价，跨价差保成交）
             }
-            If (qp > 0) {   // 盘口有效才采用
-                Return qp;
+            If (qp != InvalidNumeric) {   // 盘口无效时 Q_* 返回 InvalidNumeric（≈1.79e308），必须先排除
+                If (qp > 0) {   // 盘口有效才采用
+                    Return qp;
+                }
             }
-            Return refPrice;   // 盘口无效（未连线/休市）→ 理论价兜底
+            Return refPrice;   // 盘口无效（未连线/休市/历史回放）→ 理论价兜底
         }
         If (orderDir > 0 And Open() > refPrice) {   // 高开越过触发价：买单按开盘价（对买方更贵）
             Return Open();
@@ -499,6 +502,16 @@ Defs
     // 日志中 dir= 恒为委托方向（平仓被拒时与持仓方向符号相反，便于对照委托本身）。
     // 注意：分发必须用 If 块——IIF 两侧都会求值，会把两种指令都发出去。
     Bool DoSendOrder(Integer orderDir, Integer lots, Numeric price, Bool isClose, String reason) {
+        // 无效委托价兜底：InvalidNumeric（≈1.79e308）或 <=0 一律不发单——
+        // 防历史回放/盘口未就绪时把无效价送进交易层（TBCore: trade Error Args）
+        If (price == InvalidNumeric Or price <= 0) {
+            If (LastBadPxYmd != YMD()) {
+                LastBadPxYmd = YMD();
+                WLogW("ORDER_SKIP 无效委托价 reason=" + reason
+                    + " dir=" + Text(orderDir) + " lots=" + Text(lots) + " price=" + Text(price, 1));
+            }
+            Return False;
+        }
         // 挂单门禁：存在未完成委托 → 一律不发新单（开/平/加/损同规则；回测集合恒空）
         If (GetArraySize(PendingIds) > 0) {
             If (LastGateYmd <> YMD()) {
@@ -1026,6 +1039,7 @@ Events
         FillCnt = 0;
         OrderCnt = 0;
         LastGateYmd = 0;
+        LastBadPxYmd = 0;
         PendingClear();                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
         MappingOk = False;
         MappingRecheck = False;
