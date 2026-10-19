@@ -72,7 +72,7 @@ Params
     // ---- 日志 ----
     Integer LogLevel(2);          // 日志级别阈值：消息级别≤本值才写出（0=仅ERROR 1=+WARNING 2=+INFO正常 3=+DEBUG调试）
     Bool PrintToUI(True);         // 界面镜像：True=同步 Print 到 K 线图控制台（与文件同阈值）；无图表单元无控制台，只能看日志文件；长回测/批量优化嫌刷屏置 False
-    String LogDir("");            // 日志目录：留空=相对平台运行目录（本地/云通用，勿填机器私有路径）；填全路径须以 / 结尾
+    String LogDir("C:/Users/MI/work/quant_strategy/tbquant/logs/"); // 日志目录（本机绝对路径，换机器/云需改；留空=平台运行目录）；末位缺 / 时自动补（OnInit 日志打印实际路径）
     Integer LogHour(14);          // 每日定时日志时刻
     Integer LogMinute(45);
 
@@ -123,10 +123,21 @@ Vars
 Defs
     // ---------- 基础辅助 ----------
 
-    // 日志路径：LogDir（可空=平台运行目录）+ 公式名 + data0 合约 + 平台当前日期
+    // 日志目录规范化：非空且末位不是 / 时自动补 /（参数漏写结尾斜杠不再拼坏文件名）
+    String EffectiveLogDir() {
+        If (LogDir == "") {
+            Return "";
+        }
+        If (Right(LogDir, 1) == "/") {
+            Return LogDir;
+        }
+        Return LogDir + "/";
+    }
+
+    // 日志路径：有效日志目录（可空=平台运行目录）+ 公式名 + data0 合约 + 平台当前日期
     // （实盘按物理日分文件；回测整次运行同一文件；P/RU 多实例同目录也不混）
     String LogPath() {
-        Return LogDir + FormulaName() + "_" + Symbol + "_日志_" + Text(CurrentDate());
+        Return EffectiveLogDir() + FormulaName() + "_" + Symbol + "_日志_" + Text(CurrentDate());
     }
 
     // 时间戳：WLog*（bar 上下文）用 bar 日期时间；OnInit 阶段无 bar 时间 → 只能用 WLogInit*，取平台当前时间
@@ -1133,6 +1144,8 @@ Events
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
             + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2));
+        WLogInit("日志: LogDir=[" + LogDir + "] 实际目录=" + IIFString(LogDir == "", "(空=平台运行目录)", EffectiveLogDir())
+            + " 文件=" + LogPath());
         WLogInit("设置(原始返回): SetMarginRate=" + IIFString(okMargin, "True", "False")
             + " SetCommissionRate=" + IIFString(okComm, "True", "False")
             + " SetSlippage=" + IIFString(okSlip, "True", "False")
