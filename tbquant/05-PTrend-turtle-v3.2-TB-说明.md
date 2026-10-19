@@ -298,6 +298,7 @@
 | `entry_stall OPEN` | STALL 并行入场成功（reason=entry_stall） |
 | `stop CLOSE` / `exit_breakout CLOSE` | 2N 共享止损 / 反向突破出场平仓（含 pnl） |
 | `OPEN_SKIP` | 手数不足跳过（按日节流） |
+| `ORDER_SKIP` | 无效委托价（InvalidNumeric/≤0）拒发，按日节流（盘口未就绪/历史回放） |
 | `OPEN_FAIL` / `CLOSE_FAIL` | 委托被拒，下一 bar 重试（可能被门禁拦） |
 | `S1_SKIP` / `BREAKOUT_SKIP` | 系统1 跳过规则触发 |
 | `STALL_FIRE` | STALL 边沿命中并尝试开仓（side/stall/long/short/N） |
@@ -359,6 +360,9 @@
   第 5.2 节 v3.2 收益为聚宽实测基准，不是 TB 结果。
 - 2026-10-19 日志路径自愈：新增 `EffectiveLogDir()`（末位缺 `/` 自动补）与 OnInit `日志:` 行；
   其中 `Right()` 来自官方函数摘要，**待下次 TB 编译确认**。
+- 2026-10-19 无效价守卫：`CalcOrderPrice()` 先排除 `InvalidNumeric`；`DoSendOrder()` 入口对
+  `InvalidNumeric`/`<=0` 拒发并记 `ORDER_SKIP`（每交易日首条）。修复模拟历史回放时
+  `OPEN_FAIL price=N/A`、TBCore `trade Error Buy Price=1.79e308` 刷屏；**待编译/模拟复验**。
 - 事件链探针（RateCheckProbe，2026-10-19，TB 期货模拟 p2701，1 手开平）：
   OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
   MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
