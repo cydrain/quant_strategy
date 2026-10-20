@@ -101,6 +101,7 @@ Vars
     Global Integer StallLongCnt;  // 最近一次边沿的多头停滞计数（-1=窗口内无事件）
     Global Integer StallShortCnt; // 空头镜像
     Global String StallRefSym;    // 签名归属：DailySym()|MainSymbol()，变化=换月/换层→重基线
+    Global String D1LogSig;       // 完整 D1 行去重指纹（合约|OHLC），同一根 data1 bar 只打一次
     // ---- 移仓跟踪 ----
     Global String LastMainSym;    // 上次主力合约；变化=发生移仓
     Global Bool MainSymInit;      // 主力字符串初始化标记
@@ -120,6 +121,10 @@ Vars
     Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（Declare/Declared/FillPart/Canceling）
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
     Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流：每交易日仅首条
+    Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流：每交易日仅首条
+    // ---- 回放期门禁（模拟/实盘：QuoteStatus=RealTime 才允许交易）----
+    Global Bool ReplayGateLogged;     // REPLAY_GATE 日志仅首条
+    Global Bool RealtimeLogged;       // REALTIME_BAR 日志仅首条（回放转实时留痕）
 
 Defs
     // ---------- 基础辅助 ----------
@@ -365,13 +370,28 @@ Defs
 
     // ---------- 资金分支：回测用 Portfolio_*，实盘/模拟用 A_* ----------
 
+    // 策略交易模式（模拟/实盘图表）：不等同于账户已就绪，账户数据可能晚于 OnInit 才就绪。
+    Bool IsStrategyTradeMode() {
+        Return StrategyMode() == Enum_Mode_Strategy_Trade();
+    }
+
     // 实盘/模拟判定（全部资金读取的岔路口）：策略交易模式 + 0 号账户数据已就绪。
     // 第二条件防"模式对了但账户未连线/未就绪"；回测下 A_AccountDataExist=False（探针 R6 实测）。
     Bool IsLiveTrade() {
-        If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
+        If (IsStrategyTradeMode() == False) {
             Return False;
         }
         Return A_AccountDataExist(0);
+    }
+
+    // 模拟/实盘非实时 bar（历史回放/补充数据）→ 跳过交易，只更新通道/STALL 基线；回测恒 False。
+    Bool ShouldSkipTrading() {
+        // 回测没有实时/回放概念，不启用该门禁
+        If (IsStrategyTradeMode() == False) {
+            Return False;
+        }
+        // 模拟/实盘：仅实时行情 bar 允许交易；历史回放/补充数据只更新通道与 STALL 基线
+        Return QuoteStatus() <> Enum_QuoteStatus_RealTime;
     }
 
     // 总权益（含浮盈）：实盘→A_CurrentEquity(0)；回测→Portfolio_CurrentEquity()。
@@ -728,12 +748,18 @@ Defs
         Return 0;
     }
 
-    // 交易统一门槛：挂图合法（MappingOk）+ 已到 TradeStartDate + N/四通道五值均 >0。
+    // 交易统一门槛：挂图合法（MappingOk）+ 模拟/实盘账户已就绪 + 已到 TradeStartDate + N/四通道五值均 >0。
     // 不通过 = 不走 ManagePosition；实盘/模拟在 data1 失效期另由 ManageStopOnly 保留止损保护。
     Bool CanTradeNow() {
         // 模拟/实盘挂图不合法（非主连/两图层不一致/MapToMain=False）→ 禁止开新仓
         If (MappingOk == False) {
             Return False;
+        }
+        // 交易模式但账户数据未就绪 → 拒发一切委托（回测无此限制）
+        If (IsStrategyTradeMode()) {
+            If (IsLiveTrade() == False) {
+                Return False;
+            }
         }
         If (YMD() < TradeStartDate) {
             Return False;
@@ -819,7 +845,8 @@ Defs
     // STALL 边沿评判与入场。返回 True = 本 bar 已尝试 STALL 开仓（OnBar 跳过常规 ManagePosition）。
     // 边沿 = Data1[1] 的 OHLC 签名变化；每根 data1 bar 只消费一次，首次仅建基线；
     // 持仓/挂单/预热期达成 = 错过，不补触发。换月/换层导致引用键变化时重基线，防复权值跳变误触发。
-    Bool TryStallEntry() {
+    // allowOrder=False（历史回放期）：仍推进签名基线与 N/通道，但不下单。
+    Bool TryStallEntry(Bool allowOrder) {
         If (StallEnabled == False) {
             Return False;
         }
@@ -873,6 +900,10 @@ Defs
         StallSigL = sl;
         StallSigC = sc;
         RefreshNChannels();
+        // 回放期：边沿已消费、通道已同步，但不下单（OnBar 已跳过 ManagePosition）
+        If (allowOrder == False) {
+            Return False;
+        }
         If (CanTradeNow() == False) {
             If (LogLevel >= 3) {
                 WLogD("STALL_MISS reason=gated");
@@ -922,6 +953,59 @@ Defs
         // 无论手数不足/委托被拒，均视为本 bar 已尝试（对齐聚宽：STALL 分支不再跑海龟检查）
         DoOpenUnitMarket(side, "entry_stall");
         Return True;
+    }
+
+    // data0 心跳（仅实时 OnBarClose，每根一行）：证明事件循环在跑，并留下价格/仓位/N 状态。
+    // 有 stop 才附 stop，有挂单才附 pend，保持短行。
+    Integer LogBarHeartbeat() {
+        String stopSeg = "";
+        If (MarketPosition() <> 0) {
+            stopSeg = " stop=" + Text(StopLine, 1);
+        }
+        String pendSeg = "";
+        If (GetArraySize(PendingIds) > 0) {
+            pendSeg = " pend=" + Text(GetArraySize(PendingIds));
+        }
+        WLog("HB " + Symbol + " C=" + Text(Close(), 1)
+            + " N=" + Text(NVal, 2)
+            + " pos=" + Text(MarketPosition())
+            + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + stopSeg + pendSeg);
+        Return 0;
+    }
+
+    // data1 完整行（仅实时 OnBarClose，OnBar 之后调用）：新完成的一根 data1 bar 一行，
+    // 含 data1 OHLC + N/四通道 + STALL 计数 + 持仓台账。
+    // 用单一字符串指纹去重（合约|OHLC）：同一根 data1 bar 只打印一次。
+    Integer LogData1Bar() {
+        If (DataCount() < 2) {
+            Return 0;
+        }
+        // 逐项排除 InvalidNumeric（And/Or 不保证短路）
+        If (DailyOpen(1) == InvalidNumeric || DailyHigh(1) == InvalidNumeric ||
+            DailyLow(1) == InvalidNumeric || DailyClose(1) == InvalidNumeric) {
+            Return 0;
+        }
+        If (DailyOpen(1) <= 0 || DailyHigh(1) <= 0 || DailyLow(1) <= 0 || DailyClose(1) <= 0) {
+            Return 0;
+        }
+        Numeric o = DailyOpen(1);
+        Numeric h = DailyHigh(1);
+        Numeric l = DailyLow(1);
+        Numeric c = DailyClose(1);
+        String sig = DailySym() + "|" + MainSymbol() + "|" + Text(o, 4) + "|" + Text(h, 4)
+            + "|" + Text(l, 4) + "|" + Text(c, 4);
+        If (sig == D1LogSig) {
+            Return 0;
+        }
+        D1LogSig = sig;
+        WLog("D1BAR " + DailySym() + "(" + DailyFreq() + ") O=" + Text(o, 1)
+            + " H=" + Text(h, 1) + " L=" + Text(l, 1) + " C=" + Text(c, 1)
+            + " N=" + Text(NVal, 2)
+            + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
+            + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
+            + " stallL=" + Text(StallLongCnt) + " stallS=" + Text(StallShortCnt)
+            + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1));
+        Return 0;
     }
 
     // 交易主流程（每分钟）：按持仓状态路由，每 bar 至多执行一个动作。
@@ -1026,6 +1110,8 @@ Events
         LastRefreshErrYmd = 0;         // 刷新失败日志节流状态复位（0=与当年任何日期不等，首条必记）
         MainSymInit = False;
         SkipNextBreakout = False;
+        ReplayGateLogged = False;
+        RealtimeLogged = False;
         StallEnabled = False;
         StallInit = False;
         StallSigO = 0;
@@ -1035,11 +1121,13 @@ Events
         StallLongCnt = -1;
         StallShortCnt = -1;
         StallRefSym = "";
+        D1LogSig = "";
         FinalDone = False;
         FillCnt = 0;
         OrderCnt = 0;
         LastGateYmd = 0;
         LastBadPxYmd = 0;
+        LastAcctWarnYmd = 0;
         PendingClear();                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
         MappingOk = False;
         MappingRecheck = False;
@@ -1142,7 +1230,7 @@ Events
         WLogInit("模式: StrategyMode=" + Text(StrategyMode())
             + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
             + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + " Chart=" + Text(Enum_Mode_Strategy_Chart()));
-        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合（模拟/实盘）；回测不触发事件→不生效");
+        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合；回放期门禁=QuoteStatus<>RealTime 期间不下单（模拟/实盘）；回测均不生效");
         WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
             + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " StallPeriod=" + Text(StallPeriod)
             + " MaxUnits=" + Text(MaxUnits));
@@ -1200,19 +1288,49 @@ Events
             RecheckMapping();
 
             // ---- 2. STALL 并行入场（先于常规海龟检查）----
-            // True=边沿上确实尝试了开仓 → 本 bar 跳过常规检查（对齐聚宽 stall 分支的 elif）；
-            // False=无边沿/边沿已消费 → 照常走止损/出场/加仓（持仓中达成 STALL 时仍管理持仓，
-            // 此点与聚宽 elif 不同，为有意偏差，见说明文档）。
-            If (TryStallEntry() == False) {
-                // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
-                If (CanTradeNow()) {
-                    ManagePosition();
+            // 回放期门禁：模拟/实盘非实时 bar 不下单（否则历史 bar 委托被拒→乐观台账→
+            // 下一 tick 清理→重试，形成 OPEN_FAIL/信号闪烁循环）。只推进 STALL 基线与通道，
+            // 不调用 ManagePosition；QuoteStatus=RealTime 的首根 bar 恢复交易。回测不受影响。
+            // 只看运行模式（账户数据常晚于回放开始才就绪）；账户未就绪另由 CanTradeNow 拦。
+            If (ShouldSkipTrading()) {
+                If (ReplayGateLogged == False) {
+                    ReplayGateLogged = True;
+                    WLog("REPLAY_GATE 非实时 bar：只更新通道/STALL 基线，不交易（QuoteStatus=" + Text(QuoteStatus()) + "）");
                 }
-                Else {
-                    // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
-                    // 回测保持原语义，TradeStartDate 之前也不动作。
-                    If (IsLiveTrade() And YMD() >= TradeStartDate) {
-                        ManageStopOnly();
+                TryStallEntry(False);
+            }
+            Else {
+                If (IsStrategyTradeMode()) {
+                    If (RealtimeLogged == False) {
+                        RealtimeLogged = True;
+                        WLog("REALTIME_BAR QuoteStatus=" + Text(QuoteStatus()) + " 恢复交易");
+                    }
+                }
+                // True=边沿上确实尝试了开仓 → 本 bar 跳过常规检查（对齐聚宽 stall 分支的 elif）；
+                // False=无边沿/边沿已消费 → 照常走止损/出场/加仓（持仓中达成 STALL 时仍管理持仓，
+                // 此点与聚宽 elif 不同，为有意偏差，见说明文档）。
+                If (TryStallEntry(True) == False) {
+                    // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
+                    If (CanTradeNow()) {
+                        ManagePosition();
+                    }
+                    Else {
+                        // 交易模式但账户数据未就绪：暂停一切委托（CanTradeNow 已拦），每交易日首条告警
+                        If (IsStrategyTradeMode()) {
+                            If (IsLiveTrade() == False) {
+                                If (YMD() >= TradeStartDate) {
+                                    If (LastAcctWarnYmd <> YMD()) {
+                                        LastAcctWarnYmd = YMD();
+                                        WLogW("ACCT_NOT_READY 交易模式但账户数据未就绪，暂停交易（检查账户连接/绑定）");
+                                    }
+                                }
+                            }
+                        }
+                        // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
+                        // 回测保持原语义，TradeStartDate 之前也不动作。
+                        If (IsLiveTrade() And YMD() >= TradeStartDate) {
+                            ManageStopOnly();
+                        }
                     }
                 }
             }
@@ -1260,6 +1378,23 @@ Events
                     WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " win=" + Text(WinSize()) + " DataCount=" + Text(DataCount())
                         + " N=" + Text(NVal, 1) + " pos=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
                         + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
+                }
+            }
+        }
+    }
+
+    // 每根 data0 bar 收盘时驱动一次（下一根 bar 开始前，末根不触发）。
+    // 逐 bar 诊断只在模拟/实盘实时行情输出：回测与历史回放不刷日志。
+    // indexs=本次驱动收盘的图层集：心跳只在含 0 时打，滤掉 data1 单独收盘的额外事件。
+    OnBarClose(ArrayRef<Integer> indexs) {
+        // [红线] 同 OnBar：只放 Range[0:0]，避免多图层各跑一遍
+        Range[0:0] {
+            If (IsStrategyTradeMode()) {
+                If (QuoteStatus() == Enum_QuoteStatus_RealTime) {
+                    If (ArrayFind(indexs, 0)) {
+                        LogBarHeartbeat();
+                    }
+                    LogData1Bar();
                 }
             }
         }
