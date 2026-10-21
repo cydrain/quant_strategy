@@ -52,7 +52,7 @@
 | data1 | 同合约日线（标准） | 同合约日线（标准） | 同合约日线（标准） |
 | MapToMain | 主连图 True / 单合约切片 False | **必须 True** | **必须 True** |
 | 下单价 | 触发价；跳空越过时按开盘价 | 盘口对手价（买吃卖一、卖吃买一） | 同模拟 |
-| 资金口径 | `Portfolio_*` | `A_*` | `A_*` |
+| 资金口径 | 风险基数 `Min(InitCapital, Portfolio_CurrentEquity)`；保证金 `Portfolio_CurrentCapital` | 风险基数 `Min(InitCapital, A_CurrentEquity)`；保证金 `A_FreeMargin` | 同模拟 |
 | 挂单门禁 | 不生效（事件不回调） | 生效（OnOrder） | 生效（OnOrder） |
 | 历史回放期 | 无此阶段，正常执行 | 只更新 STALL 基线/N/通道，不下单（`REPLAY_GATE`）；`QuoteStatus=RealTime` 后恢复（`REALTIME_BAR`） | 同模拟（实盘未验证 QuoteStatus 行为） |
 | 换月 | 主连图后复权；单合约图无 | 平台原生自动换仓 + 委托映射主力 | 同模拟 |
@@ -89,6 +89,14 @@
      改成单合约代码——`MapToMain=True` 会把委托映射到真实主力。
    - 回放期门禁依赖平台 `QuoteStatus()`：模拟已实测历史回放=1、实时=4；实盘返回值未验证
      （见第 7.3 节）。
+6. **参数校验（OnInit 执行一次）**
+   - 核心参数（方向/风险/资金/手续费/滑点/乘数/保证金/加仓与止损距离/开始日期）非法：逐条记
+     `参数非法` ERROR，**只禁止开新仓与加仓，止损/平仓照常**；
+   - `SetMarginRate`/`SetCommissionRate`/`SetSlippage` 返回值均不校验（False 可能属正常返回，
+     设置仍生效）；`SlipTicks` 仍要求 >=0（`SetInitCapital` 无返回值）；
+   - 计算口径参数（`NPeriod/NSmooth/EntryN/ExitN` 及窗口预算）非法：N/四通道保持 0；实盘/模拟退化到
+     `STOP_ONLY`（仅按最后有效止损线平仓），反向突破出场不可用；
+   - 参数整轮不变、不会中途恢复——看到 `参数非法` 请停止策略、改参数后重跑。
 
 ---
 
@@ -206,7 +214,7 @@
      两者只在模拟/实盘实时行情输出，回测与历史回放不输出。
 6. **首单链路验收**：
    - `ORDER #n ... PEND_ADD` → 成交/撤单后 `PEND_DEL`、`pending=0`；
-   - 成交时 `FILL` 行与 `OPEN`/`CLOSE` 行的方向、手数、价格能对上；
+   - 成交时 `FILL id=... fillId=...` 可与账户成交记录对应，`fillVol`/方向/价格与 `OPEN`/`CLOSE` 行能对上；
    - 只有挂单期间出现 `ORDER_GATE`（每日首条）；持续不解除 = 终态事件缺失；
    - 成交跨 bar/重启/部分成交时可能出现 `LEDGER_CLEAN`/`STATE_REBUILD`，出现后核对手数与止损。
 7. **STALL 验收**：模拟从当前时间开始，只能等下一个日线边沿（通常 21:01）验证实时链路；
@@ -231,12 +239,11 @@
 
 1. 门禁连止损一起拦，且无撤单/超时 —— 实盘最大风险；
 2. OnOrder/OnFill 回测确认不回调（EventProbe）；模拟盘已由 RateCheckProbe 实测回调正常
-   （2026-10-19，p2701，Declare→Declared→Filled + OnFill 字段完整）；实盘柜台是否回调仍未验证；
+   （2026-10-19，p2701，Declare→Declared→Filled + OnFill 基础字段有效）；实盘柜台是否回调仍未验证；
 3. 乐观台账 + 成交跨 bar：先 `LEDGER_CLEAN` 后 `STATE_REBUILD`，数量可恢复；
    UnitCount 按平台建仓次数恢复，止损按重建时的 N 重推，可能与入场时略有偏差；
 4. `MAPPING ok=False` 若由 data1 晚就绪导致，首 bar 会复核；若仍 False，检查合约/图层/参数；
-5. ~~OnFill `FillRef.volume` 字段未验证~~ **已消除**：2026-10-19 模拟实测
-   `volume/price/fillPrice` 均有效；
+5. OnFill 的 `orderId/fillId/fillVolume` 待实测（`fillId` 为 String）；仅日志，不影响交易；
 6. 回放期门禁依赖平台 `QuoteStatus()`：若实时行情仍返回 History/Supplement，策略会一直
    “只更新不下单”（不会误单，但也不会交易）。模拟已实测 History=1/RealTime=4，实盘未验证；
 7. 交易还要求账户数据就绪（`A_AccountDataExist`）：交易模式下账户未登录/未就绪时，
@@ -266,7 +273,7 @@
 
 1. **不建议在门禁事件链验证前上实盘**：先完成第 7 节的模拟清单；实盘前补
    stale-pending 超时或撤单（当前版本没有）。
-2. **账户与下单**：资金用 `A_CurrentEquity / A_FreeMargin`；下单吃盘口对手价
+2. **账户与下单**：手数风险基数 `Min(InitCapital, A_CurrentEquity)`，保证金上限 `A_FreeMargin`；下单吃盘口对手价
    （买吃卖一、卖吃买一），盘口无效退回收盘价/理论价。
 3. **换月（主连图 P9888 + MapToMain=True）**：委托自动映射真实主力；平台原生自动换仓，
    公式检测 `MainSymbol()` 变化后重建台账并记 `ROLLOVER`。
@@ -276,9 +283,11 @@
      实盘/模拟仍会用最后有效止损线尝试平仓（`STOP_ONLY`）；
    - 委托被拒（停板等）→ `OPEN_FAIL/CLOSE_FAIL`，下一 bar 自动重试（但可能被门禁拦）；
    - 海龟是趋势跟踪策略，历史切片属于“已知行情”的参数验证，实盘前务必先模拟。
-5. **日志**：模拟/实盘按物理日分文件，同日续写不清空；回测 OnInit 会删除当日文件。
-   文件名格式 `公式名_合约_日志_yyyyMMdd.tbf`（合约取 data0 的 `Symbol`，如
-   `PTrendTurtle_v32_p9888.DCE_日志_20261018.tbf`），同目录跑 P/RU 两个实例也不会混。
+5. **日志**：所有模式都写、只追加、不删除（同一天多次运行/回测都追加在同一文件）。
+   模拟/实盘按物理日分文件；非交易模式（简单回测、图表历史计算/图表回测）文件名带 `_BT`。
+   文件名格式 `公式名_合约[_BT]_日志_yyyyMMdd.tbf`（合约取 data0 的 `Symbol`，如
+   `PTrendTurtle_v32_p9888.DCE_日志_20261018.tbf`、回测 `PTrendTurtle_v32_p9888.DCE_BT_日志_20261018.tbf`），
+   同目录跑 P/RU 两个实例也不会混。
    `.tbf` 不是纯文本，用 TB 的「数据中心 → 文件查看器」打开，或
    `python tbquant/tools/read_tbf.py <日志.tbf> <导出.txt>` 导出。
    OnInit 会写一行 `日志: LogDir=[...] 实际目录=... 文件=...`；`LogDir` 非空但末位漏写
@@ -306,14 +315,14 @@
 | EntryN | 20 | 突破入场通道周期（系统1=20） |
 | ExitN | 10 | 反向突破出场通道周期（系统1=10） |
 | **StallPeriod** | **10** | 连续 N 根 data1 极值停滞 → 入场；0=关闭 STALL |
-| UnitRisk | 0.01 | 1 unit 风险预算（占权益比例） |
-| MarginCapPct | 0.10 | 保证金占用上限（占权益比例，0=不限） |
+| UnitRisk | 0.01 | 1 unit 风险预算（占风险资金比例） |
+| MarginCapPct | 0.10 | 保证金占用上限（占风险资金比例，0=不限） |
 | MaxUnits | 4 | 最大 unit 数（含首仓） |
 | AddStepN | 0.5 | 顺向每 N×该值 加 1 unit |
 | StopDistN | 2.0 | 止损距离（N 倍数） |
 | S1Skip | 0 | 1=上次突破盈利则跳过下一次同类突破 |
 | TradeStartDate | 20200313 | 开始交易日期 yyyymmdd；之前仅预热不交易 |
-| InitCapital | 1000000 | 初始资金（回测） |
+| InitCapital | 1000000 | 初始资金（回测）；模拟/实盘兼作风险资金上限 |
 | MultiplierP | 10 | 合约乘数（元/点/手，P=10） |
 | MarginRateP | 0.12 | 保证金率 |
 | CommissionRateP | 0.000023 | 手续费率（按成交金额） |
@@ -345,7 +354,7 @@
 | `STATE_REBUILD` | 台账按平台持仓重建（重启/不一致/部分成交） |
 | `LEDGER_CLEAN` | 空仓残留台账清理 |
 | `DAILY` | 每日 14:45 快照（N/EL/XL/ES/XS/units/stop/equity/d1；有挂单时附 pend/ids） |
-| `ORDER` / `FILL` | OnOrder/OnFill 回报（模拟/实盘；回测不触发） |
+| `ORDER` / `FILL` | OnOrder/OnFill 回报；`FILL` 含 `id`/`fillId`/`fillVol`（模拟/实盘；回测不触发） |
 | `PEND_ADD` / `PEND_DEL` | 未完成委托集合增加/移除 |
 | `ORDER_GATE` | 有未完成委托，拒发新单（按交易日首条） |
 | `REPLAY_GATE` | 模拟/实盘进入历史回放期（`QuoteStatus<>RealTime`）：只更新通道/STALL 基线，不下单（每次启动首次进入非实时行情时一条） |
@@ -355,7 +364,8 @@
 | `D1BAR` | 实时 data1 完整行（每根新 data1 bar 至多一条，OHLC 指纹去重；OHLC/N/四通道/STALL 计数/台账；回测与历史回放不输出） |
 | `MAPPING` / `MAPPING_RECHECK` | 模拟/实盘挂图合法性（data0/data1/主连/MapToMain） |
 | `日志:` | OnInit 打印 `LogDir` 原值、实际目录与文件名（确认路径是否生效） |
-| `N/四通道刷新失败` | ERROR：data1 缺失/合约错位/历史不足/参数越界 → 拒绝开新仓与常规管理（实盘仍走 STOP_ONLY 止损兜底），逐 bar 重试 |
+| `N/四通道刷新失败` | ERROR：data1 缺失/合约错位/历史不足 → 拒绝开新仓与常规管理（实盘仍走 STOP_ONLY 止损兜底），逐 bar 重试 |
+| `参数非法` | ERROR（OnInit）：逐条列出非法参数与要求；只禁开新仓/加仓，止损/平仓保留 |
 | `TRADE_GATE` | 未到 TradeStartDate，不会产生交易动作 |
 | `EXIT fill=... order=... pending=...` | 停止策略单元时的事件计数汇总 |
 | `=== 运行结束` | 回测末根 bar 期末对账（BarCnt/pos/contracts/lots/equity） |
@@ -373,7 +383,7 @@
   海龟部分仍运行。公式不会为 STALL 扩大 WinSize（会破坏 N 对拍）。
 - **Q：新日线的 OHLC 与上一根完全相同，会漏触发吗？** A：会。签名不变 = 不认为出现新边沿；
   日线概率极低，30 分钟略高。可换 data1 周期或接受该边界。
-- **Q：换月/复权跳变会误触发 STALL 吗？** A：`DailySym()|MainSymbol()` 变化时会重设基线，
+- **Q：换月/复权跳变会误触发 STALL 吗？** A：`D1Sym()|MainSymbol()` 变化时会重设基线，
   新基准的第一根只建立签名，不触发；换月后需等下一个日线边沿。
 - **Q：重启/回放会补触发吗？** A：不会。首根只建立基线；持仓中达成也只记 MISS，不补。
 - **Q：STALL 与突破同 bar，先跑哪个？** A：STALL 先；STALL 选中后本 bar 不再跑突破，
