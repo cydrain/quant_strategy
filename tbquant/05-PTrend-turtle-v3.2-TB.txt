@@ -125,7 +125,7 @@ Vars
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
     Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流：每交易日仅首条
     Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流：每交易日仅首条
-    // ---- 回放期门禁（模拟/实盘：QuoteStatus=RealTime 才允许交易）----
+    // ---- 回放期门禁（模拟/实盘：启动回放或非实时 bar 不允许交易）----
     Global Bool ReplayGateLogged;     // REPLAY_GATE 日志仅首条
     Global Bool RealtimeLogged;       // REALTIME_BAR 日志仅首条（回放转实时留痕）
 
@@ -499,14 +499,24 @@ Defs
         Return A_AccountDataExist(0);
     }
 
-    // 模拟/实盘非实时 bar（历史回放/补充数据）→ 跳过交易，只更新通道/STALL 基线；回测恒 False。
-    Bool ShouldSkipTrading() {
-        // 回测没有实时/回放概念，不启用该门禁
-        If (IsStrategyTradeMode() == False) {
-            Return False;
+    // 当前阶段是否允许发单（True=可交易）。只管「阶段」；账户/日期/通道等业务条件由 CanTradeNow 判断。
+    // 简单回测/参数优化(mode≠0,1)=全部 bar 可交易；模拟/实盘(mode=1)=仅实时 bar；
+    // 图表模式(mode=0)=自动交易关（图表回测）可交易；自动交易开（图表交易）一律不发单。
+    Bool IsTradablePhase() {
+        Bool inBacktest = IsBacktestMode();      // 简单回测/参数优化：mode≠Trade 且 ≠Chart
+        Bool inTrade = IsStrategyTradeMode();    // 模拟/实盘策略交易：mode=Trade
+        Bool isRealtimeBar = (QuoteStatus() == Enum_QuoteStatus_RealTime);
+
+        // 1) 简单回测/参数优化（mode≠0,1）：每根 bar 都参与模拟成交
+        If (inBacktest) {
+            Return True;
         }
-        // 模拟/实盘：仅实时行情 bar 允许交易；历史回放/补充数据只更新通道与 STALL 基线
-        Return QuoteStatus() <> Enum_QuoteStatus_RealTime;
+        // 2) 模拟/实盘（mode=1）：只允许当前实时 bar
+        If (inTrade) {
+            Return isRealtimeBar;
+        }
+        // 3) 图表模式（mode=0）：自动交易关=图表回测→可交易；自动交易开=图表交易→一律不发单
+        Return IsTradeEnabled() == False;
     }
 
     // 总权益（含浮盈）：实盘→A_CurrentEquity(0)；回测→Portfolio_CurrentEquity()。供权益日志。
@@ -1350,8 +1360,9 @@ Events
         }
         WLogInit("模式: StrategyMode=" + Text(StrategyMode())
             + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
+            + " AutoTrade=" + IIFString(IsTradeEnabled(), "True", "False")
             + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + " Chart=" + Text(Enum_Mode_Strategy_Chart()));
-        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合；回放期门禁=QuoteStatus<>RealTime 期间不下单（模拟/实盘）；回测均不生效");
+        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合；回放期门禁=模拟/实盘非实时 bar 不下单；图表模式自动交易开（图表交易）一律不发单；简单回测与图表回测不拦");
         WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
             + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " StallPeriod=" + Text(StallPeriod)
             + " MaxUnits=" + Text(MaxUnits));
@@ -1412,11 +1423,13 @@ Events
             // 回放期门禁：模拟/实盘非实时 bar 不下单（否则历史 bar 委托被拒→乐观台账→
             // 下一 tick 清理→重试，形成 OPEN_FAIL/信号闪烁循环）。只推进 STALL 基线与通道，
             // 不调用 ManagePosition；QuoteStatus=RealTime 的首根 bar 恢复交易。回测不受影响。
-            // 只看运行模式（账户数据常晚于回放开始才就绪）；账户未就绪另由 CanTradeNow 拦。
-            If (ShouldSkipTrading()) {
+            // 两种不可交易阶段：①模拟/实盘的非实时 bar ②图表模式自动交易开（图表交易）。
+            // 账户未就绪另由 CanTradeNow 拦。
+            If (IsTradablePhase() == False) {
                 If (ReplayGateLogged == False) {
                     ReplayGateLogged = True;
-                    WLog("REPLAY_GATE 非实时 bar：只更新通道/STALL 基线，不交易（QuoteStatus=" + Text(QuoteStatus()) + "）");
+                    WLog("REPLAY_GATE 跳过交易：只更新通道/STALL 基线（mode=" + Text(StrategyMode())
+                        + " QuoteStatus=" + Text(QuoteStatus()) + "）");
                 }
                 TryStallEntry(False);
             }
