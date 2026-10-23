@@ -6,10 +6,10 @@
 >
 > v3.2 = v3.1 的海龟交易逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样保留，
 > 新增 **STALL 极值停滞并行入场**；同时补齐模拟/实盘运行硬化：主连挂图校验、挂单门禁、
-> **历史回放期门禁**（`QuoteStatus()==RealTime` 才允许交易）、实时 `HB`/`D1BAR` 诊断日志、
-> OnOrder/OnFill 回报日志、`SlipTicks` 命名。
-> `StallPeriod=0` 时**回测交易逻辑**应与 v3.1 一致（回放期门禁不作用于回测；模拟/实盘另有
-> 主连校验、挂单门禁与回放期门禁）。
+> **历史回放期门禁**（模拟/实盘仅 `QuoteStatus()==RealTime` 可交易；图表模式开启自动交易则一律
+> 不发单）、实时 `HB`/`D1BAR` 诊断日志、OnOrder/OnFill 回报日志、`SlipTicks` 命名。
+> `StallPeriod=0` 时**回测交易逻辑**应与 v3.1 一致（回放期门禁不作用于简单回测与图表回测；
+> 模拟/实盘另有主连校验、挂单门禁与回放期门禁）。
 
 ---
 
@@ -37,7 +37,7 @@
 | `MainContSymbol` | 无 | 新增，默认 `p9888.DCE` |
 | 模拟/实盘挂图校验 | 无 | data0/data1 必须同一主连 + `MapToMain=True`，否则禁止开新仓 |
 | 挂单门禁 | 无 | OnOrder 未完成委托集合非空时拒发任何新委托 |
-| 历史回放期门禁 | 无 | 模拟/实盘启动回放阶段只更新 STALL 基线/N/通道，`QuoteStatus()<>RealTime` 期间不下单；回测不生效 |
+| 历史回放期门禁 | 无 | 模拟/实盘启动回放阶段只更新 STALL 基线/N/通道，`QuoteStatus()<>RealTime` 期间不下单；图表模式开启自动交易（图表交易）一律不发单；简单回测/图表回测不生效 |
 | 实时诊断日志 | 无 | 模拟/实盘实时行情：data0 每根 `HB` 心跳、data1 每根 `D1BAR` 完整行；回测/历史回放不输出 |
 | 回报日志 | 无 | `ORDER`/`FILL`/`ORDER_GATE`/`PEND_ADD`/`PEND_DEL`/`EXIT` |
 
@@ -244,8 +244,11 @@
    UnitCount 按平台建仓次数恢复，止损按重建时的 N 重推，可能与入场时略有偏差；
 4. `MAPPING ok=False` 若由 data1 晚就绪导致，首 bar 会复核；若仍 False，检查合约/图层/参数；
 5. OnFill 的 `orderId/fillId/fillVolume` 待实测（`fillId` 为 String）；仅日志，不影响交易；
-6. 回放期门禁依赖平台 `QuoteStatus()`：若实时行情仍返回 History/Supplement，策略会一直
+6. 回放期门禁在交易模式下依赖平台 `QuoteStatus()`：若实时行情仍返回 History/Supplement，策略会一直
    “只更新不下单”（不会误单，但也不会交易）。模拟已实测 History=1/RealTime=4，实盘未验证；
+   图表交易判定依赖 `IsTradeEnabled()`：图表模式下 OnInit 恒读到 False（加载时开关尚未打开），
+   打开自动交易后的 bar 读到 True——2026-10-23 Ag888 已实测（见 7.3），结论依赖平台
+   “先加载、后开自动交易”的固定流程；
 7. 交易还要求账户数据就绪（`A_AccountDataExist`）：交易模式下账户未登录/未就绪时，
    `ACCT_NOT_READY` 告警并暂停委托；模拟启动时账户须先登录。
 
@@ -254,16 +257,25 @@
 - **问题**：图表启动时平台先补历史 bar。历史 bar 上的委托会被交易层拒绝，而台账是“下单即记账”
   的乐观台账，于是每根 bar 出现 `OPEN_FAIL` → `LEDGER_CLEAN` → 下一 bar 重试，并伴随 TBCore
   `信号闪烁` 刷屏（2026-10-19 模拟日志已复现）。
-- **判据**：`ShouldSkipTrading()` 只看运行模式与行情状态——模拟/实盘下 `QuoteStatus()<>RealTime`
-  即跳过交易；`QuoteStatus` 枚举：历史回放=1、补充数据=2、实时=4（模拟日志已实测 1/4）。
-  回测无实时/回放概念，门禁恒不生效。
-- **行为**：非实时 bar 只调用 `TryStallEntry(False)`（推进 STALL 签名基线、消费 data1 边沿、
-  同步 N/四通道），跳过 `ManagePosition` 与 `ManageStopOnly`；每次启动首次进入非实时行情记一条
-  `REPLAY_GATE`。`QuoteStatus()==RealTime` 的首根 bar 记 `REALTIME_BAR` 并恢复正常交易。
+- **判据**：`IsTradablePhase()` 按运行模式分三种情况——
+  简单回测/参数优化（mode≠0,1）：恒可交易；
+  模拟/实盘（mode=1）：仅 `QuoteStatus()==RealTime` 可交易（枚举：历史回放=1、补充数据=2、实时=4，
+  模拟日志已实测 1/4）；
+  图表模式（mode=0）：`IsTradeEnabled()==False`（自动交易关=图表回测/看盘）→可交易；
+  自动交易开=图表交易→一律不发单。图表回测同样运行在 mode=0（2026-10-21 p2405 `_BT` 实测
+  `StrategyMode=0`），不能仅凭 mode 区分；TBQuant 只能“先加载策略、后开自动交易”，
+  加载回放时开关必为关，因此回放走图表回测口径（只成交在图表层），开自动交易后的每根 bar 都被拦截。
+- **行为**：不可交易阶段只调用 `TryStallEntry(False)`（推进 STALL 签名基线、消费 data1 边沿、
+  同步 N/四通道），跳过 `ManagePosition` 与 `ManageStopOnly`；每次启动首次进入不可交易阶段记一条
+  `REPLAY_GATE`（含 `mode` 与 `QuoteStatus`）。模拟/实盘转入实时 bar 后记 `REALTIME_BAR` 并恢复交易；
+  图表模式在打开自动交易后的首根实时 bar 记 `REPLAY_GATE (mode=0 QuoteStatus=4)`，此后不再发单。
 - **不补**：回放期消耗掉的 STALL 边沿、突破/止损都不会在实时补做；这是启动语义，与重启一致。
-- **范围**：仅模拟/实盘（策略交易模式）；回测下 `ShouldSkipTrading()` 恒 False，行为与 v3.1 一致。
+- **范围**：简单回测/参数优化恒可交易；图表回测可交易的前提是图表“自动交易”开关关闭（正常回测时
+  即为关闭）；模拟/实盘按上述实时 bar 判据。
 - **排查**：启动后长时间只有 `REPLAY_GATE` 没有 `REALTIME_BAR` → `QuoteStatus()` 未进入 RealTime
   （检查行情连接/交易时段）或账户未就绪（看 `ACCT_NOT_READY`）；两者都不影响回测。
+  图表模式打开自动交易后仍有 entry/OPEN（日志无 `REPLAY_GATE mode=0`）→ 说明 `IsTradeEnabled()`
+  返回 False，门禁未命中，需更换判据并留日志复测（2026-10-23 Ag888 实测命中）。
 
 ---
 
@@ -357,7 +369,7 @@
 | `ORDER` / `FILL` | OnOrder/OnFill 回报；`FILL` 含 `id`/`fillId`/`fillVol`（模拟/实盘；回测不触发） |
 | `PEND_ADD` / `PEND_DEL` | 未完成委托集合增加/移除 |
 | `ORDER_GATE` | 有未完成委托，拒发新单（按交易日首条） |
-| `REPLAY_GATE` | 模拟/实盘进入历史回放期（`QuoteStatus<>RealTime`）：只更新通道/STALL 基线，不下单（每次启动首次进入非实时行情时一条） |
+| `REPLAY_GATE` | 进入不可交易阶段（模拟/实盘 `QuoteStatus<>RealTime`；图表模式已开自动交易）：只更新通道/STALL 基线，不下单（每次启动首次进入时一条） |
 | `REALTIME_BAR` | `QuoteStatus=RealTime` 的首根 bar = 门禁解除、恢复交易（每次启动首次实时时一条） |
 | `ACCT_NOT_READY` | 交易模式但账户数据未就绪，暂停委托（每交易日首条） |
 | `HB` | 实时心跳（每根 data0 收盘一条；C/N/pos/units/lots，有止损/挂单时附 stop/pend；回测与历史回放不输出） |
@@ -397,9 +409,10 @@
 - **Q：`MAPPING ok=False`，但图表看起来没问题？** A：逐项核对 `data0.Symbol` 与 `MainContSymbol`
   的大小写/后缀、data1 是否同合约、`MapToMain=True`；若 OnInit 时 data1 未就绪，看
   `MAPPING_RECHECK`；仍 False 时按 `MAP_FAIL` 行修正。
-- **Q：模拟/实盘启动后一直只有 `REPLAY_GATE`、不下单？** A：说明 `QuoteStatus()` 仍未进入
-  RealTime，或账户数据未就绪（看 `ACCT_NOT_READY`）。检查行情连接/交易时段与账户登录；
-  回测不受影响。另外，若回放期恰好达成 STALL/突破，实时不会补做（见 7.3）。
+- **Q：模拟/实盘启动后一直只有 `REPLAY_GATE`、不下单？** A：说明仍处于启动回放
+  （`QuoteStatus<>RealTime`），或账户数据未就绪（看 `ACCT_NOT_READY`）。检查行情连接/
+  交易时段与账户登录；回测不受影响。另外，若回放期恰好达成 STALL/突破，实时不会补做（见 7.3）。
+  图表模式（mode=0）开自动交易后同样恒为 `REPLAY_GATE`，属预期——图表交易不发单。
 - **Q：日志里 SetMarginRate 等返回 False，设置没生效？** A：生效；v3.1 切片终值与聚宽按
   12%/0.000023/1 跳对拍一致可证。返回值语义未明，不代表设置失败。
 - **Q：回测日志里 MainSymbol 显示“未来合约”？** A：平台行为——回测下 `MainSymbol()` 恒为当前
@@ -411,7 +424,8 @@
 
 - 代码：静态复查（花括号平衡、Global 声明、Data1 访问仅限访问器段、日志关键字、UTF-8+CRLF）；
   7 个聚宽 STALL 触发日已用 awk 按同口径复算全部命中。
-- TB 侧：**编译已通过（2026-10-20，含回放期门禁与无效价守卫）；v3.2 回测尚未实跑；模拟已复跑验证回放期门禁与实时日志**；
+- TB 侧：**编译已通过（2026-10-20，含回放期门禁与无效价守卫）；2026-10-23 图表回测（mode=0，双图层）
+  已实跑（p9888/Ag888），尚未与聚宽逐笔对拍；模拟已复跑验证回放期门禁与实时日志**；
   第 6.3 节 TB 触发时点为预期值，不是实测值；第 5.2 节 v3.2 收益为聚宽实测基准，不是 TB 结果。
 - 2026-10-19 日志路径自愈：新增 `EffectiveLogDir()`（末位缺 `/` 自动补）与 OnInit `日志:` 行；
   其中 `Right()` 来自官方函数摘要，**2026-10-20 编译通过**。
@@ -424,6 +438,16 @@
   不再产生被拒委托、乐观台账与 `信号闪烁`。**编译通过；2026-10-20 22:55 模拟复跑验证**：历史
   回放段 `QuoteStatus=1`、无 `HB`/`D1BAR`；22:55 转实时（`REALTIME_BAR`，`QuoteStatus=4`）后
   `HB` 逐分钟输出、`D1BAR` 在新 data1 bar 输出一条；无委托/报错。
+- 2026-10-23 启动回放门禁补齐：`StrategyMode=0` 的启动回放期此前绕过门禁，回放 bar 上的委托
+  能进真实账户，但图表格不记该成交，随后被 `LEDGER_CLEAN` 清账（2026-10-21 模拟 7 手单实测）。
+  函数更名为 `IsTradablePhase()`（原 `ShouldSkipTrading()`，语义取反），判据按模式三分：回测/参数
+  优化恒可交易 → 模拟/实盘仅实时 bar → 图表模式自动交易关（图表回测/看盘）放行、开（图表交易）
+  一律拦截。图表回测运行在 mode=0（2026-10-21 p2405 `_BT` 日志实测），不能按 mode 区分。
+  OnInit 模式行增加 `AutoTrade=` 诊断（初始尝试的 `A_AccountDataExist` 是全局账户状态，
+  图表回测同样返回 True，不能用于区分图表回测/图表交易）。
+  **2026-10-23 验证**：模拟 mode=1 冷启动/移除重挂，回放期均无委托，`REALTIME_BAR` 后恢复交易；
+  Ag888 图表 mode=0——加载（自动交易关）回放正常成交于图表层，打开自动交易后首根实时 bar
+  `REPLAY_GATE (mode=0 QuoteStatus=4)`，此后无 entry/OPEN/ORDER_*。
 - 事件链探针（RateCheckProbe，2026-10-19，TB 期货模拟 p2701，1 手开平）：
   OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
   MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
