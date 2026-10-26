@@ -32,6 +32,18 @@
 //   OnFill 的 side/combOffset/volume/price/fillPrice 有效；fillId 为 String，orderId/fillVolume 待实测。
 //   实盘柜台是否回调仍未验证。
 //
+// 下单通道（2026-10-27）：模拟/实盘一律走账户接口 A_Buy/A_SellShort/A_Sell/A_BuyToCover——
+//   显式落地合约（GetLayerOrderMapSymbols 首个，缺省 MainSymbol）与真实价（图价 ÷ Rollover()，
+//   按 RealTickSize 取整到可成交方向：买向上、卖向下）。账户委托不参与平台 bar 信号统计 → 不再
+//   "信号闪烁/成交回滚"；图表口径空仓时也能平掉映射仓。回测/图表回测仍用
+//   Buy/SellShort/Sell/BuyToCover（历史回测口径不变）。
+//   持仓真值：实时（QuoteStatus=RealTime）每根新 bar 用 4 参 A_GetPosition(落地合约) 对账；
+//   成交后跳 2 根、换月后跳 2 根新 bar 再对账（等柜台/换仓落地）；有未完成委托时不对账。
+//   账户有仓而台账为空/手数方向不符 → 自动接管重建（STATE_REBUILD src=acct），止损线按均价重推。
+//   发送前按账户持仓门禁：平仓手数收敛为实际同向持仓（无可平则跳过）；加仓须已有同向持仓；
+//   其余开仓须账户空仓；账户持仓不可读 → 禁开仓（平仓按台账兜底）。
+//   共用账户内其它策略/手工仓会被一并接管——本策略要求账户专用。
+//
 // 读法红线（MultiSrc 探针实测 43/43 锁定，改代码勿破）:
 //   1) N 窗口 = Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点（TR 用 Close[idx+1]）；
 //      入场通道 = Data1.High/Low[1..EntryN]；出场通道 = Data1.High/Low[1..ExitN]。
@@ -67,7 +79,8 @@ Params
     Numeric MultiplierP(10);      // 合约乘数（元/点/手，P=10）
     Numeric MarginRateP(0.12);    // 保证金率
     Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
-    Numeric SlipTicks(1);         // 回测撮合滑点（跳；P 一跳=2 元/吨）；模拟/实盘实际滑点由盘口/柜台成交决定
+    Numeric SlipTicks(1);         // 回测撮合滑点（跳）；模拟/实盘实际滑点由盘口/柜台成交决定
+    Numeric RealTickSize(1);      // 落地真实合约最小变动价，按合约填：p=1（2026-04-10 起）、ru=5、ag=1。主连图 MinMove 不可信（p9888=1），真实价取整必用本值
     Bool MapToMain(True);         // True=主连图/模拟/实盘（换月全套+委托映射主力）；False=单合约切片图（不复权、不映射）
     String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（须与日志 data0.Symbol 完全一致，区分大小写）
     // ---- 日志 ----
@@ -120,14 +133,30 @@ Vars
     // ---- 模拟/实盘挂图合法性（OnInit：data0/data1 同一主连 + MapToMain=True；回测不校验）----
     Global Bool MappingOk;
     Global Bool MappingRecheck;   // OnInit 判定失败时置位：首个 data1 就绪的 bar 复核一次（防 data1 晚挂载误锁）
-    // ---- 挂单门禁（模拟/实盘：OnOrder 维护；回测不触发事件，集合恒空）----
+    // ---- 挂单门禁（模拟/实盘：OnOrder 维护 + 每根 bar 按平台未成交列表校正；回测不触发）----
     Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（Declare/Declared/FillPart/Canceling）
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
+    Global Integer LastSyncWarnYmd;   // PEND_SYNC_FAIL 查询失败日志节流：每交易日仅首条
     Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流：每交易日仅首条
     Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流：每交易日仅首条
+    Global Array<String> SyncMapSyms; // 挂单同步查询合约缓存
     // ---- 回放期门禁（模拟/实盘：启动回放或非实时 bar 不允许交易）----
     Global Bool ReplayGateLogged;     // REPLAY_GATE 日志仅首条
     Global Bool RealtimeLogged;       // REALTIME_BAR 日志仅首条（回放转实时留痕）
+    // ---- 账户真值对账（模拟/实盘：4 参 A_GetPosition 读落地合约；回测不用）----
+    Global Integer PDir;              // 台账持仓方向：+1 多 / -1 空 / 0 空仓（模拟/实盘以此为准）
+    Global Bool AcctPosOk;            // 最近一次账户持仓读取是否成功（False → 禁开仓）
+    Global Numeric AcctLong;          // 账户落地合约多头手数
+    Global Numeric AcctShort;         // 账户落地合约空头手数
+    Global Numeric AcctLongAvg;       // 账户多头均价（真实价）
+    Global Numeric AcctShortAvg;      // 账户空头均价（真实价）
+    Global String AcctSym;            // 本次读取的落地合约（诊断）
+    Global Integer SyncBlockBars;     // 对账宽限：刚成交/刚换月时跳过的新 bar 数
+    Global String LastSyncBarSig;     // 对账去重：同一根 bar 只对账一次
+    Global Integer LastAcctPosWarnYmd;// ACCT_POS_FAIL 日志节流：每交易日首条
+    Global Integer LastCloseSkipYmd;  // 平仓无可平持仓 ORDER_SKIP 日志节流：每交易日首条
+    Global Integer LastSentLots;      // 最近一次成功委托的实际手数（平仓收敛后，供日志/盈亏）
+    Global Array<String> AcctSyms;    // 账户持仓合约清单（区分"空仓"与"读取失败"）
 
 Defs
     // ---------- 基础辅助 ----------
@@ -239,8 +268,11 @@ Defs
         LastSkipYmd = 0;
         LastRefreshErrYmd = 0;
         LastGateYmd = 0;
+        LastSyncWarnYmd = 0;
         LastBadPxYmd = 0;
         LastAcctWarnYmd = 0;
+        LastAcctPosWarnYmd = 0;
+        LastCloseSkipYmd = 0;
         Return 0;
     }
 
@@ -324,6 +356,10 @@ Defs
         }
         If (SlipTicks < 0) {
             ParamErr("SlipTicks", Text(SlipTicks, 2), ">=0");
+            ok = False;
+        }
+        If (RealTickSize <= 0) {
+            ParamErr("RealTickSize", Text(RealTickSize, 2), ">0（按合约填：p=1、ru=5、ag=1）");
             ok = False;
         }
         If (TradeStartDate < 19000101 Or TradeStartDate > 21001231) {
@@ -499,6 +535,43 @@ Defs
         Return A_AccountDataExist(0);
     }
 
+    // ---------- 持仓口径：回测=图表函数；模拟/实盘=台账（由账户真值对账维护）----------
+    // 图表口径（MarketPosition/CurrentContracts/AvgEntryPrice）看不到「委托映射主力」后的真实持仓，
+    // 模拟/实盘一律改用台账 + 4 参 A_GetPosition 对账；回测沿用图表函数（历史回测口径不变）。
+    Integer PosDirNow() {
+        If (IsLiveTrade()) {
+            Return PDir;
+        }
+        If (MarketPosition() > 0) {
+            Return 1;
+        }
+        If (MarketPosition() < 0) {
+            Return -1;
+        }
+        Return 0;
+    }
+
+    Integer PosLotsNow() {
+        If (IsLiveTrade()) {
+            Return PLots;
+        }
+        Return IntPart(Abs(CurrentContracts()));
+    }
+
+    Numeric PosAvgChart() {
+        If (IsLiveTrade()) {
+            If (PLots > 0) {
+                Return PCost / PLots;
+            }
+            Return 0;
+        }
+        Numeric a = AvgEntryPrice();
+        If (a <= 0 And PLots > 0) {
+            Return PCost / PLots;
+        }
+        Return a;
+    }
+
     // 当前阶段是否允许发单（True=可交易）。只管「阶段」；账户/日期/通道等业务条件由 CanTradeNow 判断。
     // 简单回测/参数优化(mode≠0,1)=全部 bar 可交易；模拟/实盘(mode=1)=仅实时 bar；
     // 图表模式(mode=0)=自动交易关（图表回测）可交易；自动交易开（图表交易）一律不发单。
@@ -649,6 +722,371 @@ Defs
         Return s;
     }
 
+    // 挂单同步用的委托落地合约：优先平台层映射表，其次 MainSymbol，最后图表合约。
+    String OrderMapSym() {
+        ArrayClear(SyncMapSyms);
+        If (GetLayerOrderMapSymbols(SyncMapSyms)) {
+            If (GetArraySize(SyncMapSyms) > 0) {
+                Return SyncMapSyms[0];
+            }
+        }
+        If (MainSymbol() <> "") {
+            Return MainSymbol();
+        }
+        Return Symbol;
+    }
+
+    // 每根 bar 按平台未成交委托列表校正挂单集合：OnOrder 漏报终态时下一根 bar 自动解锁；
+    // 查询失败保持原集合不动（防误放行）。仅模拟/实盘执行，回测/图表不调用。
+    Integer SyncPendingFromAccount() {
+        If (IsLiveTrade() == False) {
+            Return 0;
+        }
+        String sym = OrderMapSym();
+        Array<Integer> unfilled;
+        Bool ok = A_GetUnFillOrderIDs(sym, unfilled);
+        If (ok == False) {
+            If (LastSyncWarnYmd <> YMD()) {
+                LastSyncWarnYmd = YMD();
+                WLogW("PEND_SYNC_FAIL 查询未成交委托失败 sym=" + sym
+                    + "，沿用本地集合=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr());
+            }
+            Return 0;
+        }
+        String before = PendingStr();
+        PendingClear();
+        Integer n = GetArraySize(unfilled);
+        Integer i;
+        For i = 0 To n - 1 {
+            PendingAdd(unfilled[i]);
+        }
+        String after = PendingStr();
+        If (before <> after) {
+            WLog("PEND_SYNC sym=" + sym + " before=[" + before + "] after=[" + after + "]");
+        }
+        Return 0;
+    }
+
+    // ---------- 账户真值（模拟/实盘）：落地合约 + 真实价 + 4 参持仓 ----------
+
+    // 落地真实合约最小变动价位（价格值）。参数 RealTickSize 优先（按合约手填：p=1、ru=5、ag=1）；
+    // 主连图上 MinMove 是连续合约口径（p9888 实测 MinMove=1、PriceScale=1），不能直接当真实跳动。
+    Numeric RealTick() {
+        If (RealTickSize > 0) {
+            Return RealTickSize;
+        }
+        Numeric t = MinMove();
+        If (t <= 0) {
+            t = MinMove() * PriceScale();
+        }
+        If (t <= 0) {
+            t = 1;
+        }
+        Return t;
+    }
+
+    // 图价 → 真实价并取整到可成交方向：买向上、卖向下（跨价保成交）。
+    // 复权系数：真实价 = 图价 / Rollover()（MapPositionProbe 2026-10-22 实测：
+    // 图 11741.97 / 1.22759769 ≈ 9565，再按 RealTickSize 取整后委托）。任一步无效 → InvalidNumeric。
+    Numeric RealOrderPrice(Numeric chartPx, Integer orderDir) {
+        If (NumValid(chartPx) == False) {
+            Return InvalidNumeric;
+        }
+        Numeric r = Rollover();
+        If (NumValid(r) == False) {
+            Return InvalidNumeric;
+        }
+        Numeric rp = chartPx / r;
+        If (NumValid(rp) == False) {
+            Return InvalidNumeric;
+        }
+        Numeric t = RealTick();
+        Numeric q = rp / t;
+        Numeric n = IntPart(q);
+        // 浮点误差容差 1e-6 跳：恰好落在跳动上不额外跨价
+        If (q - n > 0.999999) {
+            n = n + 1;
+        }
+        If (orderDir > 0) {
+            If (q - n > 0.000001) {
+                n = n + 1;
+            }
+        }
+        Numeric px = n * t;
+        // 消浮点尾差（用乘法缩放，避免整数/整数除法语义差异）
+        px = IntPart(px * 1000000 + 0.5) * 0.000001;
+        If (px <= 0) {
+            Return InvalidNumeric;
+        }
+        Return px;
+    }
+
+    // 读取落地合约的账户持仓（4 参 A_GetPosition；图表口径/1 参读不到映射仓）。
+    // A_GetPosition 返回 False 时用账户持仓清单区分：清单可用且不含该合约 = 真空仓（AcctPosOk=True）；
+    // 否则视为读取失败（AcctPosOk=False → 禁开仓）。日志按交易日节流。
+    // 注：账户为策略单元共享——其它策略/手工仓会一并读入，本策略要求账户专用。
+    Integer RefreshAccountPosition() {
+        String sym = OrderMapSym();
+        AcctSym = sym;
+        Position p;
+        Bool ok = A_GetPosition(sym, p, "", 0);
+        AcctPosOk = False;
+        If (ok) {
+            If (p.longCurrentVolume != InvalidNumeric And p.shortCurrentVolume != InvalidNumeric) {
+                AcctLong = p.longCurrentVolume;
+                AcctShort = p.shortCurrentVolume;
+                AcctLongAvg = p.longAvgPriceO;
+                AcctShortAvg = p.shortAvgPriceO;
+                AcctPosOk = True;
+            }
+        }
+        Else {
+            ArrayClear(AcctSyms);
+            If (A_GetPositionSymbols(AcctSyms, 0)) {
+                Bool found = False;
+                Integer i;
+                For i = 0 To GetArraySize(AcctSyms) - 1 {
+                    If (AcctSyms[i] == sym) {
+                        found = True;
+                    }
+                }
+                If (found == False) {
+                    AcctLong = 0;
+                    AcctShort = 0;
+                    AcctLongAvg = 0;
+                    AcctShortAvg = 0;
+                    AcctPosOk = True;
+                }
+            }
+        }
+        If (AcctPosOk == False) {
+            If (LastAcctPosWarnYmd <> YMD()) {
+                LastAcctPosWarnYmd = YMD();
+                WLogW("ACCT_POS_FAIL 账户持仓读取失败 sym=" + sym + "，暂停开仓（平仓按台账兜底）");
+            }
+        }
+        Return 0;
+    }
+
+    // 以账户真值为准整体重建台账（模拟/实盘唯一重建入口；回测走 RebuildLedger 图表分支）。
+    // 场景：重启台账归零、委托映射后图表口径全 0、部分成交/人工干预、换月后。
+    // 映射：PLots/PDir ← 账户同合约多空手数；PCost/LastUnitPrice ← 账户均价 × Rollover()（图口径）；
+    //       UnitCount 至少 1；StopLine 按均价 − dir×StopDistN×NVal 重推（N 无效置 0）。
+    // 局限：加仓次数/末次入场价无法从账户恢复——加仓步进以均价为基准、止损线偏保守；
+    //       不支持同合约多空对锁（读到对锁 = 记 ERROR + 停交易，需人工处理）。
+    Integer RebuildLedgerFromAcct() {
+        RefreshAccountPosition();
+        If (AcctPosOk == False) {
+            Return 0;
+        }
+        Integer al = IntPart(AcctLong);
+        Integer as = IntPart(AcctShort);
+        If (al > 0 And as > 0) {
+            WLogE("STATE_REBUILD src=acct 对锁持仓 long=" + Text(al) + " short=" + Text(as)
+                + "（不支持锁仓，暂停交易，需人工处理）");
+            AcctPosOk = False;
+            Return 0;
+        }
+        If (al <= 0 And as <= 0) {
+            If (PLots <> 0 Or UnitCount <> 0) {
+                WLogW("STATE_REBUILD src=acct flat prevLots=" + Text(PLots) + " prevUnits=" + Text(UnitCount));
+            }
+            PLots = 0;
+            PCost = 0;
+            UnitCount = 0;
+            LastUnitPrice = 0;
+            StopLine = 0;
+            PDir = 0;
+            Return 0;
+        }
+        Integer dir = 1;
+        Integer cc = al;
+        Numeric avgReal = AcctLongAvg;
+        If (as > 0) {
+            dir = -1;
+            cc = as;
+            avgReal = AcctShortAvg;
+        }
+        Numeric avgChart = 0;
+        Numeric r = Rollover();
+        If (NumValid(avgReal) And NumValid(r)) {
+            avgChart = avgReal * r;
+        }
+        If (NumValid(avgChart) == False) {
+            avgChart = Close();
+        }
+        PLots = cc;
+        PDir = dir;
+        If (UnitCount < 1) {
+            UnitCount = 1;
+        }
+        PCost = avgChart * cc;
+        LastUnitPrice = avgChart;
+        If (NVal > 0) {
+            StopLine = LastUnitPrice - dir * StopDistN * NVal;
+        }
+        Else {
+            StopLine = 0;
+        }
+        WLogW("STATE_REBUILD src=acct dir=" + Text(dir) + " lots=" + Text(cc)
+            + " units=" + Text(UnitCount) + " avgReal=" + Text(avgReal, 1)
+            + " avgChart=" + Text(avgChart, 1) + " stop=" + Text(StopLine, 1)
+            + " N=" + Text(NVal, 2));
+        Return 0;
+    }
+
+    // 账户接口下单（模拟/实盘唯一出口）：真实落地合约 + 真实价 + 发送前账户持仓门禁。
+    // 门禁：①平仓手数=实际同向持仓（账户不可读时退回台账手数；无可平 → 跳过）
+    //       ②加仓须账户已有同向持仓 ③其余开仓须账户多空均为 0（有仓 → 重建台账并跳过）
+    // 成功返回 True，并把平台返回的 orderId 加入挂单门禁集合。
+    Bool SendAcctOrder(Integer orderDir, Integer lots, Numeric chartPx, Bool isClose, String reason) {
+        String sym = OrderMapSym();
+        RefreshAccountPosition();
+        Integer lots2 = lots;
+        If (isClose) {
+            Numeric side = AcctLong;
+            If (orderDir > 0) {
+                side = AcctShort;   // 买平 → 可平的是空头
+            }
+            If (AcctPosOk == False) {
+                side = PLots;       // 账户不可读：按台账兜底（止损优先于门禁）
+            }
+            lots2 = IntPart(side);
+            If (lots2 <= 0) {
+                If (LastCloseSkipYmd <> YMD()) {
+                    LastCloseSkipYmd = YMD();
+                    WLogW("ORDER_SKIP 无可平持仓 reason=" + reason + " dir=" + Text(orderDir)
+                        + " ledgerLots=" + Text(PLots) + " acctOk=" + IIFString(AcctPosOk, "True", "False"));
+                }
+                Return False;
+            }
+            If (lots2 <> lots) {
+                WLog("CLOSE_CLAMP reason=" + reason + " lots=" + Text(lots) + " -> " + Text(lots2)
+                    + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort))
+                    + " acctOk=" + IIFString(AcctPosOk, "True", "False"));
+            }
+        }
+        Else {
+            If (reason == "add") {
+                Bool sameSide = (orderDir > 0 And AcctLong > 0) Or (orderDir < 0 And AcctShort > 0);
+                If (AcctPosOk == False Or sameSide == False) {
+                    WLogW("OPEN_BLOCK 加仓需账户已有同向持仓 reason=" + reason + " dir=" + Text(orderDir)
+                        + " acctOk=" + IIFString(AcctPosOk, "True", "False")
+                        + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort)));
+                    Return False;
+                }
+            }
+            Else {
+                If (AcctPosOk == False) {
+                    WLogW("OPEN_BLOCK 账户持仓不可读，禁止开仓 reason=" + reason);
+                    Return False;
+                }
+                If (AcctLong > 0 Or AcctShort > 0) {
+                    WLogW("OPEN_BLOCK 账户已有持仓，禁止开仓 reason=" + reason
+                        + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort)));
+                    RebuildLedgerFromAcct();   // 立即对齐，下一 bar 按持仓管理
+                    Return False;
+                }
+            }
+        }
+        Numeric px = RealOrderPrice(chartPx, orderDir);
+        If (px == InvalidNumeric Or px <= 0) {
+            If (LastBadPxYmd != YMD()) {
+                LastBadPxYmd = YMD();
+                WLogW("ORDER_SKIP 真实委托价无效 reason=" + reason + " pxChart=" + Text(chartPx, 1)
+                    + " rollover=" + Text(Rollover(), 4));
+            }
+            Return False;
+        }
+        Array<Integer> ids;
+        Bool ok = False;
+        If (isClose) {
+            If (orderDir > 0) {
+                ok = A_BuyToCover(sym, lots2, px, ids);
+            }
+            Else {
+                ok = A_Sell(sym, lots2, px, ids);
+            }
+        }
+        Else {
+            If (orderDir > 0) {
+                ok = A_Buy(sym, lots2, px, ids);
+            }
+            Else {
+                ok = A_SellShort(sym, lots2, px, ids);
+            }
+        }
+        Integer idCnt = GetArraySize(ids);
+        Integer i;
+        For i = 0 To idCnt - 1 {
+            PendingAdd(ids[i]);
+        }
+        // 平台未返回委托号：挂单门禁无法登记，成交也可能晚于对账 → 延后对账 2 根防台账先归零再重建
+        If (ok And idCnt == 0) {
+            SyncBlockBars = Max(SyncBlockBars, 2);
+            WLogW("ORDER_NO_ID via=acct reason=" + reason + " sym=" + sym
+                + " dir=" + Text(orderDir) + " lots=" + Text(lots2) + "（无委托号，延后对账 2 根）");
+        }
+        LastSentLots = lots2;
+        WLog("ORDER_SEND via=acct reason=" + reason + " sym=" + sym
+            + " dir=" + Text(orderDir) + " close=" + IIFString(isClose, "True", "False")
+            + " lots=" + Text(lots2) + " pxReal=" + Text(px, 1) + " pxChart=" + Text(chartPx, 1)
+            + " rollover=" + Text(Rollover(), 4) + " ids=" + Text(idCnt)
+            + " ok=" + IIFString(ok, "True", "False"));
+        If (ok == False) {
+            WLogE("ORDER_REJECT via=acct reason=" + reason + " sym=" + sym
+                + " dir=" + Text(orderDir) + " lots=" + Text(lots2) + " pxReal=" + Text(px, 1));
+        }
+        Return ok;
+    }
+
+    // 每根新 bar 对账（模拟/实盘实时）：把台账校正到账户真值。
+    // 跳过：同一根 bar 已对账 / 有未完成委托（等终态）/ 成交或换月后的宽限期。
+    // 重建条件：手数或方向不符，或有仓但止损线缺失（接管首 bar 补上）。
+    Integer SyncAcctOnNewBar() {
+        If (IsLiveTrade() == False) {
+            Return 0;
+        }
+        String sig = Text(Date()) + "|" + Text(Time());
+        If (sig == LastSyncBarSig) {
+            Return 0;
+        }
+        LastSyncBarSig = sig;
+        If (GetArraySize(PendingIds) > 0) {
+            WLogD("ACCT_SYNC skip pending=" + Text(GetArraySize(PendingIds)));
+            Return 0;
+        }
+        If (SyncBlockBars > 0) {
+            SyncBlockBars = SyncBlockBars - 1;
+            WLogD("ACCT_SYNC skip grace remain=" + Text(SyncBlockBars));
+            Return 0;
+        }
+        RefreshAccountPosition();
+        If (AcctPosOk == False) {
+            Return 0;
+        }
+        Integer al = IntPart(AcctLong);
+        Integer as = IntPart(AcctShort);
+        If (al > 0 And as > 0) {
+            WLogE("ACCT_SYNC 同合约多空同时持仓 long=" + Text(al) + " short=" + Text(as)
+                + "（不支持锁仓，暂停交易，需人工处理）");
+            AcctPosOk = False;
+            Return 0;
+        }
+        Integer acctLots = al + as;
+        Integer acctDir = 0;
+        If (al > 0) {
+            acctDir = 1;
+        }
+        If (as > 0) {
+            acctDir = -1;
+        }
+        If (PLots <> acctLots Or PDir <> acctDir Or (acctLots > 0 And StopLine <= 0 And NVal > 0)) {
+            RebuildLedgerFromAcct();
+        }
+        Return 0;
+    }
+
     // 发送委托：开仓/平仓共用入口；失败记 FAIL 日志并返回 False（调用方放弃本次动作）。
     // orderDir = 委托方向（+1 买 / -1 卖）；isClose=True 平仓（卖平/买平），False 开仓（买开/卖开）。
     // 日志中 dir= 恒为委托方向（平仓被拒时与持仓方向符号相反，便于对照委托本身）。
@@ -676,6 +1114,11 @@ Defs
             Return False;
         }
         Bool ok = False;
+        If (IsLiveTrade()) {
+            // 模拟/实盘：账户接口（不进平台 bar 信号统计 → 不会信号闪烁/成交回滚）
+            ok = SendAcctOrder(orderDir, lots, price, isClose, reason);
+            Return ok;
+        }
         If (isClose) {
             If (orderDir > 0) {
                 ok = BuyToCover(lots, price);
@@ -692,6 +1135,7 @@ Defs
                 ok = SellShort(lots, price);
             }
         }
+        LastSentLots = lots;
         If (ok == False) {
             WLogE(IIFString(isClose, "CLOSE_FAIL", "OPEN_FAIL") + " 委托被拒 reason=" + reason
                 + " dir=" + Text(orderDir) + " lots=" + Text(lots) + " price=" + Text(price, 1));
@@ -721,6 +1165,7 @@ Defs
         PCost = PCost + orderPrice * lots;
         LastUnitPrice = orderPrice;
         UnitCount = UnitCount + 1;
+        PDir = dir;
         StopLine = LastUnitPrice - dir * StopDistN * NVal;
         WLog(reason + " OPEN dir=" + Text(dir) + " lots=" + Text(lots) + " price=" + Text(orderPrice, 1)
             + " N=" + Text(NVal, 1) + " stop=" + Text(StopLine, 1)
@@ -749,6 +1194,7 @@ Defs
         UnitCount = 0;
         LastUnitPrice = 0;
         StopLine = 0;
+        PDir = 0;
         Return 0;
     }
 
@@ -759,16 +1205,21 @@ Defs
         }
         // 委托方向 = 持仓方向取反（多平=卖、空平=买）
         Numeric orderPrice = CalcOrderPrice(dir * -1, refPrice);
-        Numeric avg = AvgEntryPrice();
-        If (avg <= 0) {
+        Numeric avg = PosAvgChart();
+        If (avg <= 0 And PLots > 0) {
             avg = PCost / PLots;
         }
         Integer lots = PLots;
         If (DoSendOrder(dir * -1, lots, orderPrice, True, reason) == False) {
             Return 0;
         }
-        Numeric pnl = (orderPrice - avg) * lots * MultiplierP * dir;
-        WLog(reason + " CLOSE dir=" + Text(dir) + " lots=" + Text(lots) + " price=" + Text(orderPrice, 1)
+        // 账户路径会把平仓手数收敛为实际同向持仓（可能 ≠ 台账），盈亏按实发手数计
+        Integer sent = LastSentLots;
+        If (sent <= 0) {
+            sent = lots;
+        }
+        Numeric pnl = (orderPrice - avg) * sent * MultiplierP * dir;
+        WLog(reason + " CLOSE dir=" + Text(dir) + " lots=" + Text(sent) + " price=" + Text(orderPrice, 1)
             + " avg=" + Text(avg, 1) + " pnl=" + Text(pnl, 0)
             + " units=" + Text(UnitCount) + " equity=" + Text(CurEquity(), 0));
         If (S1Skip > 0 And pnl > 0) {
@@ -783,7 +1234,8 @@ Defs
 
     // 台账重建：唯一「以平台为准」的写入口——乐观台账（下单成功即记账）与平台失同步时整体覆盖。
     // 触发场景：① ManagePosition 每 bar 数量对账失配（重启全局归零 / 部分成交 / 手工干预等）；
-    //          ② 换月——UpdateMainSymbol 检测到主力变化且持仓≠0（基准换到新合约）。
+    //          ② 换月——UpdateMainSymbol 检测到主力变化且持仓≠0（回测立即重建；模拟/实盘延后 2 根
+    //             新 bar 由 SyncAcctOnNewBar 按账户真值重建，避开换仓/映射中间态）。
     // 数据映射：PLots ← CurrentContracts；
     //          UnitCount ← CurrentEntries（下限 1）；
     //          PCost ← AvgEntryPrice×cc（≤0 退回收盘价）；
@@ -794,6 +1246,10 @@ Defs
     // 后置保证：返回后 PLots 与平台手数一致（守卫收敛，不会连续重建）；调用点均在意向判断
     //           （止损/加仓/入场）之前，同 bar 风控即使用修复后的台账。
     Integer RebuildLedger() {
+        // 模拟/实盘：图表口径看不到映射仓，只能按账户真值重建
+        If (IsLiveTrade()) {
+            Return RebuildLedgerFromAcct();
+        }
         // 平台真值：当前总手数（Abs 统一多空符号、IntPart 取整）
         Integer cc = IntPart(Abs(CurrentContracts()));
         PLots = cc;
@@ -815,6 +1271,7 @@ Defs
         If (MarketPosition() < 0) {
             dir = -1;
         }
+        PDir = dir;
         StopLine = LastUnitPrice - dir * StopDistN * NVal;
         // WARNING 留痕：contracts/entries/avg/lastEntry/stop 全量落日志，便于事后审计
         WLogW("STATE_REBUILD contracts=" + Text(cc) + " entries=" + Text(UnitCount) + " avg=" + Text(avg, 1)
@@ -826,8 +1283,10 @@ Defs
 
     // 主力换月检测：比较 MainSymbol() 字符串，变化=换月——留 ROLLOVER 日志，持仓≠0 时重建台账
     // 基准（TB 原生自动换仓把平台均价换到新合约价格口径，策略台账需跟随重建）。
-    // 调用时机：OnBar 每 bar 无条件（不放 ManagePosition 内——空仓时换月日志也要记；也不放 OnBarOpen——
-    //           重建须紧贴交易判断：bar 中途换月时同一 OnBar 内先重建、后风控，旧口径 StopLine 不漏判）。
+    // 调用时机：OnBar 每 bar 无条件（不放 ManagePosition 内——空仓时换月日志也要记）。
+    //           回测：换月 bar 立即重建，紧贴同 bar 交易判断（旧口径 StopLine 不漏判）；
+    //           模拟/实盘：图表口径无映射仓，只置对账宽限，由下一根实时新 bar 的
+    //           SyncAcctOnNewBar（OnBarOpen，先于 OnBar）按账户真值重建。
     // 盲区：停机期间发生换月时，重启后 MainSymInit 走静默分支不报 ROLLOVER——一致性由
     //       RebuildLedger 的数量守卫兜底，仅缺日志条（增强备选：按换月日历时间兜底检测）。
     // 后置保证：返回后 LastMainSym == 当前 MainSymbol()，同一换月不会重复触发。
@@ -843,13 +1302,20 @@ Defs
         }
         // 字符串变化 = 发生换月（自动换仓已在平台侧完成）
         If (ms <> LastMainSym) {
-            // WARNING 留痕：旧→新 + 换仓后的平台状态（pos=-1/0/1，contracts=平台手数）
-            WLogW("ROLLOVER " + LastMainSym + " -> " + ms + " pos=" + Text(MarketPosition())
-                + " contracts=" + Text(CurrentContracts()) + " avg=" + Text(AvgEntryPrice(), 1));
+            // WARNING 留痕：旧→新 + 换仓后的台账/账户状态（pos=方向，lots=台账手数）
+            WLogW("ROLLOVER " + LastMainSym + " -> " + ms + " pos=" + Text(PosDirNow())
+                + " lots=" + Text(PosLotsNow()) + " avg=" + Text(PosAvgChart(), 1));
             LastMainSym = ms;
-            // 有持仓：台账基准整体换成新合约口径（均价/末次入场价/止损线）
-            If (MarketPosition() <> 0) {
-                RebuildLedger();
+            If (PosLotsNow() <> 0) {
+                If (IsLiveTrade()) {
+                    // 换仓/委托映射切换需要时间：延后 2 根新 bar 再按账户真值对账，防读到换仓中间态
+                    SyncBlockBars = Max(SyncBlockBars, 2);
+                    WLogW("ROLLOVER_SYNC 延后 2 根新 bar 按账户真值重建");
+                }
+                Else {
+                    // 有持仓：台账基准整体换成新合约口径（均价/末次入场价/止损线）
+                    RebuildLedger();
+                }
             }
         }
         Return 0;
@@ -895,6 +1361,10 @@ Defs
         // 交易模式但账户数据未就绪 → 拒发一切委托（回测无此限制）
         If (IsStrategyTradeMode()) {
             If (IsLiveTrade() == False) {
+                Return False;
+            }
+            // 账户持仓读取失败 → 无法做发送前门禁，禁开仓（止损平仓走 ManageStopOnly 兜底）
+            If (AcctPosOk == False) {
                 Return False;
             }
         }
@@ -1076,7 +1546,7 @@ Defs
         If (side < 0) {
             sideTxt = "short";
         }
-        If (MarketPosition() <> 0) {
+        If (PosLotsNow() <> 0) {
             WLog("STALL_MISS side=" + sideTxt + " reason=holding stall=" + Text(StallPeriod));
             Return False;
         }
@@ -1102,17 +1572,25 @@ Defs
     // 有 stop 才附 stop，有挂单才附 pend，保持短行。
     Integer LogBarHeartbeat() {
         String stopSeg = "";
-        If (MarketPosition() <> 0) {
+        If (PosLotsNow() <> 0) {
             stopSeg = " stop=" + Text(StopLine, 1);
         }
         String pendSeg = "";
         If (GetArraySize(PendingIds) > 0) {
             pendSeg = " pend=" + Text(GetArraySize(PendingIds));
         }
+        // 模拟/实盘附加账户真值（图表口径看不到映射仓，pos= 恒 0 属正常）
+        String acctSeg = "";
+        If (IsLiveTrade()) {
+            RefreshAccountPosition();
+            acctSeg = " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
+                + " acctS=" + Text(IntPart(AcctShort))
+                + " acctOk=" + IIFString(AcctPosOk, "True", "False");
+        }
         WLog("HB " + Symbol + " C=" + Text(Close(), 1)
             + " N=" + Text(NVal, 2)
             + " pos=" + Text(MarketPosition())
-            + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + stopSeg + pendSeg);
+            + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + stopSeg + pendSeg + acctSeg);
         Return 0;
     }
 
@@ -1157,7 +1635,7 @@ Defs
     // 调用前提：OnBar 第 2 步且 CanTradeNow() 通过（MappingOk + TradeStartDate + N/四通道有效）。
     Integer ManagePosition() {
         // 空仓分支：先清残留台账（手工平仓/异常后可能残留），再尝试入场
-        If (MarketPosition() == 0) {
+        If (PosLotsNow() == 0) {
             If (PLots <> 0 Or UnitCount <> 0) {
                 WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
                 ResetLedger();
@@ -1165,14 +1643,14 @@ Defs
             TryEntry();
             Return 0;
         }
-        // 持仓对账：平台手数 ≠ 台账 → 以平台为准重建（重启/部分成交/换月后）
-        If (IntPart(Abs(CurrentContracts())) <> PLots) {
+        // 持仓对账：平台手数 ≠ 台账 → 以平台为准重建（重启/部分成交/换月后；模拟/实盘走账户真值）
+        If (PosLotsNow() <> PLots) {
             RebuildLedger();
         }
-        // 持仓方向：+1 多 / -1 空（止损/出场/加仓的判向与触发价用）
-        Integer dir = 1;
-        If (MarketPosition() < 0) {
-            dir = -1;
+        // 持仓方向：+1 多 / -1 空（模拟/实盘=台账方向；回测=图表方向）
+        Integer dir = PosDirNow();
+        If (dir == 0) {
+            Return 0;
         }
         // 1) 共享止损：多单 Low ≤ StopLine、空单 High ≥ StopLine（2N 距离，加仓后随末 unit 上移）
         If (StopLine > 0) {
@@ -1214,12 +1692,12 @@ Defs
     // 只用最后一次有效 StopLine 保护已有持仓；台账缺失（PLots<=0）时不动作。
     // 注意：失效期间若恰逢换月，UpdateMainSymbol 的重建会把 StopLine 推到末次入场价（NVal=0 → 按保本线兜底）。
     Integer ManageStopOnly() {
-        If (MarketPosition() == 0 Or PLots <= 0 Or StopLine <= 0) {
+        If (PosLotsNow() == 0 Or PLots <= 0 Or StopLine <= 0) {
             Return 0;
         }
-        Integer dir = 1;
-        If (MarketPosition() < 0) {
-            dir = -1;
+        Integer dir = PosDirNow();
+        If (dir == 0) {
+            Return 0;
         }
         If (dir > 0 And Low() <= StopLine) {
             WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平多");
@@ -1256,6 +1734,16 @@ Events
         CalcOk = False;
         ResetChannels();
         ResetLedger();
+        // 账户真值对账状态复位（模拟/实盘；回测不用）——首根实时 bar 由 SyncAcctOnNewBar 建基线
+        AcctPosOk = False;
+        AcctLong = 0;
+        AcctShort = 0;
+        AcctLongAvg = 0;
+        AcctShortAvg = 0;
+        AcctSym = "";
+        SyncBlockBars = 0;
+        LastSyncBarSig = "";
+        LastSentLots = 0;
         // SetInitCapital 无返回值，合法性由 InitCapital>0 校验
         SetInitCapital(InitCapital);
         Bool okMargin = SetMarginRate(MarginRateP);
@@ -1362,7 +1850,9 @@ Events
             + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
             + " AutoTrade=" + IIFString(IsTradeEnabled(), "True", "False")
             + " Trade=" + Text(Enum_Mode_Strategy_Trade()) + " Chart=" + Text(Enum_Mode_Strategy_Chart()));
-        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合；回放期门禁=模拟/实盘非实时 bar 不下单；图表模式自动交易开（图表交易）一律不发单；简单回测与图表回测不拦");
+        WLogInit("GATE: 挂单门禁=OnOrder 未完成委托集合 + 每根 bar 按平台未成交列表校正；回放期门禁=模拟/实盘非实时 bar 不下单；图表模式自动交易开（图表交易）一律不发单；简单回测与图表回测不拦");
+        WLogInit("ORDER_CH: 模拟/实盘=A_*账户接口（落地合约+真实价/图价÷Rollover，无信号统计→不闪烁；每根实时新 bar 4 参 A_GetPosition 对账）"
+            + " 回测=Buy/SellShort/Sell/BuyToCover（图表信号）");
         WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
             + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " StallPeriod=" + Text(StallPeriod)
             + " MaxUnits=" + Text(MaxUnits));
@@ -1377,7 +1867,8 @@ Events
             + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2) + " S1Skip=" + Text(S1Skip));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
-            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2));
+            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2)
+            + " RealTickSize=" + Text(RealTickSize, 2));
         WLogInit("日志: LogDir=[" + LogDir + "] 实际目录=" + IIFString(LogDir == "", "(空=平台运行目录)", EffectiveLogDir())
             + " 文件=" + LogPath());
         WLogInit("设置(原始返回): SetMarginRate=" + IIFString(okMargin, "True", "False")
@@ -1394,6 +1885,10 @@ Events
             // 刻意不做「仅 data1 新 bar 时」过滤：刷新幂等（值随 data1 头部推进才变）、边界读数最迟下根 bar 自纠。
             // 失败（无 data1 源/合约错位/历史不足/参数越界）→ 五值归 0 拒交易，下根新 bar 自动重试；日志按交易日节流。
             RefreshNChannels();
+            // 模拟/实盘实时：每根新 bar 把台账校正到账户真值（成交/换月后宽限 2 根；有挂单时跳过）
+            If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
+                SyncAcctOnNewBar();
+            }
         }
     }
 
@@ -1407,6 +1902,8 @@ Events
             If (BarCnt == 1) {
                 PendingClear();
             }
+            // 每根 bar 用平台未成交委托列表校正挂单集合（模拟/实盘）：OnOrder 漏报终态不会永久锁死门禁
+            SyncPendingFromAccount();
 
             // 实盘防呆：TradeStartDate 未到时 CanTradeNow 恒 False、静默不交易 → 首 bar 警告一次（重启复现）。
             // 放在首 bar 而非 OnInit：YMD() 依赖 bar 上下文，OnInit 里判不了；挂上策略的第一分钟即可见。
@@ -1491,12 +1988,21 @@ Events
                 If (GetArraySize(PendingIds) > 0) {
                     pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr();
                 }
+                // 账户真值（模拟/实盘）：每天一行，供事后核对台账 vs 账户
+                String acctseg = "";
+                If (IsLiveTrade()) {
+                    RefreshAccountPosition();
+                    acctseg = " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
+                        + " acctS=" + Text(IntPart(AcctShort))
+                        + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
+                        + " acctOk=" + IIFString(AcctPosOk, "True", "False");
+                }
                 WLog("DAILY " + MainSymbol()
                     + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
                     + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
                     + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
                     + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
-                    + " d1=" + d1s + d0seg + pendseg);
+                    + " d1=" + d1s + d0seg + pendseg + acctseg);
             }
 
             // ---- 4. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
@@ -1543,12 +2049,15 @@ Events
     // 回测不触发（EventProbe 实测 0 次）；模拟盘实测回调正常（RateCheckProbe 2026-10-19：
     // OnOrder 1(Declare)→2(Declared)→5(Filled)，OnFill 的 side/combOffset/price/fillPrice 有效）；
     // 实盘是否回调仍由柜台决定。
-    // OnOrder 维护挂单门禁（PendingIds），不改台账；OnFill 仅日志，不动 PLots/PCost/StopLine。
+    // OnOrder 维护挂单门禁（PendingIds，每根 bar 再由 SyncPendingFromAccount 按平台列表校正），
+    // 不改台账；OnFill 仅日志，不动 PLots/PCost/StopLine（只延后账户真值对账，防读到成交前/中间态）。
     // FillRef：volume/fillVolume/orderId 为 Integer，fillId 为 String（勿套 Text）；
     // 后三字段模拟盘填充待实测，仅日志留痕。
 
     OnFill(FillRef ordFill) {
         FillCnt = FillCnt + 1;
+        // 成交后 A_GetPosition 更新可能滞后：延后 2 根新 bar 再对账
+        SyncBlockBars = Max(SyncBlockBars, 2);
         WLogEvt("FILL #" + Text(FillCnt)
             + " id=" + Text(ordFill.orderId)
             + " fillId=" + ordFill.fillId
