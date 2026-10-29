@@ -5,11 +5,11 @@
 #   规则（Faith《海龟交易法则》系统 1 口径）：
 #   - N = TR 的平滑均值，经典递归 N=(19*PDN+TR)/20（参数 n_period / n_smooth）
 #   - 入场: 盘中触及"前 entry_n 根 bar 最高价"（多头；空头为最低价）→ 市价入场 1 unit
-#   - 并行入场（v3.2 新增，stall_period>0）：连续 stall_period 个日线极值停滞（多头为
+#   - 并行入场（v3.2 新增，stall_period>0）：连续 stall_period 根 bar 极值停滞（多头为
 #     未创新低；空头镜像为未创新高）→ 入场，与突破入场并列、先达成者先入场。
-#     判定（日线口径，独立于 bar_freq）：某日极值刷新此前 stall_period 日极值 = 一次事件；
-#     自最近事件起连续 stall_period 日未创新低（即最新完成日线恰为事件后第 stall_period 日）
-#     → 触发。按新完成日线边沿评判，每段仅触发一次；持仓中达成 = 错过，不补触发。
+#     判定（bar_freq 口径，与指标周期一致）：某根 bar 极值刷新此前 stall_period 根 bar 极值 = 一次事件；
+#     自最近事件起连续 stall_period 根 bar 未创新低（即最新完成 bar 恰为事件后第 stall_period 根）
+#     → 触发。按新完成 bar 边沿评判，每段仅触发一次；持仓中达成 = 错过，不补触发。
 #   - 出场: 盘中触及"前 exit_n 根 bar 反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
@@ -35,7 +35,7 @@ PARAMS = {
     'n_smooth': 20,               # N 的平滑系数（经典 N=(19*PDN+TR)/20）
     'entry_n': 20,                # 突破入场通道周期（系统1=20 / 系统2=55，单位=bar_freq 根）
     'exit_n': 10,                 # 反向突破出场通道周期（系统1=10 / 系统2=20，单位=bar_freq 根）
-    'stall_period': 10,           # 并行入场：连续 N 个日线极值停滞（未创新低/新高）→入场；0=关闭
+    'stall_period': 10,           # 并行入场：连续 N 根指标周期 bar 极值停滞（未创新低/新高）→入场；0=关闭
     'unit_risk': 0.01,            # 1 unit 风险预算（账户权益比例）
     'margin_cap_pct': 0.10,       # 保证金占用上限（当前权益比例；0=不限，每档按剩余额度开满）
     'max_units': 4,               # 最大 unit 数（含首仓）
@@ -168,20 +168,20 @@ def bar_levels(ctx):
     g.lv = lv
     return lv
 
-# ==================== 极值停滞并行入场（日线口径，与 bar_freq 无关） ====================
+# ==================== 极值停滞并行入场（bar_freq 口径，与指标周期一致） ====================
 
 
 def stall_state(ctx):
-    """最新完成日线距最近一次"创新低/创新高"事件的日数（事件 := 极值刷新此前 stall_period 日极值）。
-    窗口内未见事件返回 None；结果按新日线缓存"""
+    """最新完成 bar 距最近一次"创新低/创新高"事件的 bar 数（事件 := 极值刷新此前 stall_period 根 bar 极值）。
+    窗口内未见事件返回 None；结果按新 bar 缓存"""
     p = g.params
     if p['stall_period'] <= 0:
         return None
     n = p['stall_period']
-    hist = attribute_history(g.current_contract, n * 2 + 5, '1d', ['high', 'low'])
+    hist = attribute_history(g.current_contract, n * 2 + 5, p['bar_freq'], ['high', 'low'])
     if hist is None or len(hist) == 0:
         return None
-    key = (g.current_contract, hist.index[-1])
+    key = (p['bar_freq'], g.current_contract, hist.index[-1])
     if getattr(g, 'stall_key', None) == key and g.stall_days is not None:
         return g.stall_days
     g.stall_key = key
@@ -204,8 +204,8 @@ def stall_state(ctx):
 
 
 def stall_edge(ctx):
-    """按新完成日线边沿评判（每根新日线仅一次）：计数恰达 stall_period 时返回 'long'/'short'，否则 None。
-    首个日线键仅作基线（切片前已达成的不触发）；持仓中达成 = 错过，不补触发"""
+    """按新完成 bar 边沿评判（每根新 bar 仅一次）：计数恰达 stall_period 时返回 'long'/'short'，否则 None。
+    首个 bar 键仅作基线（切片前已达成的不触发）；持仓中达成 = 错过，不补触发"""
     p = g.params
     if p['stall_period'] <= 0:
         return None
@@ -457,7 +457,7 @@ def retry_migration(ctx):
 
 
 def risk_and_signal_routine(ctx):
-    """分钟单入口：一致性校验 → 极值停滞并行入场（日线边沿）→ 海龟检查（止损/出场/加仓/入场）→ 14:45 移仓检查与 LEVELS"""
+    """分钟单入口：一致性校验 → 极值停滞并行入场（bar_freq 边沿）→ 海龟检查（止损/出场/加仓/入场）→ 14:45 移仓检查与 LEVELS"""
     try:
         p = g.params
         if g.current_contract is None:
