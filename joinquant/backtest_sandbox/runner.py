@@ -6,7 +6,7 @@
     python joinquant/backtest_sandbox/runner.py \
         --strategy joinquant/04-RubberTrendPullback-v1.0.py \
         --data local_data/export_ru --start 2020-01-01 --end 2026-09-28 --out joinquant/logs/out.log
-    # 棕榈油：--data local_data/export_p --tick 2 --param symbol=P --param exchange=XDCE
+    # 棕榈油：--data local_data/export_p --param symbol=P --param exchange=XDCE
 
 事件语义（对齐聚宽期货回测）：
 - 交易日 D 的日盘：每个分钟 bar 触发 every_bar（策略内 14:45 判定即来源于此）
@@ -33,7 +33,8 @@ def parse_args():
     ap.add_argument('--start', default='2020-01-01')
     ap.add_argument('--end', default='2026-09-28')
     ap.add_argument('--cash', type=float, default=1_000_000)
-    ap.add_argument('--tick', type=float, default=5.0)
+    ap.add_argument('--tick', type=float, default=1.0,
+                    help='最小变动价位（默认 1=P；RU 回测须显式传 --tick 5）')
     ap.add_argument('--multiplier', type=float, default=10)
     ap.add_argument('--out', default=os.path.join(HERE, '..', 'logs', 'out.log'))
     ap.add_argument('--equity-out', default=None, help='每日权益（资金曲线）输出 CSV：date,equity')
@@ -74,6 +75,7 @@ def main():
         mod.PARAMS[k] = _coerce(v)
     if args.param:
         print(f'[sandbox] PARAMS override: { {kv.split("=", 1)[0]: _coerce(kv.split("=", 1)[1]) for kv in args.param} }')
+    print(f'[sandbox] tick={args.tick:g} multiplier={args.multiplier:g} cash={args.cash:g}')
 
     # ---- 初始化（聚宽在回测起始日 00:00 调用 initialize） ----
     start = dt.date.fromisoformat(args.start)

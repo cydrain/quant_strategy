@@ -15,14 +15,14 @@
 环境：需 pandas / numpy（本地惯例用 `jq` conda 环境）。在**仓库根目录**执行：
 
 ```bash
-# RU 2020~2026（--strategy / --data 有默认值，可省略）
+# RU 2020~2026（--strategy / --data 有默认值，可省略；RU 须显式传 --tick 5）
 python joinquant/backtest_sandbox/runner.py \
-    --start 2020-01-01 --end 2026-09-28 \
+    --start 2020-01-01 --end 2026-09-28 --tick 5 \
     --out joinquant/logs/out_ru.log
 
 # 棕榈油（P）
 python joinquant/backtest_sandbox/runner.py \
-    --data local_data/export_p --tick 2 \
+    --data local_data/export_p \
     --param symbol=P --param exchange=XDCE \
     --out joinquant/logs/out_p.log
 
@@ -40,7 +40,7 @@ python joinquant/backtest_sandbox/runner.py \
 | `--strategy` | `joinquant/04-RubberTrendPullback-v1.0.py` | 策略文件（任何文件均可，含历史版本/试验版） |
 | `--data` | `local_data/export_ru` | 数据根（P 用 `local_data/export_p`） |
 | `--start` / `--end` | `2020-01-01` / `2026-09-28` | 回测区间 |
-| `--tick` | `5` | 最小变动价位（RU=5；P=2） |
+| `--tick` | `1`（P） | 最小变动价位；**RU 回测须显式传 `--tick 5`**（启动时会打印生效值） |
 | `--multiplier` | `10` | 合约乘数（RU/P 均 10） |
 | `--cash` | `1000000` | 起始资金 |
 | `--out` | `joinquant/logs/out.log` | 输出日志（格式与聚宽导出一致，可直接 diff） |
