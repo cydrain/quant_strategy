@@ -14,7 +14,8 @@
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
 #   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
-#   - 系统1 跳过规则: 上次突破若盈利，跳过下一次同类突破（s1_skip 开关，默认关闭）
+#   - 系统1 跳过规则: 上次突破若盈利，跳过一次同类突破（跳过该突破价位，
+#     等通道刷新出新极值后再入场；s1_skip 开关，默认开启）
 #   - fixed_dir: 1=只做多 / -1=只做空 / 0=经典双向（跟随突破方向）
 #   工程: 主力移仓 / 夜盘分钟检查 / 停板等待 沿用既有框架
 #   沙盒口径: 盘中周期为会话锚定分桶（日盘 09:00/13:30 起、夜盘 21:00 起；
@@ -41,7 +42,7 @@ PARAMS = {
     'max_units': 4,               # 最大 unit 数（含首仓）
     'add_step_n': 0.5,            # 顺向每 N×该值 加 1 unit
     'stop_dist_n': 2.0,           # 初始/加仓后止损距离（N 倍数）
-    's1_skip': 0,                 # 系统1 跳过规则开关（默认关闭；置 1 = 上次突破盈利则跳过一次同类突破）
+    's1_skip': 1,                 # 系统1 跳过规则开关（默认开启；上次突破盈利则跳过一次同类突破，等新极值再入场）
     'signal_time': '14:45',       # 14:45 做主力切换检查与 LEVELS 日志（交易本身全天分钟级）
     'night_start': '21:00',       # 夜盘任务注册起始时刻（空串 = 无夜盘品种）
     'night_end': '23:00',         # 夜盘任务注册结束时刻
@@ -263,6 +264,9 @@ def open_unit(ctx, direction, n_val, reason):
     g.legs.append({'contract': c, 'side': side, 'lots': lots, 'entry_price': o.price,
                    'n_at_entry': n_val, 'stop_line': stop_line})
     g.stop_line = stop_line
+    if reason in ('entry', 'entry_stall'):
+        g.skip_level = None
+        g.skip_side = None
     log.info(f"{log_pfx()} ✅{trade_mark(side, reason)} {reason.upper()} {side} {c} {lots}@{o.price:.1f} "
              f"N={n_val:.1f} stop={stop_line:.1f} units={len(g.legs)} equity={ctx.portfolio.total_value:.0f}")
     g.warned.pop('open_' + c, None)
@@ -294,6 +298,8 @@ def close_all(ctx, reason):
         g.stop_line = None
         if g.params['s1_skip'] and trade_pnl > 0:
             g.skip_next_breakout = True          # 系统1：上次突破盈利 → 跳过下一次同类突破
+            g.skip_level = None
+            g.skip_side = None
         log.info(f"{log_pfx()} ✅ 清仓完成，当前空仓 trade_pnl={trade_pnl:.0f}")
 
 
@@ -368,15 +374,27 @@ def turtle_minute_checks(ctx, bar, lv):
     if allow_long and bar['high'] >= lv['entry_long']:
         if g.skip_next_breakout:
             g.skip_next_breakout = False
+            g.skip_level = lv['entry_long']
+            g.skip_side = 'long'
             log.info(f"{log_pfx()} BREAKOUT_SKIP long level={lv['entry_long']:.1f} (系统1：上次突破盈利)")
             return
+        if g.skip_side == 'long' and g.skip_level is not None and lv['entry_long'] == g.skip_level:
+            return                       # 被跳过的突破价位尚未刷新，继续等待新极值
+        if g.skip_side == 'long' and g.skip_level is not None:
+            log.info(f"{log_pfx()} SKIP_RELEASED long old={g.skip_level:.1f} new={lv['entry_long']:.1f}")
         open_unit(ctx, 1, lv['n'], 'entry')
         return
     if allow_short and bar['low'] <= lv['entry_short']:
         if g.skip_next_breakout:
             g.skip_next_breakout = False
+            g.skip_level = lv['entry_short']
+            g.skip_side = 'short'
             log.info(f"{log_pfx()} BREAKOUT_SKIP short level={lv['entry_short']:.1f} (系统1：上次突破盈利)")
             return
+        if g.skip_side == 'short' and g.skip_level is not None and lv['entry_short'] == g.skip_level:
+            return
+        if g.skip_side == 'short' and g.skip_level is not None:
+            log.info(f"{log_pfx()} SKIP_RELEASED short old={g.skip_level:.1f} new={lv['entry_short']:.1f}")
         open_unit(ctx, -1, lv['n'], 'entry')
 
 # ==================== 移仓 ====================
@@ -518,6 +536,8 @@ def initialize(ctx):
         g.stall_seen_key = None
         g.last_signal_date = None
         g.skip_next_breakout = False
+        g.skip_level = None
+        g.skip_side = None
         g.dominant_counter = {'contract': None, 'days': 0}
         g.migrating = None
         g.warned = {}
