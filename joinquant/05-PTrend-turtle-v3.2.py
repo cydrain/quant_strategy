@@ -1,21 +1,25 @@
 # ============================================================
-# 棕榈油 P 经典海龟策略 v3.2（聚宽回测 · 单周期版 + 极值停滞并行入场）
+# 棕榈油 P 经典海龟策略 v3.2（聚宽回测 · 单周期版 + 极值停滞 / NR 收缩并行入场）
 #   指标周期（N、四通道）由 bar_freq 指定：15m/30m/60m 由分钟数据聚合仅用已完成 bar，
 #   1d 走日线口径、不含当日。触发仍为盘中分钟级。
 #   规则（Faith《海龟交易法则》系统 1 口径）：
 #   - N = TR 的平滑均值，经典递归 N=(19*PDN+TR)/20（参数 n_period / n_smooth）
 #   - 入场: 盘中触及"前 entry_n 根 bar 最高价"（多头；空头为最低价）→ 市价入场 1 unit
-#   - 并行入场（v3.2 新增，stall_period>0）：连续 stall_period 根 bar 极值停滞（多头为
+#   - 并行入场（stall_period>0）：连续 stall_period 根 bar 极值停滞（多头为
 #     未创新低；空头镜像为未创新高）→ 入场，与突破入场并列、先达成者先入场。
 #     判定（bar_freq 口径，与指标周期一致）：某根 bar 极值刷新此前 stall_period 根 bar 极值 = 一次事件；
 #     自最近事件起连续 stall_period 根 bar 未创新低（即最新完成 bar 恰为事件后第 stall_period 根）
 #     → 触发。按新完成 bar 边沿评判，每段仅触发一次；持仓中达成 = 错过，不补触发。
+#   - 并行入场（nr_n>0）：最近已完成 nr_n 根 bar 中振幅（high-low）最小的一根 = NRn；
+#     其后一个 bar 期间盘中突破该 bar 高点 → 开多 / 跌破低点 → 开空，与突破、停滞入场并列，
+#     先达成者先入场，每事件仅触发一次。NR 入场同样受 s1_skip 约束：
+#     上次交易盈利后跳过一次 NR 突破（该事件作废，等新 NR 事件再入场）。
 #   - 出场: 盘中触及"前 exit_n 根 bar 反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
 #   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
-#   - 系统1 跳过规则: 上次突破若盈利，跳过一次同类突破（跳过该突破价位，
-#     等通道刷新出新极值后再入场；s1_skip 开关，默认开启）
+#   - 系统1 跳过规则: 上次交易若盈利，跳过一次同类入场——20 日突破记录被跳过价位并等通道
+#     刷新出新极值；NR 突破作废当前事件、等新 NR 事件再入场（s1_skip 开关，默认开启）
 #   - fixed_dir: 1=只做多 / -1=只做空 / 0=经典双向（跟随突破方向）
 #   工程: 主力移仓 / 夜盘分钟检查 / 停板等待 沿用既有框架
 #   沙盒口径: 盘中周期为会话锚定分桶（日盘 09:00/13:30 起、夜盘 21:00 起；
@@ -37,6 +41,7 @@ PARAMS = {
     'entry_n': 20,                # 突破入场通道周期（系统1=20 / 系统2=55，单位=bar_freq 根）
     'exit_n': 10,                 # 反向突破出场通道周期（系统1=10 / 系统2=20，单位=bar_freq 根）
     'stall_period': 10,           # 并行入场：连续 N 根指标周期 bar 极值停滞（未创新低/新高）→入场；0=关闭
+    'nr_n': 6,                    # 并行入场：最近 nr_n 根 bar 振幅最小者（NRn）的极值突破 → 入场；0=关闭
     'unit_risk': 0.01,            # 1 unit 风险预算（账户权益比例）
     'margin_cap_pct': 0.10,       # 保证金占用上限（当前权益比例；0=不限，每档按剩余额度开满）
     'max_units': 4,               # 最大 unit 数（含首仓）
@@ -60,7 +65,7 @@ def log_pfx():
 
 def trade_mark(side, reason):
     """开/加多=🔴、平多=🔶、开/加空=🟢、平空=🔷"""
-    if reason in ('entry', 'entry_stall', 'add'):
+    if reason in ('entry', 'entry_stall', 'entry_nr', 'add'):
         return '🔴' if side == 'long' else '🟢'
     return '🔶' if side == 'long' else '🔷'
 
@@ -140,7 +145,7 @@ def current_minute_bar(ctx, contract):
 def load_bars(ctx, contract):
     """指标周期 bar 序列（前若干根已完成 bar；盘中周期由分钟数据聚合，不含未完成 bar）"""
     p = g.params
-    need = max(60, p['n_period'] * 3, p['entry_n'], p['exit_n'])
+    need = max(60, p['n_period'] * 3, p['entry_n'], p['exit_n'], p['nr_n'] + 1)
     hist = attribute_history(contract, need + 1, p['bar_freq'], ['high', 'low', 'close'])
     if hist is None or len(hist) == 0:
         return None
@@ -162,9 +167,15 @@ def bar_levels(ctx):
     n_val = calc_n(highs, lows, closes, p['n_period'], p['n_smooth'])
     if n_val is None or n_val <= 0:
         return None
+    win = p['nr_n']
+    is_nr = False
+    if win > 0 and len(highs) >= win:
+        ranges = [highs[i] - lows[i] for i in range(len(highs) - win, len(highs))]
+        is_nr = ranges[-1] <= min(ranges)
     lv = {'n': n_val,
           'entry_long': max(highs[-p['entry_n']:]), 'entry_short': min(lows[-p['entry_n']:]),
-          'exit_long': min(lows[-p['exit_n']:]), 'exit_short': max(highs[-p['exit_n']:])}
+          'exit_long': min(lows[-p['exit_n']:]), 'exit_short': max(highs[-p['exit_n']:]),
+          'is_nr': is_nr, 'nr_high': highs[-1], 'nr_low': lows[-1]}
     g.lv_key = key
     g.lv = lv
     return lv
@@ -224,6 +235,23 @@ def stall_edge(ctx):
     if p['fixed_dir'] in (0, -1) and st['short'] == p['stall_period']:
         return 'short'
     return None
+
+# ==================== NRn 收缩并行入场（bar_freq 口径） ====================
+
+
+def nr_event(ctx, lv):
+    """按新完成 bar 刷新 NRn 事件：最新 bar 为近 nr_n 根振幅最小者则返回其高低点。
+    事件仅在该 NRn bar 之后一个 bar 期间有效；每事件仅触发一次；nr_n=0 关闭"""
+    if lv is None or g.params['nr_n'] <= 0:
+        return None
+    if g.nr_key != g.lv_key:
+        g.nr_key = g.lv_key
+        g.nr_fired = False
+        g.nr = {'high': lv['nr_high'], 'low': lv['nr_low']} if lv['is_nr'] else None
+        if g.nr is not None:
+            log.info(f"{log_pfx()} NR_SET n={g.params['nr_n']} "
+                     f"high={g.nr['high']:.1f} low={g.nr['low']:.1f}")
+    return g.nr
 
 # ==================== 订单封装 ====================
 
@@ -300,6 +328,7 @@ def close_all(ctx, reason):
             g.skip_next_breakout = True          # 系统1：上次突破盈利 → 跳过下一次同类突破
             g.skip_level = None
             g.skip_side = None
+            g.nr_skip_next = True                # NR 突破同样跳过下一次
         log.info(f"{log_pfx()} ✅ 清仓完成，当前空仓 trade_pnl={trade_pnl:.0f}")
 
 
@@ -333,8 +362,8 @@ def check_state_consistency(ctx):
 # ==================== 分钟检查（止损/出场/加仓/入场） ====================
 
 
-def turtle_minute_checks(ctx, bar, lv):
-    """海龟核心：共享 2N 止损 → 反向突破出场 → 加仓 → 突破入场（全部盘中分钟级）"""
+def turtle_minute_checks(ctx, bar, lv, nr_ev):
+    """海龟核心：共享 2N 止损 → 反向突破出场 → 加仓 → NR 收缩 / 通道突破入场（全部盘中分钟级）"""
     if g.migrating is not None:
         return
     p = g.params
@@ -368,9 +397,31 @@ def turtle_minute_checks(ctx, bar, lv):
             if reach:
                 open_unit(ctx, direction, lv['n'], 'add')
         return
-    # 4) 入场：突破前 entry_n 根 bar 极值（fixed_dir 限定方向；系统1 跳过规则）
+    # 4) 并行入场：NRn 收缩 bar 极值突破（价位低于 20 日通道，先判定）
     allow_long = p['fixed_dir'] in (0, 1)
     allow_short = p['fixed_dir'] in (0, -1)
+    if nr_ev is not None and not g.nr_fired:
+        if allow_long and bar['high'] >= nr_ev['high']:
+            if g.nr_skip_next:
+                g.nr_skip_next = False
+                g.nr_fired = True
+                log.info(f"{log_pfx()} NR_SKIP long level={nr_ev['high']:.1f} (系统1：上次交易盈利)")
+                return
+            if open_unit(ctx, 1, lv['n'], 'entry_nr'):
+                g.nr_fired = True
+                log.info(f"{log_pfx()} NR_BREAK long level={nr_ev['high']:.1f}")
+            return
+        if allow_short and bar['low'] <= nr_ev['low']:
+            if g.nr_skip_next:
+                g.nr_skip_next = False
+                g.nr_fired = True
+                log.info(f"{log_pfx()} NR_SKIP short level={nr_ev['low']:.1f} (系统1：上次交易盈利)")
+                return
+            if open_unit(ctx, -1, lv['n'], 'entry_nr'):
+                g.nr_fired = True
+                log.info(f"{log_pfx()} NR_BREAK short level={nr_ev['low']:.1f}")
+            return
+    # 5) 入场：突破前 entry_n 根 bar 极值（fixed_dir 限定方向；系统1 跳过规则）
     if allow_long and bar['high'] >= lv['entry_long']:
         if g.skip_next_breakout:
             g.skip_next_breakout = False
@@ -475,7 +526,7 @@ def retry_migration(ctx):
 
 
 def risk_and_signal_routine(ctx):
-    """分钟单入口：一致性校验 → 极值停滞并行入场（bar_freq 边沿）→ 海龟检查（止损/出场/加仓/入场）→ 14:45 移仓检查与 LEVELS"""
+    """分钟单入口：一致性校验 → NR 事件刷新 → 极值停滞并行入场 → 海龟检查（止损/出场/加仓/NR/突破入场）→ 14:45 移仓检查与 LEVELS"""
     try:
         p = g.params
         if g.current_contract is None:
@@ -484,13 +535,14 @@ def risk_and_signal_routine(ctx):
         check_state_consistency(ctx)
         lv = bar_levels(ctx)
         bar = current_minute_bar(ctx, g.current_contract)
+        nr_ev = nr_event(ctx, lv)
         stall_side = stall_edge(ctx)
         if stall_side is not None and not g.legs and bar is not None and lv is not None:
             direction = 1 if stall_side == 'long' else -1
             log.info(f"{log_pfx()} STALL_FIRE {stall_side}：连续{p['stall_period']}日极值停滞，入场")
             open_unit(ctx, direction, lv['n'], 'entry_stall')
         elif lv is not None:
-            turtle_minute_checks(ctx, bar, lv)
+            turtle_minute_checks(ctx, bar, lv, nr_ev)
         retry_migration(ctx)
         if ctx.current_dt.strftime('%H:%M') != p['signal_time']:
             return
@@ -498,9 +550,10 @@ def risk_and_signal_routine(ctx):
             return
         check_dominant(ctx)
         if lv is not None:
+            nr_txt = f"NRH={nr_ev['high']:.1f} NRL={nr_ev['low']:.1f}" if nr_ev is not None else 'NRH=- NRL=-'
             log.info(f"{log_pfx()} LEVELS[{p['bar_freq']}] {g.current_contract} N={lv['n']:.1f} "
                      f"EL={lv['entry_long']:.1f} XL={lv['exit_long']:.1f} "
-                     f"ES={lv['entry_short']:.1f} XS={lv['exit_short']:.1f} "
+                     f"ES={lv['entry_short']:.1f} XS={lv['exit_short']:.1f} {nr_txt} "
                      f"units={len(g.legs)} stop={(g.stop_line if g.stop_line is not None else 0):.1f}")
         g.last_signal_date = ctx.current_dt.date()
     except Exception as e:
@@ -534,6 +587,10 @@ def initialize(ctx):
         g.stall_days = None
         g.stall_key = None
         g.stall_seen_key = None
+        g.nr = None
+        g.nr_key = None
+        g.nr_fired = False
+        g.nr_skip_next = False
         g.last_signal_date = None
         g.skip_next_breakout = False
         g.skip_level = None
