@@ -1,19 +1,21 @@
 # 05-PTrend-turtle-v3.2 TBQuant 公式版 使用说明
 
 > 适用文件：`tbquant/05-PTrend-turtle-v3.2-TB.txt`（公式名 `PTrendTurtle_v32`，TBQuant 2.x）
-> 移植基准：`joinquant/05-PTrend-turtle-v3.2.py`（聚宽 · 棕榈油 P · STALL 版）
+> 移植基准：`joinquant/05-PTrend-turtle-v3.2.py`（聚宽 · 棕榈油 P · STALL + NR 版）
 > 前版对照：`tbquant/05-PTrend-turtle-v3.1-TB.txt`（双图层 · 无 STALL）
 >
 > v3.2 = v3.1 的海龟交易逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样保留，
-> 新增 **STALL 极值停滞并行入场**；同时补齐模拟/实盘运行硬化：主连挂图校验、挂单门禁、
+> 新增 **STALL 极值停滞并行入场** 与 **NR 收缩并行入场**；同时补齐模拟/实盘运行硬化：主连挂图校验、挂单门禁、
 > **历史回放期门禁**（模拟/实盘仅 `QuoteStatus()==RealTime` 可交易；图表模式开启自动交易则一律
 > 不发单）、实时 `HB`/`D1BAR` 诊断日志、OnOrder/OnFill 回报日志、`SlipTicks` 命名。
-> `StallPeriod=0` 时**回测交易逻辑**应与 v3.1 一致（回放期门禁不作用于简单回测与图表回测；
+> `StallPeriod=0` 且 `NrN=0`、`S1Skip=0` 时**回测交易逻辑**应与 v3.1 一致（回放期门禁不作用于简单回测与图表回测；
 > 模拟/实盘另有主连校验、挂单门禁与回放期门禁）。
 > 2026-10-27 起模拟/实盘**改走账户接口下单**（`A_Buy/A_SellShort/A_Sell/A_BuyToCover`：落地真实合约 +
 > 图价÷`Rollover()` + `RealTickSize` 取整）、**按账户持仓对账**（4 参 `A_GetPosition`）；
 > 回测/图表回测仍用图表下单接口（`Buy/SellShort/Sell/BuyToCover`）。
 > 2026-10-28 模拟已实测整日 4 笔成交全部 `via=acct`、台账与账户全程一致（见第 12 节）。
+> 2026-11-01 同步聚宽 NR6 收缩并行入场（`NrN=6`，0=关闭；NR 同样受系统1 跳过约束；
+> `S1Skip` 默认由 0 改为 1，与聚宽一致）。TB 侧尚未编译/回测，验证状态见第 12 节。
 
 ---
 
@@ -26,7 +28,7 @@
 | `tbquant/05-PTrend-turtle-v3.1-TB-说明.md` | 前版完整说明（回测/换月/预热细节仍适用） |
 | `tbquant/PTrendTurtle_MultiSrc_Probe.txt` | 双图层运行时假设探针（非交易） |
 | `tbquant/PTrendTurtle_EventProbe.txt` | 事件驱动探针（回测事件为 0 次的实测依据） |
-| `joinquant/05-PTrend-results.md` | 聚宽 v3.1/v3.2 六切片结果与 STALL 触发明细 |
+| `joinquant/05-PTrend-results.md` | 聚宽 v3.1/v3.2 六切片结果、STALL/NR 触发与收缩突破对照 |
 | `tbquant/tools/README.md` | 日志导出/基线工具说明 |
 
 ---
@@ -36,6 +38,8 @@
 | 项 | v3.1 | v3.2 |
 |---|---|---|
 | STALL 并行入场 | 无 | 新增，`StallPeriod>0` 启用 |
+| NR 收缩并行入场 | 无 | 新增，`NrN>0` 启用（默认 6；0=关闭）；与 STALL、20 日突破谁先触发谁入场 |
+| 系统1 跳过范围 | 仅 20 日突破（简化：只跳过下一次） | 20 日突破（记录被跳过价位、同价位不再入场直到通道刷新）+ NR 突破（作废当前事件）；`S1Skip` 默认 0→**1**，与聚宽一致 |
 | 滑点参数名 | `SlippageTicks` | `SlipTicks`（语义不变；旧参数模板需重设） |
 | `MapToMain` 默认值 | False | **True**（模拟/实盘安全口径；单合约切片回测必须显式改 False） |
 | `MainContSymbol` | 无 | 新增，默认 `p9888.DCE` |
@@ -44,7 +48,7 @@
 | 模拟/实盘下单通道 | 图表下单接口（`Buy/SellShort/Sell/BuyToCover`） | **账户接口 `A_*`**：落地真实合约 + 真实价（图价÷`Rollover()`，按 `RealTickSize` 取整）；不进平台 bar 信号统计 → 不再信号闪烁 |
 | 持仓口径 | 图表口径（映射后读不到真实仓） | 模拟/实盘以**账户真值**为准：每根实时新 bar 4 参 `A_GetPosition` 对账，不符即 `STATE_REBUILD src=acct` |
 | `RealTickSize` | 无 | 新增，默认 **1**（p=1、ru=5、ag=1，按合约手填）；真实委托价取整用 |
-| 历史回放期门禁 | 无 | 模拟/实盘启动回放阶段只更新 STALL 基线/N/通道，`QuoteStatus()<>RealTime` 期间不下单；图表模式开启自动交易（图表交易）一律不发单；简单回测/图表回测不生效 |
+| 历史回放期门禁 | 无 | 模拟/实盘启动回放阶段只更新 STALL/NR 事件与 N/通道，`QuoteStatus()<>RealTime` 期间不下单；图表模式开启自动交易（图表交易）一律不发单；简单回测/图表回测不生效 |
 | 实时诊断日志 | 无 | 模拟/实盘实时行情：data0 每根 `HB` 心跳、data1 每根 `D1BAR` 完整行；回测/历史回放不输出 |
 | 回报日志 | 无 | `ORDER`/`FILL`/`ORDER_SEND`/`ORDER_GATE`/`PEND_ADD`/`PEND_DEL`/`EXIT` |
 
@@ -63,7 +67,7 @@
 | 持仓口径 | 图表口径 | 账户真值（4 参 `A_GetPosition`，每根实时新 bar 对账） | 同模拟 |
 | 资金口径 | 风险基数 `Min(InitCapital, Portfolio_CurrentEquity)`；保证金 `Portfolio_CurrentCapital` | 风险基数 `Min(InitCapital, A_CurrentEquity)`；保证金 `A_FreeMargin` | 同模拟 |
 | 挂单门禁 | 不生效（事件不回调） | 生效（OnOrder） | 生效（OnOrder） |
-| 历史回放期 | 无此阶段，正常执行 | 只更新 STALL 基线/N/通道，不下单（`REPLAY_GATE`）；`QuoteStatus=RealTime` 后恢复（`REALTIME_BAR`） | 同模拟（实盘未验证 QuoteStatus 行为） |
+| 历史回放期 | 无此阶段，正常执行 | 只更新 STALL/NR 事件与 N/通道，不下单（`REPLAY_GATE`）；`QuoteStatus=RealTime` 后恢复（`REALTIME_BAR`） | 同模拟（实盘未验证 QuoteStatus 行为） |
 | 换月 | 主连图后复权；单合约图无 | 平台原生自动换仓 + 委托映射主力（换月后延 2 根按账户重建） | 同模拟 |
 
 注意：v3.2 的模拟/实盘**不再允许单合约图 + MapToMain=False**。该组合会在 OnInit 被判为
@@ -76,7 +80,7 @@
 
 1. **双图层（缺一不可）**
    - `data0` = 目标合约 **1 分钟**：全部信号/风控/下单在此层执行；
-   - `data1` = **同合约日线（1d）**：纯只读指标源，提供 N/四通道与 STALL 计数。
+   - `data1` = **同合约日线（1d）**：纯只读指标源，提供 N/四通道、STALL 计数与 NR 事件。
    - 追加：策略研究中选中策略单元 → 右键数据源 → 周期选 `1d` → 追加。
    - 两图层都右键「同步为主商品数据范围」，避免回测起止错位。
 2. **运行模式选「K线收盘模型」**。逐笔模型每 tick 触发 OnBar，不适合本公式。
@@ -85,11 +89,11 @@
    `OnBarClose` 只写 `HB`/`D1BAR` 日志，不下单。回测按 1 分钟 bar 的 High/Low 判定。
 3. **数据历史深度**
    - N 计算硬要求：`data1` 在首个目标信号日前已有 **≥61 根日线**（WinSize=61，约 3 个月）；
-   - STALL 扫描要求：`2*StallPeriod+5` 根。默认 `StallPeriod=10` → 25 根，61 根已覆盖；
+   - STALL 扫描要求：`2*StallPeriod+5` 根；NR 要求 `NrN` 根（默认 6）。默认 `StallPeriod=10` → 25 根，61 根已覆盖；
    - 历史不足的后果见 v3.1 说明第 3/9 节（N 静默偏高、假突破）。
 4. **data1 周期**
    - 标准 = 日线；也支持 30 分钟等日内周期（实验）。
-   - N/四通道与 STALL 计数都**随 data1 周期推进**：挂 30 分钟 data1 就是 30 分钟口径，
+   - N/四通道与 STALL/NR 事件都**随 data1 周期推进**：挂 30 分钟 data1 就是 30 分钟口径，
      与聚宽 v3.2（固定日线）不可比；30 分钟下 `Data1[0]/[1]` 盘中对齐尚未经探针复验。
 5. **模拟/实盘专用校验**
    - `data0.Symbol` 必须与参数 `MainContSymbol` **完全一致**（含大小写与交易所后缀）；
@@ -139,31 +143,35 @@
 ### 5.2 六切片参数与聚宽基准
 
 > 每个切片独立回测；资金 100 万，其余参数默认；切片 3 为只做空（FixedDir=-1）。
-> 下表的 v3.2 列是**聚宽 v3.2 基准**，不是 TB 实测值；TB 尚未跑 v3.2 六切片。
+> 下表的 v3.1 / v3.2(stall=10) 列为历史聚宽基准（毛），v3.2+NR6 列为**当前聚宽净利**
+> （S1Skip=1、NrN=6、NR 纳入跳过）；TB 尚未跑 v3.2+NR 六切片。
 
-| # | 预热起点 | TradeStartDate | 回测终点 | FixedDir | v3.1 聚宽基准 | v3.2 聚宽基准(stall=10) | STALL 次数 |
-|---|---|---|---|---|---|---|---|
-| 1 | 2019-11-01 | 20200313 | 2021-01-31 | 1 | +259,220 | +315,600 | 3 |
-| 2 | 2021-02-01 | 20210601 | 2022-03-31 | 1 | +371,940 | +373,360 | 2 |
-| 3 | 2022-01-01 | 20220501 | 2022-10-31 | -1 | +163,160 | +154,400 | 1 |
-| 4 | 2023-10-01 | 20240201 | 2024-04-26 | 1 | +20,640 | +44,760 | 1 |
-| 5 | 2024-04-01 | 20240801 | 2024-12-30 | 1 | +116,340 | +116,340 | 0 |
-| 6 | 2024-09-01 | 20250101 | 2025-03-10 | 1 | +8,240 | +8,240 | 0 |
-| 合计 | | | | | +939,540 | +1,012,700 | 7 |
+| # | 预热起点 | TradeStartDate | 回测终点 | FixedDir | v3.1 聚宽毛 | v3.2(stall=10) 聚宽毛 | v3.2+NR6 聚宽净 | 旧基线 STALL 次数 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 2019-11-01 | 20200313 | 2021-01-31 | 1 | +259,220 | +315,600 | +364,216 | 3 |
+| 2 | 2021-02-01 | 20210601 | 2022-03-31 | 1 | +371,940 | +373,360 | +465,987 | 2 |
+| 3 | 2022-01-01 | 20220501 | 2022-10-31 | -1 | +163,160 | +154,400 | +215,470 | 1 |
+| 4 | 2023-10-01 | 20240201 | 2024-04-26 | 1 | +20,640 | +44,760 | +66,597 | 1 |
+| 5 | 2024-04-01 | 20240801 | 2024-12-30 | 1 | +116,340 | +116,340 | +131,310 | 0 |
+| 6 | 2024-09-01 | 20250101 | 2025-03-10 | 1 | +8,240 | +8,240 | +39,128 | 0 |
+| 合计 | | | | | +939,540 | +1,012,700 | **+1,282,709** | 7 |
 
 ### 5.3 v3.2 回测验收建议
 
-1. **回归**：`StallPeriod=0` 跑切片 4/5/6，trades/DAILY 应与 v3.1 一致（仅头部参数行不同）。
+1. **NR 关闭回归**：`NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，trades/DAILY 应与 v3.1 一致
+   （仅头部参数行不同）；用于确认 NR 代码未干扰原有海龟路径。
 2. **STALL 触发日**：见第 6.3 节；单合约切片只核对信号日与方向，不要求与聚宽逐笔同价同时。
-3. **判定标准**：常规海龟交易的方向、手数、时间（±1 分钟）一致；价格允许 1~数跳差；
-   非换月段平仓盈亏偏差 ≤2%；STALL 交易按第 6.3 节的时点差异单独核对。
-4. **注意**：TB 的 STALL 触发时点比聚宽早：完成日线当晚 21:01（周一至周四对应次日 09:01，
+3. **NR 触发日**：见第 6.5 节；核对 `NR_SET → NR_FIRE/NR_SKIP` 的日期、方向与触发沿，
+   不要求与聚宽逐笔同价同时。
+4. **判定标准**：常规海龟交易的方向、手数、时间（±1 分钟）一致；价格允许 1~数跳差；
+   非换月段平仓盈亏偏差 ≤2%；STALL/NR 交易按第 6.3/6.5 节的时点差异单独核对。
+5. **注意**：TB 的 STALL/NR 触发时点比聚宽早：完成日线当晚 21:01（周一至周四对应次日 09:01，
    约早 12 小时；周五对应下周一 09:01，跨周末约早 60 小时），成交价与后续加仓档位可能不同；
    不要把“逐笔完全一致”作为 v3.2 的验收标准。
 
 ---
 
-## 6. STALL 规则详解
+## 6. 并行入场规则详解（STALL / NR）
 
 ### 6.1 事件与计数
 
@@ -184,8 +192,8 @@
 - 若持仓中达成 → `STALL_MISS reason=holding`，**错过不补**；
 - 若已有未完成委托 → `STALL_MISS reason=pending`，本边沿放弃；
 - 若预热/数据无效期达成 → `STALL_MISS reason=gated`（DEBUG 级），本边沿放弃；
-- STALL 与突破同 bar 时 **STALL 优先**；STALL 分支一旦选中，本 bar 不再跑常规海龟检查，
-  即使随后手数不足/委托被拒也不改跑突破（与聚宽分支语义对齐）。
+- STALL 与 NR/突破同 bar 时 **STALL 优先**；STALL 分支一旦选中，本 bar 不再跑常规海龟检查，
+  即使随后手数不足/委托被拒也不改跑 NR/突破（与聚宽分支语义对齐）。
 
 ### 6.3 触发时点差异（重要）
 
@@ -213,6 +221,27 @@
 - 超限时 OnInit 自动停用 STALL 并记 ERROR，海龟部分照常运行；
 - 不要把 `StallPeriod` 调大后指望公式自动扩窗（扩窗会改变 N 递归窗口，破坏对拍）。
 
+### 6.5 NR 收缩并行入场（NrN，默认 6）
+
+- **事件**：最新完成 data1 bar 的振幅（`High-Low`）为近 `NrN` 根最小（含等号，同聚宽）；
+  触发沿 = 该 bar 的 `High/Low`。`NrN=0` 关闭，OnInit 校验 `NrN<=WinSize()`；
+- **触发**：下一根 data1 bar 期间，1 分钟 `High>=NRH`（多）/ `Low<=NRL`（空）→ 市价开 1 unit
+  （`reason=entry_nr`）；受 `FixedDir` 约束；
+- **优先级**：`STALL 边沿 > NR > EntryN 突破`；NR 一旦触发或跳过（`NR_SKIP`），本 bar 不再走
+  常规海龟检查（同聚宽 return 语义）；持仓中让位给止损/出场/加仓；
+- **每事件只尝试一次**：进入 `NR_FIRE` 后无论手数不足/委托被拒都不再重试；
+  被 `gated/pending` 拦住（`NR_MISS`）不算尝试，事件保留、后续 bar 可重试；
+  持仓/预热期达成 = 错过不补；
+- **系统1 跳过**：盈利平仓后 `NrSkipNext=True`；下一次 NR 触发被消费并记 `NR_SKIP`
+  （与 20 日突破的 `BREAKOUT_SKIP` 相互独立），等下一 NR 事件再入场；
+- **时点差异**：与 STALL 同——聚宽在次日盘中看到新日线，TB 在 data1 推进后的整个下一根
+  data1 bar 有效（1d 通常夜盘 21:01 起），价格/时点可能不同；
+- **启动注意**：与聚宽一致，启动/重启后首个可交易 bar 若上一根 data1 bar 满足 NRn
+  且价格已越过触发沿，可能立即入场（不补历史触发，但当前事件仍有效）；如不希望这种
+  "补入场"，需另加启动基线门禁（当前未加）；
+- **可核对样例（聚宽 v3.2+NR6）**：切片1 `2020-03-24 4664`、`2020-04-29 4352`；
+  切片4 `2024-02-21 7366`（3/29 的 8172 被 `NR_SKIP`）；切片6 `2025-01-27 8328`。
+
 ---
 
 ## 7. 模拟怎么用
@@ -228,9 +257,10 @@
    - `ORDER_CH: 模拟/实盘=A_*账户接口...`（确认走账户通道，而不是图表信号）；
    - `参数C: ... RealTickSize=1`（按合约核对：p=1 / ru=5 / ag=1）；
    - `STALL: enabled=True StallPeriod=10 win=61 need=25 data1周期=1d`；
+   - `NR: enabled=True NrN=6 win=61 data1周期=1d`；
    - `IsLiveTrade=True`。
 5. **启动回放**：平台先回放历史 bar，此时 `QuoteStatus()<>RealTime`，处于**历史回放期门禁**：
-   只推进 STALL 基线、N/四通道，不调用 `ManagePosition`（不开仓/不止损/不重试），首条记
+   只推进 STALL/NR 基线、N/四通道，不调用 `ManagePosition`（不开仓/不止损/不重试），首条记
    `REPLAY_GATE`；`QuoteStatus()==RealTime` 的首根 bar 记 `REALTIME_BAR` 并恢复交易（机制与
    风险见 7.3）。回放期不会因历史 bar 产生被拒委托、乐观台账或 `信号闪烁`。门禁解除后，若账户
    已有持仓而台账为空，首个可交易 bar 由 `STATE_REBUILD` 自动重建。
@@ -304,6 +334,9 @@
 10. `RealTickSize` 是手填参数，填错不会报错但会影响成交价（填大让价、填小可能被拒单）；
    换品种/换合约后务必核对。旧默认值 2 是探针参数沿用的（p 最小变动价已改 1），
    已挂实例需在参数面板改为 1。
+11. NR 事件与跳过状态是内存变量（`NrHasEvent/NrFired/NrSkipNext`），重启/重载后清零：
+   首个 data1 bar 会按当时历史重建事件，`NrSkipNext` 丢失；NR 每事件**尝试一次即消费**
+   （手数不足/委托被拒不再重试，与聚宽"下单失败可重试"不同，见 6.5）。
 
 ### 7.3 回放期门禁（模拟/实盘启动阶段）
 
@@ -318,11 +351,13 @@
   自动交易开=图表交易→一律不发单。图表回测同样运行在 mode=0（2026-10-21 p2405 `_BT` 实测
   `StrategyMode=0`），不能仅凭 mode 区分；TBQuant 只能“先加载策略、后开自动交易”，
   加载回放时开关必为关，因此回放走图表回测口径（只成交在图表层），开自动交易后的每根 bar 都被拦截。
-- **行为**：不可交易阶段只调用 `TryStallEntry(False)`（推进 STALL 签名基线、消费 data1 边沿、
-  同步 N/四通道），跳过 `ManagePosition` 与 `ManageStopOnly`；每次启动首次进入不可交易阶段记一条
+- **行为**：不可交易阶段只调用 `TryStallEntry(False)`（推进 STALL 签名基线、消费 data1 边沿，
+  同步 N/四通道）；NR 事件由每根 bar 的 `RefreshNrEvent()` 维护（同样不下单）。
+  跳过 `ManagePosition` 与 `ManageStopOnly`；每次启动首次进入不可交易阶段记一条
   `REPLAY_GATE`（含 `mode` 与 `QuoteStatus`）。模拟/实盘转入实时 bar 后记 `REALTIME_BAR` 并恢复交易；
   图表模式在打开自动交易后的首根实时 bar 记 `REPLAY_GATE (mode=0 QuoteStatus=4)`，此后不再发单。
-- **不补**：回放期消耗掉的 STALL 边沿、突破/止损都不会在实时补做；这是启动语义，与重启一致。
+- **不补**：回放期消耗掉的 STALL 边沿、突破/止损都不会在实时补做；NR 只保留最新一根 data1 bar
+  的事件状态，回放期间错过的 NR 触发同样不补；这是启动语义，与重启一致。
 - **范围**：简单回测/参数优化恒可交易；图表回测可交易的前提是图表“自动交易”开关关闭（正常回测时
   即为关闭）；模拟/实盘按上述实时 bar 判据。
 - **排查**：启动后长时间只有 `REPLAY_GATE` 没有 `REALTIME_BAR` → `QuoteStatus()` 未进入 RealTime
@@ -410,12 +445,13 @@
 | EntryN | 20 | 突破入场通道周期（系统1=20） |
 | ExitN | 10 | 反向突破出场通道周期（系统1=10） |
 | **StallPeriod** | **10** | 连续 N 根 data1 极值停滞 → 入场；0=关闭 STALL |
+| **NrN** | **6** | 最近 NrN 根 data1 振幅最小者（NRn）的极值突破 → 入场；0=关闭 NR |
 | UnitRisk | 0.01 | 1 unit 风险预算（占风险资金比例） |
 | MarginCapPct | 0.10 | 保证金占用上限（占风险资金比例，0=不限） |
 | MaxUnits | 4 | 最大 unit 数（含首仓） |
 | AddStepN | 0.5 | 顺向每 N×该值 加 1 unit |
 | StopDistN | 2.0 | 止损距离（N 倍数） |
-| S1Skip | 0 | 1=上次突破盈利则跳过下一次同类突破 |
+| S1Skip | 1 | 1=上次交易盈利则跳过下一次同类突破：20 日突破记录被跳过价位、同价位不再入场直到通道刷新；NR 作废当前事件、等下一事件 |
 | TradeStartDate | 20200313 | 开始交易日期 yyyymmdd；之前仅预热不交易 |
 | InitCapital | 1000000 | 初始资金（回测）；模拟/实盘兼作风险资金上限 |
 | MultiplierP | 10 | 合约乘数（元/点/手，P=10） |
@@ -438,19 +474,25 @@
 |---|---|
 | `entry OPEN` / `add OPEN` | 开仓/加仓成功（dir/lots/price/N/stop/units/equity） |
 | `entry_stall OPEN` | STALL 并行入场成功（reason=entry_stall） |
+| `entry_nr OPEN` | NR 收缩并行入场成功（reason=entry_nr；前置 `NR_FIRE`） |
 | `stop CLOSE` / `exit_breakout CLOSE` | 2N 共享止损 / 反向突破出场平仓（含 pnl） |
 | `OPEN_SKIP` | 手数不足跳过（按日节流） |
 | `ORDER_SKIP` | 拒发：无效委托价（InvalidNumeric/≤0）/ 真实委托价无效 / 无可平持仓，按日节流 |
 | `OPEN_FAIL` / `CLOSE_FAIL` | 委托被拒，下一 bar 重试（可能被门禁拦；仅回测/图表通道） |
-| `S1_SKIP` / `BREAKOUT_SKIP` | 系统1 跳过规则触发 |
+| `S1_SKIP` / `BREAKOUT_SKIP` / `NR_SKIP` | 系统1 跳过规则触发（盈利平仓后；20 日突破与 NR 各自消费一次） |
+| `SKIP_RELEASED` | 被跳过的 20 日突破价位已被新极值刷新，恢复入场（old/new 价位） |
 | `STALL_FIRE` | STALL 边沿命中并尝试开仓（side/stall/long/short/N） |
 | `STALL_MISS` | 边沿命中但未开仓：`reason=holding/pending/gated` |
 | `STALL_EDGE` | DEBUG：边沿 OHLC 签名与 long/short 计数 |
+| `NR_SET` | DEBUG：新 data1 bar 构成 NRn 收缩事件（n/high/low） |
+| `NR_FIRE` | NR 触发并尝试市价开仓（side/n/level/N；随后看 `entry_nr OPEN` 或 `OPEN_SKIP`） |
+| `NR_SKIP` | 系统1 跳过本次 NR 突破（side/level） |
+| `NR_MISS` | DEBUG：NR 命中但被门禁/挂单拦住（`reason=gated/pending`） |
 | `ROLLOVER` | 主力合约切换（实盘；有持仓时随后 `ROLLOVER_SYNC` 并延后 2 根重建） |
 | `ROLLOVER_SYNC` | 换月后延后 2 根新 bar，按账户真值重建台账 |
 | `STATE_REBUILD` | 台账重建：回测=`contracts` 平台口径；模拟/实盘=`src=acct`（重启/不一致/部分成交/换月；对锁会记 ERROR 并停交易） |
 | `LEDGER_CLEAN` | 空仓残留台账清理 |
-| `DAILY` | 每日 14:45 快照（N/EL/XL/ES/XS/units/stop/equity/d1；有挂单时附 pend/ids；模拟/实盘附 `pdir/acctL/acctS/acctAvgL/acctAvgS/acctOk`） |
+| `DAILY` | 每日 14:45 快照（N/EL/XL/ES/XS/units/stop/equity/d1；有挂单时附 pend/ids；模拟/实盘附 `pdir/acctL/acctS/acctAvgL/acctAvgS/acctOk`；当日有 NR 事件时附 `NRH/NRL/nrF`） |
 | `ORDER` / `FILL` | OnOrder/OnFill 回报；`FILL` 含 `id`/`fillId`/`fillVol`（模拟/实盘；回测不触发） |
 | `ORDER_CH` | OnInit：本次运行的下单通道（模拟/实盘=`A_*` 账户接口；回测=图表信号） |
 | `ORDER_SEND` | 委托已发出（模拟/实盘 `via=acct`：`reason/sym/dir/close/lots/pxReal/pxChart/rollover/ids/ok`；回测无此行） |
@@ -464,7 +506,7 @@
 | `PEND_SYNC` | 按平台未成交列表校正挂单集合（集合变化时一条：`before=[...] after=[...]`） |
 | `PEND_SYNC_FAIL` | 未成交委托查询失败，沿用本地集合（每交易日首条） |
 | `ORDER_GATE` | 有未完成委托，拒发新单（按交易日首条） |
-| `REPLAY_GATE` | 进入不可交易阶段（模拟/实盘 `QuoteStatus<>RealTime`；图表模式已开自动交易）：只更新通道/STALL 基线，不下单（每次启动首次进入时一条） |
+| `REPLAY_GATE` | 进入不可交易阶段（模拟/实盘 `QuoteStatus<>RealTime`；图表模式已开自动交易）：只更新通道/STALL/NR 基线，不下单（每次启动首次进入时一条） |
 | `REALTIME_BAR` | `QuoteStatus=RealTime` 的首根 bar = 门禁解除、恢复交易（每次启动首次实时时一条） |
 | `ACCT_NOT_READY` | 交易模式但账户数据未就绪，暂停委托（每交易日首条） |
 | `HB` | 实时心跳（每根 data0 收盘一条；C/N/pos/units/lots，有止损/挂单时附 stop/pend；模拟/实盘附 `pdir/acctL/acctS/acctOk`，映射模式下 `pos` 恒 0 属正常；回测与历史回放不输出） |
@@ -534,6 +576,10 @@
 
 ## 12. 验证状态
 
+- **2026-11-01（NR 同步，未验证）**：TB 公式新增 NR 收缩并行入场（`NrN=6`，0=关闭）、NR 纳入
+  系统1 跳过、`S1Skip` 默认 0→1；仅做静态复查（花括号平衡、Global 声明、引用一致性）。
+  **尚未在 TB 编译/回测**；需编译通过后按 5.3 第 1/3 项验收（`NrN=0` 回归、NR 触发日核对），
+  再补六切片对照。已挂实例需在参数面板确认 `NrN=6`、`S1Skip=1` 后重新保存参数模板。
 - 代码：静态复查（花括号平衡、Global 声明、Data1 访问仅限访问器段、日志关键字、UTF-8+CRLF）；
   7 个聚宽 STALL 触发日已用 awk 按同口径复算全部命中。
 - TB 侧：**编译已通过（2026-10-20，含回放期门禁与无效价守卫；2026-10-26 含挂单同步；
@@ -549,7 +595,7 @@
   `OPEN_FAIL price=N/A`、TBCore `trade Error Buy Price=1.79e308` 刷屏；编译已通过，模拟重跑中
   新增日志不再出现 `price=N/A`。
 - 2026-10-20 回放期门禁：以 `QuoteStatus()==RealTime` 为唯一交易判据（`ShouldSkipTrading()`），
-  非实时 bar 只推进 STALL 基线/N/通道；首条 `REPLAY_GATE`、恢复时一条 `REALTIME_BAR`；回放期
+  非实时 bar 只推进 STALL/NR 基线/N/通道；首条 `REPLAY_GATE`、恢复时一条 `REALTIME_BAR`；回放期
   不再产生被拒委托、乐观台账与 `信号闪烁`。**编译通过；2026-10-20 22:55 模拟复跑验证**：历史
   回放段 `QuoteStatus=1`、无 `HB`/`D1BAR`；22:55 转实时（`REALTIME_BAR`，`QuoteStatus=4`）后
   `HB` 逐分钟输出、`D1BAR` 在新 data1 bar 输出一条；无委托/报错。
@@ -596,11 +642,16 @@
   OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
   MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
 - 首轮 TB 验收顺序：
-  1. 跑首轮回测时检查 `data1.Symbol`、`MAPPING ok=True`、`STALL: enabled=True need=25`；
-  2. `StallPeriod=0` 跑切片 4/5/6，与 v3.1 的 trades/DAILY 对齐；
+  1. 跑首轮回测时检查 `data1.Symbol`、`MAPPING ok=True`、`STALL: enabled=True need=25`、
+     `NR: enabled=True NrN=6`；
+  2. `NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，与 v3.1 的 trades/DAILY 对齐
+     （确认 NR 代码未干扰原海龟路径）；
   3. 跑第 6.3 节 7 个触发日（单合约切片），核对信号日/方向；触发时点应落在预期边沿 ±1 根 1m；
-  4. 边界：持仓中边沿 → `STALL_MISS reason=holding`；有挂单 → `reason=pending`；
-     STALL 与突破同 bar → STALL 优先；重启/回放 → 首边沿只建基线；
+  4. NR：核对 `NR_SET → NR_FIRE/NR_SKIP` 的日期、方向、触发沿（样例见 6.5）；
+     STALL 与 NR/突破同 bar → STALL 优先；NR 与突破同 bar → NR 优先；
+     持仓中 → 让位给止损/出场；有挂单 → `NR_MISS reason=pending`；
+     盈利平仓（`S1Skip=1`）后下一次 NR 触发应 `NR_SKIP`；`NrN=0` 时无 NR 日志；
+     20 日突破：`BREAKOUT_SKIP` 后同价位不再入场，直到 `SKIP_RELEASED` 才恢复；
   5. 模拟：按第 7 节核对 `REPLAY_GATE`→`REALTIME_BAR`（回放期无 `OPEN_FAIL`/信号闪烁）、
      `HB`/`D1BAR` 实时输出、PEND_ADD/PEND_DEL、FILL、DAILY、ROLLOVER。
 - 首轮跑通后如需回归基线，再按 `tbquant/tools/README.md` 流程落 `baselines/slice4-6`；
@@ -608,4 +659,4 @@
 
 ---
 
-*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
+*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1 · 2026-11-01 同步 NR6 收缩并行入场 + S1Skip 默认 1，待 TB 编译/回测）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*

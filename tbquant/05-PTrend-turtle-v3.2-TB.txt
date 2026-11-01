@@ -1,13 +1,13 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2（TBQuant · 双图层 + STALL 极值停滞并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2（TBQuant · 双图层 + STALL 极值停滞 / NR 收缩并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
-// 移植: joinquant/05-PTrend-turtle-v3.2.py（聚宽 · 棕榈油 P STALL 版）/ tbquant/05-PTrend-turtle-v3.1-TB.txt
+// 移植: joinquant/05-PTrend-turtle-v3.2.py（聚宽 · 棕榈油 P STALL + NR 版）/ tbquant/05-PTrend-turtle-v3.1-TB.txt
 //------------------------------------------------------------------------
-// v3.2 = v3.1 海龟逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样 + STALL 并行入场。
-// 指标与 STALL 口径 = data1 图层周期（默认日线；30m 等日内周期为实验口径，收完即推进，
+// v3.2 = v3.1 海龟逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样 + STALL 与 NR 收缩并行入场。
+// 指标与 STALL/NR 口径 = data1 图层周期（默认日线；30m 等日内周期为实验口径，收完即推进，
 // 且 Data1[0]/[1] 盘中对齐未复验、与聚宽不可比）。窗口头恒为最新一根已完成 data1 K线，
 // 每根新 bar 在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 不重算）；全局状态随 OnInit 复位。
 //
@@ -19,6 +19,14 @@
 //   与聚宽差异：聚宽次日 09:01 见新日线，TB 在 data1 推进首根 1m 触发（1d 通常夜盘 21:01），价格/时点不同。
 //   窗口上限 2*StallPeriod+5 ≤ WinSize()（默认 61 → 最大 28），超限 OnInit 停用 STALL 并记 ERROR。
 //
+// NR 收缩并行入场（NrN>0 启用，0=关闭；默认 6）:
+//   事件：最新完成 data1 bar 的振幅（High-Low）为近 NrN 根最小 → 触发沿 = 该 bar 高/低点；
+//   触发：下一根 data1 bar 期间，1m 价格触及触发沿 → 市价开 1 unit（空仓且 FixedDir 允许）；
+//   优先级：STALL 边沿 > NR > EntryN 突破；每事件只尝试一次；持仓/挂单/预热期达成 = 错过不补。
+//   系统1 跳过：S1Skip>0 且上次交易盈利 → 跳过一次 NR 突破（NR_SKIP），等下一 NR 事件。
+//   与聚宽差异：聚宽 NR 事件在次日盘中有效、TB 在 data1 推进后的整个下一根 data1 bar 有效（同一根），
+//   1d 通常夜盘 21:01 起，价格/时点可能不同。
+//
 // 挂载（两图层缺一不可；运行模式「K线收盘模型」）:
 //   data0 = 1 分钟：全部信号/风控/下单；data1 = 同合约日线：纯只读指标源。
 //   追加：策略单元右键数据源 → 周期 1d → 追加；两图层都「同步为主商品数据范围」。
@@ -27,7 +35,7 @@
 //   模拟/实盘校验：data0=data1=MainContSymbol（默认 p9888.DCE，区分大小写与后缀）且 MapToMain=True，
 //   否则禁开新仓；OnInit 时 data1 未就绪 → 首个齐备 bar 复核一次（MAPPING_RECHECK）。回测不校验合约。
 //   挂单门禁（模拟/实盘）：OnOrder 维护未完成委托集合（Declare/Declared/FillPart/Canceling），
-//   非空时拒发任何新委托（开/平/加/损；STALL 边沿遇挂单则放弃本次边沿）；只拦不撤；回测门禁不生效。
+//   非空时拒发任何新委托（开/平/加/损；STALL/NR 边沿遇挂单则放弃本次边沿）；只拦不撤；回测门禁不生效。
 //   回调实证（2026-10-19 RateCheckProbe，TB 期货模拟 p2701）：OnOrder 稳定 1→2→5，
 //   OnFill 的 side/combOffset/volume/price/fillPrice 有效；fillId 为 String，orderId/fillVolume 待实测。
 //   实盘柜台是否回调仍未验证。
@@ -67,12 +75,13 @@ Params
     Integer EntryN(20);           // 突破入场通道周期（系统1=20）
     Integer ExitN(10);            // 反向突破出场通道周期（系统1=10）
     Integer StallPeriod(10);      // 并行入场：连续 N 根 data1 极值停滞（未创新低/新高）→入场；0=关闭
+    Integer NrN(6);               // 并行入场：最近 NrN 根 data1 振幅最小者（NRn）的极值突破 → 入场；0=关闭
     Numeric UnitRisk(0.01);       // 1 unit 风险预算（占风险资金比例）
     Numeric MarginCapPct(0.10);   // 保证金占用上限（占风险资金比例，0=不限）
     Integer MaxUnits(4);          // 最大 unit 数（含首仓）
     Numeric AddStepN(0.5);        // 顺向每 N*该值 加 1 unit
     Numeric StopDistN(2.0);       // 止损距离（N 倍数）
-    Integer S1Skip(0);            // 系统1跳过规则：1=上次突破盈利则跳过下一次同类突破
+    Integer S1Skip(1);            // 系统1跳过规则：1=上次交易盈利则跳过下一次同类突破（含 NR 突破）
     Integer TradeStartDate(20200313); // 开始交易日期(yyyymmdd)；之前仅预热不交易
     // ---- 账户/撮合参数 ----
     Numeric InitCapital(1000000); // 初始资金（回测）；模拟/实盘风险资金上限
@@ -105,6 +114,8 @@ Vars
     Global Numeric StopLine;      // 共享止损线
     // ---- 系统1 跳过 ----
     Global Bool SkipNextBreakout;
+    Global Numeric SkipLevel;     // 被跳过的 20 日突破价位（同价位不再入场，直到通道刷新）
+    Global Integer SkipDir;       // 跳过方向：+1 多 / -1 空 / 0 无
     // ---- STALL 极值停滞并行入场（v3.2）----
     Global Bool StallEnabled;     // OnInit 校验：StallPeriod>0 且 2*StallPeriod+5<=WinSize()
     Global Bool StallInit;        // 首次有效读取仅建基线
@@ -116,6 +127,14 @@ Vars
     Global Integer StallShortCnt; // 空头镜像
     Global String StallRefSym;    // 签名归属：D1Sym()|MainSymbol()，变化=换月/换层→重基线
     Global String D1LogSig;       // 完整 D1 行去重指纹（合约|OHLC），同一根 data1 bar 只打一次
+    // ---- NR 收缩并行入场（v3.2 新增，与 STALL/突破并列）----
+    Global Bool NrEnabled;        // OnInit 校验：NrN>0 且 NrN<=WinSize()
+    Global Bool NrHasEvent;       // 最新完成 data1 bar 是否为近 NrN 根振幅最小者
+    Global Bool NrFired;          // 本事件已尝试（开仓或跳过），每根新 data1 bar 复位
+    Global Bool NrSkipNext;       // 系统1：上次交易盈利 → 跳过一次 NR 突破
+    Global Numeric NrHighLv;      // 事件触发上沿 = 收缩 bar High
+    Global Numeric NrLowLv;       // 事件触发下沿 = 收缩 bar Low
+    Global String NrD1Sig;        // 上次评判的 data1 OHLC 指纹（合约|OHLC）
     // ---- 移仓跟踪 ----
     Global String LastMainSym;    // 上次主力合约；变化=发生移仓
     Global Bool MainSymInit;      // 主力字符串初始化标记
@@ -1224,7 +1243,10 @@ Defs
             + " units=" + Text(UnitCount) + " equity=" + Text(CurEquity(), 0));
         If (S1Skip > 0 And pnl > 0) {
             SkipNextBreakout = True;
-            WLog("S1_SKIP 上次突破盈利，下一次同类突破将跳过");
+            SkipLevel = 0;
+            SkipDir = 0;
+            NrSkipNext = True;
+            WLog("S1_SKIP 上次交易盈利，下一次同类突破（含 NR）将跳过");
         }
         ResetLedger();
         Return 0;
@@ -1379,7 +1401,8 @@ Defs
 
     // 入场判断：空仓时检查价格是否突破前 EntryN 根 data1 极值（唐奇安通道上/下沿；随最新完成 data1 K线刷新）。
     // 概念映射：多头触发 = High() ≥ EntryLongLv；空头触发 = Low() ≤ EntryShortLv；评估粒度 = 分钟 bar。
-    // 系统1 跳过：S1Skip>0 且 SkipNextBreakout 置位（上次同类突破盈利）→ 本次突破取消并消费该标记。
+    // 系统1 跳过：S1Skip>0 且 SkipNextBreakout 置位（上次交易盈利）→ 本次突破取消并记录价位；
+    // 同价位不再入场，直到通道刷新出新极值（SKIP_RELEASED）后恢复。
     // 调用前提：仅由 ManagePosition 空仓分支调用（平台空仓、台账已清后）。
     // 互斥/单动作：多头分支 Return 后不再评估空头——同 bar 双突破时多头优先；每 bar 至多开 1 unit。
     // 后置：开仓交给 DoOpenUnit（实际价由 CalcOrderPrice、手数由 CalcLots 解析）；手数不足时逐 bar
@@ -1394,11 +1417,21 @@ Defs
         Bool allowShort = (FixedDir == 0 Or FixedDir == -1);
         // 多头突破
         If (allowLong And High() >= EntryLongLv) {
-            // 系统1 跳过：消费标记，仅跳过一次突破
+            // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
             If (S1Skip > 0 And SkipNextBreakout) {
                 SkipNextBreakout = False;
+                SkipLevel = EntryLongLv;
+                SkipDir = 1;
                 WLog("BREAKOUT_SKIP long level=" + Text(EntryLongLv, 1));
                 Return 0;
+            }
+            If (S1Skip > 0 And SkipDir == 1 And SkipLevel > 0) {
+                If (EntryLongLv == SkipLevel) {
+                    Return 0;
+                }
+                WLog("SKIP_RELEASED long old=" + Text(SkipLevel, 1) + " new=" + Text(EntryLongLv, 1));
+                SkipLevel = 0;
+                SkipDir = 0;
             }
             // 触发价=通道上沿；实际委托价/手数在 DoOpenUnit 内解析
             DoOpenUnit(1, EntryLongLv, "entry");
@@ -1406,11 +1439,21 @@ Defs
         }
         // 空头突破（多头已触发则上面已 Return——每 bar 单动作）
         If (allowShort And Low() <= EntryShortLv) {
-            // 系统1 跳过：消费标记，仅跳过一次突破
+            // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
             If (S1Skip > 0 And SkipNextBreakout) {
                 SkipNextBreakout = False;
+                SkipLevel = EntryShortLv;
+                SkipDir = -1;
                 WLog("BREAKOUT_SKIP short level=" + Text(EntryShortLv, 1));
                 Return 0;
+            }
+            If (S1Skip > 0 And SkipDir == -1 And SkipLevel > 0) {
+                If (EntryShortLv == SkipLevel) {
+                    Return 0;
+                }
+                WLog("SKIP_RELEASED short old=" + Text(SkipLevel, 1) + " new=" + Text(EntryShortLv, 1));
+                SkipLevel = 0;
+                SkipDir = 0;
             }
             // 触发价=通道下沿；实际委托价/手数在 DoOpenUnit 内解析
             DoOpenUnit(-1, EntryShortLv, "entry");
@@ -1568,6 +1611,140 @@ Defs
         Return True;
     }
 
+    // ---------- NR 收缩并行入场（v3.2；口径=data1 周期）----------
+
+    // NR 运行状态复位（OnInit 调用；NrEnabled 随后由 NrN 校验重新置位）
+    Integer ResetNrState() {
+        NrEnabled = False;
+        NrHasEvent = False;
+        NrFired = False;
+        NrSkipNext = False;
+        NrHighLv = 0;
+        NrLowLv = 0;
+        NrD1Sig = "";
+        Return 0;
+    }
+
+    // 刷新 NR 事件：最新完成 data1 bar 的 OHLC 指纹变化时重算。
+    // 事件 := 该 bar 振幅（High-Low）为近 NrN 根最小（含等号，同聚宽）；触发沿 = 该 bar High/Low。
+    // 事件在下一根 data1 bar 期间有效；NrFired 每根新 data1 bar 复位。
+    Integer RefreshNrEvent() {
+        If (NrEnabled == False Or DataCount() < 2) {
+            NrHasEvent = False;
+            Return 0;
+        }
+        If (NumValid(D1Open(1)) == False Or NumValid(D1High(1)) == False Or
+            NumValid(D1Low(1)) == False Or NumValid(D1Close(1)) == False) {
+            NrHasEvent = False;
+            Return 0;
+        }
+        Numeric o = D1Open(1);
+        Numeric h = D1High(1);
+        Numeric l = D1Low(1);
+        Numeric c = D1Close(1);
+        String sig = D1Sym() + "|" + MainSymbol() + "|" + Text(o, 4) + "|" + Text(h, 4)
+            + "|" + Text(l, 4) + "|" + Text(c, 4);
+        If (sig == NrD1Sig) {
+            Return 0;
+        }
+        NrD1Sig = sig;
+        Numeric lastR = h - l;
+        Numeric minR = lastR;
+        Numeric r;
+        Integer k;
+        Integer validCnt = 1;
+        For k = 2 To NrN {
+            If (NumValid(D1High(k)) And NumValid(D1Low(k))) {
+                r = D1High(k) - D1Low(k);
+                minR = Min(minR, r);
+                validCnt = validCnt + 1;
+            }
+        }
+        NrHighLv = h;
+        NrLowLv = l;
+        NrFired = False;
+        // 窗口不足 NrN 根：不构成事件（等历史补足）
+        If (validCnt < NrN) {
+            NrHasEvent = False;
+            Return 0;
+        }
+        NrHasEvent = (lastR <= minR);
+        If (NrHasEvent And LogLevel >= 3) {
+            WLogD("NR_SET n=" + Text(NrN) + " high=" + Text(h, 1) + " low=" + Text(l, 1));
+        }
+        Return 0;
+    }
+
+    // NR 突破入场。返回 True = 本 bar 已处理 NR（开仓尝试或跳过），OnBar 不再走常规 ManagePosition。
+    // 触发 = 1m High/Low 触及收缩 bar 的高/低点；空仓且无挂单才动作；每事件只尝试一次。
+    // 市价单（与聚宽 order()/STALL 一致）：回测按当前 1m 收盘，实盘按盘口对手价。
+    Bool TryNrEntry() {
+        If (ParamsOk == False Or NrEnabled == False Or NrHasEvent == False Or NrFired) {
+            Return False;
+        }
+        If (PosLotsNow() <> 0) {
+            Return False;
+        }
+        // 与 STALL 同口径：挂图/账户/交易起点/N 通道不满足时不动作，事件保留待后续 bar
+        If (CanTradeNow() == False) {
+            If (LogLevel >= 3) {
+                WLogD("NR_MISS reason=gated");
+            }
+            Return False;
+        }
+        Bool allowLong = (FixedDir == 0 Or FixedDir == 1);
+        Bool allowShort = (FixedDir == 0 Or FixedDir == -1);
+        // 多头
+        If (allowLong And High() >= NrHighLv) {
+            If (S1Skip > 0 And NrSkipNext) {
+                NrSkipNext = False;
+                NrFired = True;
+                WLog("NR_SKIP side=long level=" + Text(NrHighLv, 1) + "（系统1：上次交易盈利）");
+                Return True;
+            }
+            If (GetArraySize(PendingIds) > 0) {
+                If (LogLevel >= 3) {
+                    WLogD("NR_MISS side=long reason=pending ids=" + PendingStr());
+                }
+                Return False;
+            }
+            If (PLots <> 0 Or UnitCount <> 0) {
+                WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
+                ResetLedger();
+            }
+            WLog("NR_FIRE side=long n=" + Text(NrN) + " level=" + Text(NrHighLv, 1)
+                + " N=" + Text(NVal, 1));
+            DoOpenUnitMarket(1, "entry_nr");
+            NrFired = True;
+            Return True;
+        }
+        // 空头
+        If (allowShort And Low() <= NrLowLv) {
+            If (S1Skip > 0 And NrSkipNext) {
+                NrSkipNext = False;
+                NrFired = True;
+                WLog("NR_SKIP side=short level=" + Text(NrLowLv, 1) + "（系统1：上次交易盈利）");
+                Return True;
+            }
+            If (GetArraySize(PendingIds) > 0) {
+                If (LogLevel >= 3) {
+                    WLogD("NR_MISS side=short reason=pending ids=" + PendingStr());
+                }
+                Return False;
+            }
+            If (PLots <> 0 Or UnitCount <> 0) {
+                WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
+                ResetLedger();
+            }
+            WLog("NR_FIRE side=short n=" + Text(NrN) + " level=" + Text(NrLowLv, 1)
+                + " N=" + Text(NVal, 1));
+            DoOpenUnitMarket(-1, "entry_nr");
+            NrFired = True;
+            Return True;
+        }
+        Return False;
+    }
+
     // data0 心跳（仅实时 OnBarClose，每根一行）：证明事件循环在跑，并留下价格/仓位/N 状态。
     // 有 stop 才附 stop，有挂单才附 pend，保持短行。
     Integer LogBarHeartbeat() {
@@ -1719,9 +1896,12 @@ Events
         BarCnt = 0;
         MainSymInit = False;
         SkipNextBreakout = False;
+        SkipLevel = 0;
+        SkipDir = 0;
         ReplayGateLogged = False;
         RealtimeLogged = False;
         ResetStallState();
+        ResetNrState();
         ResetLogThrottle();
         D1LogSig = "";
         FinalDone = False;
@@ -1767,6 +1947,15 @@ Events
                 StallEnabled = True;
             }
         }
+        // NR 参数校验：NrN>0 时窗口须在 WinSize 内；NrN=0 关闭
+        If (NrN > 0) {
+            If (NrN > WinSize()) {
+                WLogInitE("NR 停用: NrN=" + Text(NrN) + " > WinSize()=" + Text(WinSize()));
+            }
+            Else {
+                NrEnabled = True;
+            }
+        }
         // 模拟/实盘校验：data0 与 data1 必须是同一主连合约（MainContSymbol），且 MapToMain=True；回测不校验。
         // TB 公式无法直接查询"图表是否主连"，以 Symbol 与主连代码参数精确匹配判定。
         // 不满足 → CanTradeNow 恒 False（不开新仓）；映射/换月只按 data0 是否主连 + MapToMain 下发。
@@ -1802,7 +1991,7 @@ Events
                 SetOrderMap2MainSymbol();
             }
         }
-        WLogInit("===== OnInit 棕榈油海龟 v3.2（TB公式版-双图层+STALL）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2（TB公式版-双图层+STALL+NR）=====");
         WLogInit("图层: DataCount=" + Text(DataCount()) + " MainSymbol=" + MainSymbol());
         WLogInit("data0.Symbol=" + Symbol + "(" + Frequency() + ")");
         If (DataCount() >= 2) {
@@ -1855,7 +2044,7 @@ Events
             + " 回测=Buy/SellShort/Sell/BuyToCover（图表信号）");
         WLogInit("参数A: FixedDir=" + Text(FixedDir) + " NPeriod=" + Text(NPeriod) + " NSmooth=" + Text(NSmooth)
             + " EntryN=" + Text(EntryN) + " ExitN=" + Text(ExitN) + " StallPeriod=" + Text(StallPeriod)
-            + " MaxUnits=" + Text(MaxUnits));
+            + " NrN=" + Text(NrN) + " MaxUnits=" + Text(MaxUnits));
         String stallFreq = "na";
         If (DataCount() >= 2) {
             stallFreq = D1Freq();
@@ -1863,6 +2052,8 @@ Events
         WLogInit("STALL: enabled=" + IIFString(StallEnabled, "True", "False")
             + " StallPeriod=" + Text(StallPeriod) + " win=" + Text(WinSize())
             + " need=" + Text(StallPeriod * 2 + 5) + " data1周期=" + stallFreq);
+        WLogInit("NR: enabled=" + IIFString(NrEnabled, "True", "False")
+            + " NrN=" + Text(NrN) + " win=" + Text(WinSize()) + " data1周期=" + stallFreq);
         WLogInit("参数B: UnitRisk=" + Text(UnitRisk, 4) + " MarginCapPct=" + Text(MarginCapPct, 4)
             + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2) + " S1Skip=" + Text(S1Skip));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
@@ -1916,16 +2107,19 @@ Events
             // 1b. 挂图合法性复核：OnInit 时 data1 可能未就绪，首个数据齐备的 bar 解锁一次
             RecheckMapping();
 
-            // ---- 2. STALL 并行入场（先于常规海龟检查）----
+            // ---- 2. NR 事件刷新（只更新事件状态；入场在 STALL 之后判定）----
+            RefreshNrEvent();
+
+            // ---- 3. STALL / NR 并行入场（先于常规海龟检查）----
             // 回放期门禁：模拟/实盘非实时 bar 不下单（否则历史 bar 委托被拒→乐观台账→
-            // 下一 tick 清理→重试，形成 OPEN_FAIL/信号闪烁循环）。只推进 STALL 基线与通道，
+            // 下一 tick 清理→重试，形成 OPEN_FAIL/信号闪烁循环）。只推进 STALL/NR 基线与通道，
             // 不调用 ManagePosition；QuoteStatus=RealTime 的首根 bar 恢复交易。回测不受影响。
             // 两种不可交易阶段：①模拟/实盘的非实时 bar ②图表模式自动交易开（图表交易）。
             // 账户未就绪另由 CanTradeNow 拦。
             If (IsTradablePhase() == False) {
                 If (ReplayGateLogged == False) {
                     ReplayGateLogged = True;
-                    WLog("REPLAY_GATE 跳过交易：只更新通道/STALL 基线（mode=" + Text(StrategyMode())
+                    WLog("REPLAY_GATE 跳过交易：只更新通道/STALL/NR 基线（mode=" + Text(StrategyMode())
                         + " QuoteStatus=" + Text(QuoteStatus()) + "）");
                 }
                 TryStallEntry(False);
@@ -1938,35 +2132,37 @@ Events
                     }
                 }
                 // True=边沿上确实尝试了开仓 → 本 bar 跳过常规检查（对齐聚宽 stall 分支的 elif）；
-                // False=无边沿/边沿已消费 → 照常走止损/出场/加仓（持仓中达成 STALL 时仍管理持仓，
-                // 此点与聚宽 elif 不同，为有意偏差，见说明文档）。
+                // False=无边沿/边沿已消费 → 再判 NR；NR 未处理时才走常规检查。
                 If (TryStallEntry(True) == False) {
-                    // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
-                    If (CanTradeNow()) {
-                        ManagePosition();
-                    }
-                    Else {
-                        // 交易模式但账户数据未就绪：暂停一切委托（CanTradeNow 已拦），每交易日首条告警
-                        If (IsStrategyTradeMode()) {
-                            If (IsLiveTrade() == False) {
-                                If (YMD() >= TradeStartDate) {
-                                    If (LastAcctWarnYmd <> YMD()) {
-                                        LastAcctWarnYmd = YMD();
-                                        WLogW("ACCT_NOT_READY 交易模式但账户数据未就绪，暂停交易（检查账户连接/绑定）");
+                    // NR 触发/跳过时返回 True，本 bar 不再走 ManagePosition（同聚宽 return 语义）
+                    If (TryNrEntry() == False) {
+                        // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
+                        If (CanTradeNow()) {
+                            ManagePosition();
+                        }
+                        Else {
+                            // 交易模式但账户数据未就绪：暂停一切委托（CanTradeNow 已拦），每交易日首条告警
+                            If (IsStrategyTradeMode()) {
+                                If (IsLiveTrade() == False) {
+                                    If (YMD() >= TradeStartDate) {
+                                        If (LastAcctWarnYmd <> YMD()) {
+                                            LastAcctWarnYmd = YMD();
+                                            WLogW("ACCT_NOT_READY 交易模式但账户数据未就绪，暂停交易（检查账户连接/绑定）");
+                                        }
                                     }
                                 }
                             }
-                        }
-                        // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
-                        // 回测保持原语义，TradeStartDate 之前也不动作。
-                        If (IsLiveTrade() And YMD() >= TradeStartDate) {
-                            ManageStopOnly();
+                            // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
+                            // 回测保持原语义，TradeStartDate 之前也不动作。
+                            If (IsLiveTrade() And YMD() >= TradeStartDate) {
+                                ManageStopOnly();
+                            }
                         }
                     }
                 }
             }
 
-            // ---- 3. 每日定时日志（14:45，同聚宽 signal_time）----
+            // ---- 4. 每日定时日志（14:45，同聚宽 signal_time）----
             // 回测照写；模拟/实盘仅实时（历史回放阶段不写）。
             Bool dailyLogOk = True;
             If (IsStrategyTradeMode()) {
@@ -1997,15 +2193,21 @@ Events
                         + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
                         + " acctOk=" + IIFString(AcctPosOk, "True", "False");
                 }
+                // NR 事件状态：仅在当日存在收缩事件时附加
+                String nrseg = "";
+                If (NrHasEvent) {
+                    nrseg = " NRH=" + Text(NrHighLv, 1) + " NRL=" + Text(NrLowLv, 1)
+                        + " nrF=" + IIFString(NrFired, "True", "False");
+                }
                 WLog("DAILY " + MainSymbol()
                     + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
                     + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
                     + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
                     + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
-                    + " d1=" + d1s + d0seg + pendseg + acctseg);
+                    + " d1=" + d1s + d0seg + pendseg + acctseg + nrseg);
             }
 
-            // ---- 4. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
+            // ---- 5. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
             // 本段主要为回测验收/回归对照而设：不翻全程日志，一行核对三件事——
             //   ① 对账：pos/contracts（平台）vs lots（台账），不等=台账漂移（查 STATE_REBUILD）。
             //   ② 收益：equity 期末权益为主指标；BarCnt=处理的1分钟bar数 → 证明整段跑完。
