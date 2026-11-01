@@ -18,10 +18,12 @@
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
 #   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
-#   - 系统1 跳过规则: 上次交易若盈利，跳过一次同类入场——20 日突破记录被跳过价位并等通道
-#     刷新出新极值；NR 突破作废当前事件、等新 NR 事件再入场（s1_skip 开关，默认开启）
+#   - 系统1 跳过规则: 上次交易若盈利，突破与 NR 各跳过一次（不判方向；STALL 不参与）
+#     ——20 日突破记录被跳过价位并等通道刷新出新极值；NR 突破作废当前事件、等新 NR 事件再入场
+#     （s1_skip 开关，默认开启）
 #   - fixed_dir: 1=只做多 / -1=只做空 / 0=经典双向（跟随突破方向）
-#   工程: 主力移仓 / 夜盘分钟检查 / 停板等待 沿用既有框架
+#   工程: 主力移仓（开新腿前保证金预检、不足回退先平旧；移仓中触止损/出场中止移仓并平仓）/
+#         夜盘分钟检查 / 停板等待（未平完的平仓每 bar 重试直至清仓）沿用既有框架
 #   沙盒口径: 盘中周期为会话锚定分桶（日盘 09:00/13:30 起、夜盘 21:00 起；
 #             60m 在 11:00-11:30、14:30-15:00 会形成半根 bar，按实际长度计入）
 # 回测设置: 期货账户 / 100 万 / 分钟频率
@@ -286,26 +288,37 @@ def open_unit(ctx, direction, n_val, reason):
         return False
     o = order(c, lots, side=side)
     if o is None or o.filled < lots:
+        if o is not None and o.filled > 0:
+            g.entry_log[(c, side)] = {'price': o.price, 'n': n_val}   # 部分成交也记录，供状态重建恢复
         warn_once('open_' + c, f"{log_pfx()} ❌ WARN open unfilled (limit board?) {c} lots={lots}")
         return False
     stop_line = o.price - direction * p['stop_dist_n'] * n_val
+    if not g.legs:
+        g.close_pnl_acc = 0.0      # 新仓开始，清空上一笔的累计盈亏
+        g.close_retry = None
     g.legs.append({'contract': c, 'side': side, 'lots': lots, 'entry_price': o.price,
                    'n_at_entry': n_val, 'stop_line': stop_line})
     g.stop_line = stop_line
-    if reason in ('entry', 'entry_stall'):
-        g.skip_level = None
-        g.skip_side = None
+    g.entry_log[(c, side)] = {'price': o.price, 'n': n_val}
     log.info(f"{log_pfx()} ✅{trade_mark(side, reason)} {reason.upper()} {side} {c} {lots}@{o.price:.1f} "
              f"N={n_val:.1f} stop={stop_line:.1f} units={len(g.legs)} equity={ctx.portfolio.total_value:.0f}")
     g.warned.pop('open_' + c, None)
     return True
 
 
+def realize_leg_pnl(leg, exit_price):
+    """实现一条 leg 的盈亏并计入整笔累计（分批平仓 / 移仓平旧腿共用）"""
+    pnl = (exit_price - leg['entry_price']) * leg['lots'] * g.params['multiplier'] * side_to_dir(leg['side'])
+    g.close_pnl_acc += pnl
+    return pnl
+
+
 def close_all(ctx, reason):
-    """全部平仓（止损/反向突破出场）；未成交的 leg 留待下一 bar 继续"""
+    """全部平仓（止损/反向突破出场）；未平完置 close_retry，由分钟检查每 bar 重试直至清仓"""
     if not g.legs:
         return
-    trade_pnl = 0.0
+    pos_side = g.legs[0]['side']
+    pos_contract = g.legs[0]['contract']
     for leg in list(g.legs):
         c = leg['contract']
         if has_open_order(c):
@@ -316,20 +329,27 @@ def close_all(ctx, reason):
             warn_once('close_' + c, f"{log_pfx()} ❌ WARN close unfilled (limit board?) {c} "
                                     f"{leg['side']} lots={leg['lots']} reason={reason}")
             continue
-        pnl = (o.price - leg['entry_price']) * leg['lots'] * g.params['multiplier'] * side_to_dir(leg['side'])
-        trade_pnl += pnl
+        pnl = realize_leg_pnl(leg, o.price)
         log.info(f"{log_pfx()} ✅{trade_mark(leg['side'], reason)} CLOSE {leg['side']} {c} {leg['lots']}@{o.price:.1f} "
                  f"pnl={pnl:.0f} reason={reason} entry={leg['entry_price']:.1f} stop={leg['stop_line']:.1f}")
         g.legs.remove(leg)
         g.warned.pop('close_' + c, None)
     if not g.legs:
         g.stop_line = None
-        if g.params['s1_skip'] and trade_pnl > 0:
-            g.skip_next_breakout = True          # 系统1：上次突破盈利 → 跳过下一次同类突破
+        g.close_retry = None
+        g.entry_log.pop((pos_contract, pos_side), None)
+        total_pnl = g.close_pnl_acc
+        if g.params['s1_skip'] and total_pnl > 0:
+            # 系统1：突破与 NR 各跳过一次，不判方向；STALL 不参与
+            g.skip_next_breakout = True
             g.skip_level = None
             g.skip_side = None
-            g.nr_skip_next = True                # NR 突破同样跳过下一次
-        log.info(f"{log_pfx()} ✅ 清仓完成，当前空仓 trade_pnl={trade_pnl:.0f}")
+            g.nr_skip_next = True
+            log.info(f"{log_pfx()} S1_SKIP_ARM side={pos_side} (下一次突破/NR 跳过，不分方向)")
+        log.info(f"{log_pfx()} ✅ 清仓完成，当前空仓 trade_pnl={total_pnl:.0f}")
+        g.close_pnl_acc = 0.0
+    else:
+        g.close_retry = reason
 
 
 def check_state_consistency(ctx):
@@ -350,14 +370,23 @@ def check_state_consistency(ctx):
         return
     log.warn(f"{log_pfx()} STATE_MISMATCH tracked={tracked} actual={actual} -> rebuild from actual")
     g.legs = []
+    g.close_pnl_acc = 0.0      # 重建后原入场价/已平盈亏不可知，累计盈亏清零
     for (c, side), amt in actual.items():
+        rec = g.entry_log.get((c, side))
         d = bar_levels(ctx)
         n_val = d['n'] if d is not None else 0.0
-        price = get_current_data()[c].last_price
-        stop_line = price - side_to_dir(side) * g.params['stop_dist_n'] * n_val
+        if rec is not None:
+            price = rec['price']            # 优先恢复真实入场价，避免现价兜底偏离
+            if rec['n'] > 0:
+                n_val = rec['n']
+        else:
+            price = get_current_data()[c].last_price
+        stop_line = g.stop_line if g.stop_line is not None else \
+            price - side_to_dir(side) * g.params['stop_dist_n'] * n_val
         g.legs.append({'contract': c, 'side': side, 'lots': amt, 'entry_price': price,
                        'n_at_entry': n_val, 'stop_line': stop_line})
         g.stop_line = stop_line
+        g.entry_log[(c, side)] = {'price': price, 'n': n_val}
 
 # ==================== 分钟检查（止损/出场/加仓/入场） ====================
 
@@ -370,6 +399,9 @@ def turtle_minute_checks(ctx, bar, lv, nr_ev):
     if bar is None:
         return
     if g.legs:
+        if g.close_retry is not None:
+            close_all(ctx, g.close_retry)   # 上次平仓未平完（停板等），继续重试直至清仓
+            return
         side = g.legs[0]['side']
         direction = side_to_dir(side)
         # 1) 共享止损（2N，含加仓后的上移）
@@ -427,12 +459,14 @@ def turtle_minute_checks(ctx, bar, lv, nr_ev):
             g.skip_next_breakout = False
             g.skip_level = lv['entry_long']
             g.skip_side = 'long'
-            log.info(f"{log_pfx()} BREAKOUT_SKIP long level={lv['entry_long']:.1f} (系统1：上次突破盈利)")
+            log.info(f"{log_pfx()} BREAKOUT_SKIP long level={lv['entry_long']:.1f} (系统1：上次交易盈利)")
             return
         if g.skip_side == 'long' and g.skip_level is not None and lv['entry_long'] == g.skip_level:
             return                       # 被跳过的突破价位尚未刷新，继续等待新极值
         if g.skip_side == 'long' and g.skip_level is not None:
             log.info(f"{log_pfx()} SKIP_RELEASED long old={g.skip_level:.1f} new={lv['entry_long']:.1f}")
+            g.skip_level = None
+            g.skip_side = None
         open_unit(ctx, 1, lv['n'], 'entry')
         return
     if allow_short and bar['low'] <= lv['entry_short']:
@@ -440,12 +474,14 @@ def turtle_minute_checks(ctx, bar, lv, nr_ev):
             g.skip_next_breakout = False
             g.skip_level = lv['entry_short']
             g.skip_side = 'short'
-            log.info(f"{log_pfx()} BREAKOUT_SKIP short level={lv['entry_short']:.1f} (系统1：上次突破盈利)")
+            log.info(f"{log_pfx()} BREAKOUT_SKIP short level={lv['entry_short']:.1f} (系统1：上次交易盈利)")
             return
         if g.skip_side == 'short' and g.skip_level is not None and lv['entry_short'] == g.skip_level:
             return
         if g.skip_side == 'short' and g.skip_level is not None:
             log.info(f"{log_pfx()} SKIP_RELEASED short old={g.skip_level:.1f} new={lv['entry_short']:.1f}")
+            g.skip_level = None
+            g.skip_side = None
         open_unit(ctx, -1, lv['n'], 'entry')
 
 # ==================== 移仓 ====================
@@ -479,25 +515,36 @@ def start_migration(ctx, new_contract):
     total = sum([leg['lots'] for leg in g.legs])
     g.migrating = {'old': g.current_contract, 'new': new_contract, 'side': side, 'total': total,
                    'new_price': None, 'old_price': None}
+    g.close_retry = None      # 移仓接管持仓，作废未完成的平仓重试
     log.info(f"{log_pfx()} MIGRATE start {g.current_contract}->{new_contract} side={side} lots={total}")
     retry_migration(ctx)
 
 
 def retry_migration(ctx):
-    """推进移仓：每 bar 重试未成交腿；两腿全成交后统一更新 legs 并做价差平移"""
+    """推进移仓：每 bar 重试未成交腿；两腿全成交后统一更新 legs 并做价差平移。
+    开新腿前做保证金预检，不足则回退为"先平旧再开新"（旧腿平仓释放保证金后再开新腿）"""
     m = g.migrating
     if m is None:
         return
     if has_open_order(m['new']) or has_open_order(m['old']):
         return
-    if m['new_price'] is None:
-        o = order(m['new'], m['total'], side=m['side'])
-        if o is None or o.filled < m['total']:
-            warn_once('mig_new', f"{log_pfx()} WARN migrate open unfilled {m['new']} lots={m['total']}")
-            return
-        m['new_price'] = o.price
-        g.warned.pop('mig_new', None)
-        log.info(f"{log_pfx()} MIGRATE open {m['new']} {m['side']} {m['total']}@{o.price:.1f}")
+    p = g.params
+    if m['new_price'] is None and not m.get('close_first'):
+        price = get_current_data()[m['new']].last_price
+        lots = fit_lots_to_margin(m['total'], price, p['multiplier'], p['margin_rate'],
+                                  ctx.subportfolios[0].available_cash)
+        if lots < m['total']:
+            warn_once('mig_margin', f"{log_pfx()} WARN migrate margin insufficient {m['new']} "
+                                    f"lots={m['total']} afford={lots}，回退为先平旧再开新")
+            m['close_first'] = True
+        else:
+            o = order(m['new'], m['total'], side=m['side'])
+            if o is None or o.filled < m['total']:
+                warn_once('mig_new', f"{log_pfx()} WARN migrate open unfilled {m['new']} lots={m['total']}")
+                return
+            m['new_price'] = o.price
+            g.warned.pop('mig_new', None)
+            log.info(f"{log_pfx()} MIGRATE open {m['new']} {m['side']} {m['total']}@{o.price:.1f}")
     if m['old_price'] is None:
         o = order(m['old'], -m['total'], side=m['side'])
         if o is None or o.filled < m['total']:
@@ -505,9 +552,25 @@ def retry_migration(ctx):
             return
         m['old_price'] = o.price
         g.warned.pop('mig_old', None)
-        pnl = sum([(o.price - leg['entry_price']) * leg['lots'] * g.params['multiplier']
-                   * side_to_dir(m['side']) for leg in g.legs])
+        pnl = 0.0
+        for leg in g.legs:
+            pnl += realize_leg_pnl(leg, o.price)
         log.info(f"{log_pfx()} MIGRATE close {m['old']} {m['side']} {m['total']}@{o.price:.1f} pnl={pnl:.0f}")
+    if m['new_price'] is None:   # 先平旧模式：旧腿已平、保证金释放，再开新腿
+        price = get_current_data()[m['new']].last_price
+        lots = fit_lots_to_margin(m['total'], price, p['multiplier'], p['margin_rate'],
+                                  ctx.subportfolios[0].available_cash)
+        if lots < m['total']:
+            warn_once('mig_new_short', f"{log_pfx()} WARN migrate open margin insufficient {m['new']} "
+                                       f"lots={m['total']} afford={lots}（继续等待）")
+            return
+        o = order(m['new'], m['total'], side=m['side'])
+        if o is None or o.filled < m['total']:
+            warn_once('mig_new', f"{log_pfx()} WARN migrate open unfilled {m['new']} lots={m['total']}")
+            return
+        m['new_price'] = o.price
+        g.warned.pop('mig_new', None)
+        log.info(f"{log_pfx()} MIGRATE open {m['new']} {m['side']} {m['total']}@{o.price:.1f}")
     delta = m['new_price'] - m['old_price']
     d = bar_levels(ctx)
     n_val = d['n'] if d is not None else (g.legs[0]['n_at_entry'] if g.legs else 0.0)
@@ -518,6 +581,8 @@ def retry_migration(ctx):
         leg['n_at_entry'] = n_val
         leg['stop_line'] = m['new_price'] - direction * g.params['stop_dist_n'] * n_val
     g.stop_line = m['new_price'] - direction * g.params['stop_dist_n'] * n_val
+    g.entry_log.pop((m['old'], m['side']), None)
+    g.entry_log[(m['new'], m['side'])] = {'price': m['new_price'], 'n': n_val}
     g.current_contract = m['new']
     g.migrating = None
     log.info(f"{log_pfx()} MIGRATE done {m['old']}->{m['new']} delta={delta:.1f} stop={g.stop_line:.1f}")
@@ -543,6 +608,29 @@ def risk_and_signal_routine(ctx):
             open_unit(ctx, direction, lv['n'], 'entry_stall')
         elif lv is not None:
             turtle_minute_checks(ctx, bar, lv, nr_ev)
+        # 移仓期间旧腿仍持有：触止损/出场则中止移仓（取消未成交新腿，或直接平掉已开新腿）
+        if g.migrating is not None and g.migrating['old_price'] is None and g.legs \
+                and bar is not None and lv is not None:
+            side = g.legs[0]['side']
+            direction = side_to_dir(side)
+            stop_hit = g.stop_line is not None and (
+                bar['low'] <= g.stop_line if direction == 1 else bar['high'] >= g.stop_line)
+            exit_line = lv['exit_long'] if direction == 1 else lv['exit_short']
+            exit_hit = bar['low'] <= exit_line if direction == 1 else bar['high'] >= exit_line
+            if stop_hit or exit_hit:
+                reason = 'stop' if stop_hit else 'exit_breakout'
+                m = g.migrating
+                if m['new_price'] is None:
+                    for o in get_open_orders().values():
+                        if o.security == m['new']:
+                            cancel_order(o)
+                else:
+                    o2 = order(m['new'], -m['total'], side=side)
+                    if o2 is None or o2.filled < m['total']:
+                        warn_once('mig_abort_new', f"{log_pfx()} WARN migrate abort close new unfilled {m['new']}")
+                g.migrating = None
+                log.info(f"{log_pfx()} MIGRATE_ABORT {reason} side={side} 移仓中触止损/出场，中止移仓并平仓")
+                close_all(ctx, reason)
         retry_migration(ctx)
         if ctx.current_dt.strftime('%H:%M') != p['signal_time']:
             return
@@ -582,6 +670,9 @@ def initialize(ctx):
         g.current_contract = None
         g.legs = []
         g.stop_line = None
+        g.close_pnl_acc = 0.0
+        g.close_retry = None
+        g.entry_log = {}
         g.lv = None
         g.lv_key = None
         g.stall_days = None

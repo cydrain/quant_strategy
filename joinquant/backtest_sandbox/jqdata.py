@@ -417,6 +417,11 @@ def get_open_orders(security=None):
     return {}
 
 
+def cancel_order(order):
+    """沙盒为即时全额成交，无挂单可撤；策略移仓中止路径需要此符号"""
+    log.warn(f"cancel_order called in sandbox (no-op): {getattr(order, 'security', order)}")
+
+
 def order(security, amount, side='long'):
     """市价单：即时成交（买入=bar收盘价；卖出=bar收盘价−tick）"""
     return _account.order(security, amount, side)
