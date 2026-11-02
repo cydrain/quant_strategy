@@ -50,6 +50,7 @@ PARAMS = {
     'add_step_n': 0.5,            # 顺向每 N×该值 加 1 unit
     'stop_dist_n': 2.0,           # 初始/加仓后止损距离（N 倍数）
     's1_skip': 1,                 # 系统1 跳过规则开关（默认开启；上次突破盈利则跳过一次同类突破，等新极值再入场）
+    's1_scope': 'breakout',       # skip 参与范围：'breakout'=仅 20 日突破武装与消费（默认，2026-11-02 起）/'breakout_nr'=突破与 NR 各自独立/'current'=任意盈利入场都武装突破+NR（旧行为）；STALL 任何 scope 都不参与
     'signal_time': '14:45',       # 14:45 做主力切换检查与 LEVELS 日志（交易本身全天分钟级）
     'night_start': '21:00',       # 夜盘任务注册起始时刻（空串 = 无夜盘品种）
     'night_end': '23:00',         # 夜盘任务注册结束时刻
@@ -296,6 +297,7 @@ def open_unit(ctx, direction, n_val, reason):
     if not g.legs:
         g.close_pnl_acc = 0.0      # 新仓开始，清空上一笔的累计盈亏
         g.close_retry = None
+        g.trade_reason = reason    # 本笔交易的入场类型（首仓决定；加仓不改变）
     g.legs.append({'contract': c, 'side': side, 'lots': lots, 'entry_price': o.price,
                    'n_at_entry': n_val, 'stop_line': stop_line})
     g.stop_line = stop_line
@@ -339,15 +341,27 @@ def close_all(ctx, reason):
         g.close_retry = None
         g.entry_log.pop((pos_contract, pos_side), None)
         total_pnl = g.close_pnl_acc
+        scope = g.params.get('s1_scope', 'current')
+        reason_in = g.trade_reason
         if g.params['s1_skip'] and total_pnl > 0:
-            # 系统1：突破与 NR 各跳过一次，不判方向；STALL 不参与
-            g.skip_next_breakout = True
-            g.skip_level = None
-            g.skip_side = None
-            g.nr_skip_next = True
-            log.info(f"{log_pfx()} S1_SKIP_ARM side={pos_side} (下一次突破/NR 跳过，不分方向)")
+            armed = []
+            if scope == 'current' or (scope in ('breakout', 'breakout_nr') and reason_in == 'entry'):
+                g.skip_next_breakout = True
+                g.skip_level = None
+                g.skip_side = None
+                armed.append('breakout')
+            if scope == 'current' or (scope == 'breakout_nr' and reason_in == 'entry_nr'):
+                g.nr_skip_next = True
+                armed.append('nr')
+            if armed:
+                log.info(f"{log_pfx()} S1_SKIP_ARM side={pos_side} reason={reason_in} scope={scope} "
+                         f"armed={'+'.join(armed)} (下一次同类入场跳过，不分方向)")
+            else:
+                log.info(f"{log_pfx()} S1_SKIP_NOARM side={pos_side} reason={reason_in} scope={scope} "
+                         f"（该入场类型不产生 skip）")
         log.info(f"{log_pfx()} ✅ 清仓完成，当前空仓 trade_pnl={total_pnl:.0f}")
         g.close_pnl_acc = 0.0
+        g.trade_reason = None
     else:
         g.close_retry = reason
 
@@ -371,6 +385,7 @@ def check_state_consistency(ctx):
     log.warn(f"{log_pfx()} STATE_MISMATCH tracked={tracked} actual={actual} -> rebuild from actual")
     g.legs = []
     g.close_pnl_acc = 0.0      # 重建后原入场价/已平盈亏不可知，累计盈亏清零
+    g.trade_reason = None      # 入场类型同样不可知
     for (c, side), amt in actual.items():
         rec = g.entry_log.get((c, side))
         d = bar_levels(ctx)
@@ -434,7 +449,7 @@ def turtle_minute_checks(ctx, bar, lv, nr_ev):
     allow_short = p['fixed_dir'] in (0, -1)
     if nr_ev is not None and not g.nr_fired:
         if allow_long and bar['high'] >= nr_ev['high']:
-            if g.nr_skip_next:
+            if g.nr_skip_next and p['s1_scope'] in ('current', 'breakout_nr'):
                 g.nr_skip_next = False
                 g.nr_fired = True
                 log.info(f"{log_pfx()} NR_SKIP long level={nr_ev['high']:.1f} (系统1：上次交易盈利)")
@@ -444,7 +459,7 @@ def turtle_minute_checks(ctx, bar, lv, nr_ev):
                 log.info(f"{log_pfx()} NR_BREAK long level={nr_ev['high']:.1f}")
             return
         if allow_short and bar['low'] <= nr_ev['low']:
-            if g.nr_skip_next:
+            if g.nr_skip_next and p['s1_scope'] in ('current', 'breakout_nr'):
                 g.nr_skip_next = False
                 g.nr_fired = True
                 log.info(f"{log_pfx()} NR_SKIP short level={nr_ev['low']:.1f} (系统1：上次交易盈利)")
@@ -682,6 +697,7 @@ def initialize(ctx):
         g.nr_key = None
         g.nr_fired = False
         g.nr_skip_next = False
+        g.trade_reason = None
         g.last_signal_date = None
         g.skip_next_breakout = False
         g.skip_level = None
