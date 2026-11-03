@@ -18,9 +18,10 @@
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
 #   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
 #   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
-#   - 系统1 跳过规则: 上次交易若盈利，突破与 NR 各跳过一次（不判方向；STALL 不参与）
-#     ——20 日突破记录被跳过价位并等通道刷新出新极值；NR 突破作废当前事件、等新 NR 事件再入场
-#     （s1_skip 开关，默认开启）
+#   - 系统1 跳过规则: 上次同类入场若盈利，则该类型跳过一次（不判方向；STALL 任何 scope 都不参与）
+#     ——参与范围由 s1_scope 决定：'breakout'（默认）仅突破盈利武装与消费；'breakout_nr' 突破与 NR
+#     各自独立；'current' 任意盈利入场都武装突破+NR。20 日突破记录被跳过价位并等通道刷新出新极值；
+#     NR 突破作废当前事件、等新 NR 事件再入场（s1_skip 开关，默认开启）
 #   - fixed_dir: 1=只做多 / -1=只做空 / 0=经典双向（跟随突破方向）
 #   工程: 主力移仓（开新腿前保证金预检、不足回退先平旧；移仓中触止损/出场中止移仓并平仓）/
 #         夜盘分钟检查 / 停板等待（未平完的平仓每 bar 重试直至清仓）沿用既有框架
@@ -116,6 +117,7 @@ def fit_lots_to_cap(ctx, lots, price):
     margin_per_lot = price * p['multiplier'] * p['margin_rate']
     if margin_per_lot <= 0:
         return lots
+    # 已有持仓按当前价计保证金（price 即当前价，与平台逐日盯市口径一致）
     used = sum(l['lots'] for l in g.legs) * margin_per_lot
     room = ctx.portfolio.total_value * p['margin_cap_pct'] - used
     return min(lots, int(room / margin_per_lot))
@@ -146,9 +148,11 @@ def current_minute_bar(ctx, contract):
 
 
 def load_bars(ctx, contract):
-    """指标周期 bar 序列（前若干根已完成 bar；盘中周期由分钟数据聚合，不含未完成 bar）"""
+    """指标周期 bar 序列（前若干根已完成 bar；不含未完成 bar）。
+    由 bar_levels 每根新 bar 拉取一次并缓存到 g.hist_cache，stall_state 复用同一份"""
     p = g.params
-    need = max(60, p['n_period'] * 3, p['entry_n'], p['exit_n'], p['nr_n'] + 1)
+    need = max(60, p['n_period'] * 3, p['entry_n'], p['exit_n'], p['nr_n'] + 1,
+               p['stall_period'] * 2 + 5)
     hist = attribute_history(contract, need + 1, p['bar_freq'], ['high', 'low', 'close'])
     if hist is None or len(hist) == 0:
         return None
@@ -160,10 +164,12 @@ def bar_levels(ctx):
     p = g.params
     hist = load_bars(ctx, g.current_contract)
     if hist is None or len(hist) == 0:
+        g.hist_cache = None      # 防止 stall_state 复用到旧合约/旧 bar 数据
         return None
     key = (p['bar_freq'], g.current_contract, hist.index[-1])
     if getattr(g, 'lv_key', None) == key and g.lv is not None:
         return g.lv
+    g.hist_cache = hist          # 供 stall_state 复用（同一根 bar 内不再重复拉取）
     highs = list(hist['high'].values)
     lows = list(hist['low'].values)
     closes = list(hist['close'].values)
@@ -172,9 +178,9 @@ def bar_levels(ctx):
         return None
     win = p['nr_n']
     is_nr = False
-    if win > 0 and len(highs) >= win:
+    if win >= 2 and len(highs) >= win:
         ranges = [highs[i] - lows[i] for i in range(len(highs) - win, len(highs))]
-        is_nr = ranges[-1] <= min(ranges)
+        is_nr = ranges[-1] <= min(ranges)          # 最新 bar 为窗口内最窄（并列算）
     lv = {'n': n_val,
           'entry_long': max(highs[-p['entry_n']:]), 'entry_short': min(lows[-p['entry_n']:]),
           'exit_long': min(lows[-p['exit_n']:]), 'exit_short': max(highs[-p['exit_n']:]),
@@ -188,21 +194,23 @@ def bar_levels(ctx):
 
 def stall_state(ctx):
     """最新完成 bar 距最近一次"创新低/创新高"事件的 bar 数（事件 := 极值刷新此前 stall_period 根 bar 极值）。
-    窗口内未见事件返回 None；结果按新 bar 缓存"""
+    窗口内未见事件返回 None；结果按新 bar 缓存。数据复用 bar_levels 已拉取的 g.hist_cache
+    （routine 中 bar_levels 先于本函数执行）"""
     p = g.params
     if p['stall_period'] <= 0:
         return None
     n = p['stall_period']
-    hist = attribute_history(g.current_contract, n * 2 + 5, p['bar_freq'], ['high', 'low'])
+    hist = getattr(g, 'hist_cache', None)
     if hist is None or len(hist) == 0:
+        return None
+    hist = hist.tail(n * 2 + 5)
+    if len(hist) < n + 2:
         return None
     key = (p['bar_freq'], g.current_contract, hist.index[-1])
     if getattr(g, 'stall_key', None) == key and g.stall_days is not None:
         return g.stall_days
     g.stall_key = key
     g.stall_days = None
-    if len(hist) < n + 2:
-        return None
     lows = list(hist['low'].values)
     highs = list(hist['high'].values)
     last = len(lows) - 1
@@ -233,6 +241,8 @@ def stall_edge(ctx):
     if g.stall_key == g.stall_seen_key:
         return None
     g.stall_seen_key = g.stall_key
+    if p['fixed_dir'] == 0 and st['long'] == p['stall_period'] and st['short'] == p['stall_period']:
+        return None          # 双向同时达成且无方向偏好：放弃本次，避免固定偏向多头
     if p['fixed_dir'] in (0, 1) and st['long'] == p['stall_period']:
         return 'long'
     if p['fixed_dir'] in (0, -1) and st['short'] == p['stall_period']:
@@ -290,18 +300,29 @@ def open_unit(ctx, direction, n_val, reason):
     o = order(c, lots, side=side)
     if o is None or o.filled < lots:
         if o is not None and o.filled > 0:
-            g.entry_log[(c, side)] = {'price': o.price, 'n': n_val}   # 部分成交也记录，供状态重建恢复
+            rec = {'price': o.price, 'n': n_val}   # 部分成交也记录，供状态重建恢复
+            if not g.legs:
+                rec['reason'] = reason
+            g.entry_log[(c, side)] = rec
         warn_once('open_' + c, f"{log_pfx()} ❌ WARN open unfilled (limit board?) {c} lots={lots}")
         return False
     stop_line = o.price - direction * p['stop_dist_n'] * n_val
-    if not g.legs:
+    first_leg = not g.legs
+    if first_leg:
         g.close_pnl_acc = 0.0      # 新仓开始，清空上一笔的累计盈亏
         g.close_retry = None
         g.trade_reason = reason    # 本笔交易的入场类型（首仓决定；加仓不改变）
     g.legs.append({'contract': c, 'side': side, 'lots': lots, 'entry_price': o.price,
                    'n_at_entry': n_val, 'stop_line': stop_line})
     g.stop_line = stop_line
-    g.entry_log[(c, side)] = {'price': o.price, 'n': n_val}
+    rec = {'price': o.price, 'n': n_val}
+    if first_leg:
+        rec['reason'] = reason                        # 首仓记录入场类型，供重建恢复 S1 判断
+    else:
+        prev_reason = g.entry_log.get((c, side), {}).get('reason')
+        if prev_reason:
+            rec['reason'] = prev_reason               # 加仓保留首仓入场类型
+    g.entry_log[(c, side)] = rec
     log.info(f"{log_pfx()} ✅{trade_mark(side, reason)} {reason.upper()} {side} {c} {lots}@{o.price:.1f} "
              f"N={n_val:.1f} stop={stop_line:.1f} units={len(g.legs)} equity={ctx.portfolio.total_value:.0f}")
     g.warned.pop('open_' + c, None)
@@ -384,8 +405,11 @@ def check_state_consistency(ctx):
         return
     log.warn(f"{log_pfx()} STATE_MISMATCH tracked={tracked} actual={actual} -> rebuild from actual")
     g.legs = []
-    g.close_pnl_acc = 0.0      # 重建后原入场价/已平盈亏不可知，累计盈亏清零
-    g.trade_reason = None      # 入场类型同样不可知
+    g.close_pnl_acc = 0.0      # 重建后已实现盈亏不可知，累计盈亏清零
+    g.trade_reason = None      # 优先从 entry_log 恢复（见下）；无记录则保持不可知
+    if not actual:
+        g.stop_line = None
+        g.close_retry = None
     for (c, side), amt in actual.items():
         rec = g.entry_log.get((c, side))
         d = bar_levels(ctx)
@@ -401,7 +425,12 @@ def check_state_consistency(ctx):
         g.legs.append({'contract': c, 'side': side, 'lots': amt, 'entry_price': price,
                        'n_at_entry': n_val, 'stop_line': stop_line})
         g.stop_line = stop_line
-        g.entry_log[(c, side)] = {'price': price, 'n': n_val}
+        new_rec = {'price': price, 'n': n_val}
+        if rec is not None and rec.get('reason') is not None:
+            new_rec['reason'] = rec['reason']        # 入场类型随记录传播
+            if g.trade_reason is None:
+                g.trade_reason = rec['reason']       # 首条有效记录恢复本笔入场类型
+        g.entry_log[(c, side)] = new_rec
 
 # ==================== 分钟检查（止损/出场/加仓/入场） ====================
 
@@ -597,7 +626,10 @@ def retry_migration(ctx):
         leg['stop_line'] = m['new_price'] - direction * g.params['stop_dist_n'] * n_val
     g.stop_line = m['new_price'] - direction * g.params['stop_dist_n'] * n_val
     g.entry_log.pop((m['old'], m['side']), None)
-    g.entry_log[(m['new'], m['side'])] = {'price': m['new_price'], 'n': n_val}
+    rec = {'price': m['new_price'], 'n': n_val}
+    if g.trade_reason:
+        rec['reason'] = g.trade_reason      # 移仓续持同一笔交易，保留入场类型供重建恢复
+    g.entry_log[(m['new'], m['side'])] = rec
     g.current_contract = m['new']
     g.migrating = None
     log.info(f"{log_pfx()} MIGRATE done {m['old']}->{m['new']} delta={delta:.1f} stop={g.stop_line:.1f}")
@@ -690,6 +722,7 @@ def initialize(ctx):
         g.entry_log = {}
         g.lv = None
         g.lv_key = None
+        g.hist_cache = None
         g.stall_days = None
         g.stall_key = None
         g.stall_seen_key = None
