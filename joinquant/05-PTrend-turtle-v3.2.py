@@ -648,8 +648,9 @@ def risk_and_signal_routine(ctx):
         lv = bar_levels(ctx)
         bar = current_minute_bar(ctx, g.current_contract)
         nr_ev = nr_event(ctx, lv)
-        stall_side = stall_edge(ctx)
-        if stall_side is not None and not g.legs and bar is not None and lv is not None:
+        # 无分钟 bar 的分钟（21:00 开盘首分钟）不消费边沿，留到下一根真实 bar 触发
+        stall_side = stall_edge(ctx) if bar is not None else None
+        if stall_side is not None and not g.legs and lv is not None:
             direction = 1 if stall_side == 'long' else -1
             log.info(f"{log_pfx()} STALL_FIRE {stall_side}：连续{p['stall_period']}日极值停滞，入场")
             open_unit(ctx, direction, lv['n'], 'entry_stall')
