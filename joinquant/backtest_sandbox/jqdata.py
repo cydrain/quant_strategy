@@ -10,6 +10,7 @@
     手续费 = 成交额 × 费率；保证金 = 最新价 × 手数 × 乘数 × 保证金率；可用资金 = 权益 − 保证金占用
 - 只提供 04 策略用到的 API 子集；未知 API 直接 AttributeError，暴露缺口而非静默容错。
 """
+import bisect
 import datetime as dt
 import glob
 import os
@@ -117,12 +118,23 @@ class _DataStore:
         sub = df[df.index <= pd.Timestamp(t)]
         return float(sub['close'].iloc[-1]) if len(sub) else None
 
+    def _trading_day(self, t):
+        """t 所属交易日：夜盘（21:00 起）属于下一交易日，日盘属于当日"""
+        t = pd.Timestamp(t)
+        if t.hour >= 18:
+            i = bisect.bisect_right(self.trade_days, t.date())
+            if i < len(self.trade_days):
+                return self.trade_days[i]
+            return t.date() + dt.timedelta(days=1)
+        return t.date()
+
     def daily_hist(self, sec, t, count):
         df = self.daily.get(self.base(sec))
         if df is None:
             return pd.DataFrame()
-        # 排除"当日"：日线索引为 00:00，须按日期比较（时间戳比较会把当天也算进来）
-        return df[df.index.date < t.date()].tail(count)
+        # 排除当前交易日正在形成的日线（日线索引=交易日）：
+        # 夜盘属于下一交易日，当日 15:00 已完成的日线可见；不能按日历日排除
+        return df[df.index.date < self._trading_day(t)].tail(count)
 
     # 会话区间（分钟标签 = bar 结束分钟：09:01..11:30 / 13:31..15:00 / 21:01..23:00）
     _SESSIONS = ((9 * 60, 11 * 60 + 30), (13 * 60 + 30, 15 * 60), (21 * 60, 23 * 60))
