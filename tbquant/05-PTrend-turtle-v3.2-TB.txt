@@ -655,11 +655,21 @@ Defs
     // 开仓手数计算：三段连续削峰（风险定量 → 资金 → 占用上限），逐段只能更小。
     // 风险基数 = Min(InitCapital, 当前权益)；② 用实际可用资金。
     // 唯一调用点 DoOpenUnitCore（传当前价 Close()）；price 仅用于估算每手保证金。
+    // 模拟/实盘：权益是真实资金，而 price/NVal 是主连复权口径 → 按 Rollover 折回真实口径
+    // （真实价=图价/r、真实N=N/r），否则风险手数偏小 r 倍、保证金占用被高估 r 倍；
+    // 回测成交/权益/指标同为图口径，r=1 保持原行为。
     Integer CalcLots(Numeric price) {
         Numeric eq = RiskCapital();
+        Numeric roll = 1;
+        If (IsLiveTrade()) {
+            Numeric rr = Rollover();
+            If (NumValid(rr) And rr > 0) {
+                roll = rr;
+            }
+        }
         // ① 经典海龟 unit：1N 波动 ≈ 风险资金 × UnitRisk（1%），向下取整、最低 1 手
-        Integer lots = Max(1, IntPart(eq * UnitRisk / (NVal * MultiplierP)));
-        Numeric marginPerLot = price * MultiplierP * MarginRateP;   // 每手保证金
+        Integer lots = Max(1, IntPart(eq * UnitRisk * roll / (NVal * MultiplierP)));
+        Numeric marginPerLot = price * MultiplierP * MarginRateP / roll;   // 每手保证金（真实价口径）
         If (marginPerLot > 0) {   // ≤0 时跳过②③（防除零；聚宽同款守卫）
             // ② 物理约束：可用资金 ÷ 每手保证金（聚宽 fit_lots_to_margin）
             lots = Min(lots, IntPart(CurAvailable() / marginPerLot));
