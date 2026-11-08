@@ -1,6 +1,6 @@
 # 05-PTrend-turtle-v3.1 TBQuant 公式版 使用说明
 
-> 适用文件：`tbquant/05-PTrend-turtle-v3.1-TB.txt`（公式名 PTrendTurtle_v31，TBQuant 2.x；原 v4.0-TB，2026-10 更名）
+> 适用文件：`tbquant/05-PTrend-turtle-v3.1-TB.txt`（公式名 PTrendTurtle_v31，TBQuant 2.x）
 > 移植基准：`joinquant/05-PTrend-turtle-v3.1.py`（聚宽 · 棕榈油 P 海龟策略）
 > 前版对照：`tbquant/05-PTrend-turtle-v3.0-TB.txt`（单图层 · 1 分钟自聚合日线环）
 >

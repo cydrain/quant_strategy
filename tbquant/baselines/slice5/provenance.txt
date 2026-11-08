@@ -1,4 +1,4 @@
-切片5 回归基准 — 05-PTrend 海龟 v4.0 TBQuant（caiyd_check_n_invalid 分支）
+切片5 回归基准 — 05-PTrend 海龟 v3.1 TBQuant
 
 来源：tbquant/logs/my_PTrendTurtle_v4_日志_20261006.tbf
       （2026-10-06 18:29 运行；导出为 logs/tmp_v4_s5new.txt，raw_export.txt 为其快照）

@@ -2134,11 +2134,20 @@ Events
                 If (GetArraySize(PendingIds) > 0) {
                     pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr();
                 }
-                // 账户真值（模拟/实盘）：每天一行，供事后核对台账 vs 账户
+                // 合约标签：前缀=指标来源 data1（无 data1 时退回 data0）
+                String symseg = Symbol;
+                If (DataCount() >= 2) {
+                    symseg = D1Sym();
+                }
+                // 账户真值（模拟/实盘）：每天一行，供事后核对台账 vs 账户；
+                // 落地合约与 data1 不同（连续图→真实主力）时附 acctSym，避免把连续合约当成可交易合约
                 String acctseg = "";
                 If (IsLiveTrade()) {
                     RefreshAccountPosition();
-                    acctseg = " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
+                    If (AcctSym <> "" And AcctSym <> symseg) {
+                        acctseg = acctseg + " acctSym=" + AcctSym;
+                    }
+                    acctseg = acctseg + " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
                         + " acctS=" + Text(IntPart(AcctShort))
                         + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
                         + " acctOk=" + IIFString(AcctPosOk, "True", "False");
@@ -2149,7 +2158,7 @@ Events
                     nrseg = " NRH=" + Text(NrHighLv, 1) + " NRL=" + Text(NrLowLv, 1)
                         + " nrF=" + IIFString(NrFired, "True", "False");
                 }
-                WLog("DAILY " + MainSymbol()
+                WLog("DAILY " + symseg
                     + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
                     + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
                     + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)

@@ -514,7 +514,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | `ROLLOVER_SYNC` | 换月后延后 2 根新 bar，按账户真值重建台账 |
 | `STATE_REBUILD` | 台账重建：回测=`contracts` 平台口径；模拟/实盘=`src=acct`（重启/不一致/部分成交/换月；对锁会记 ERROR 并停交易） |
 | `LEDGER_CLEAN` | 空仓残留台账清理 |
-| `DAILY` | 每日 14:45 快照（N/EL/XL/ES/XS/units/stop/equity/d1；有挂单时附 pend/ids；模拟/实盘附 `pdir/acctL/acctS/acctAvgL/acctAvgS/acctOk`；当日有 NR 事件时附 `NRH/NRL/nrF`） |
+| `DAILY` | 每日 14:45 快照；前缀=指标来源 data1 合约（无 data1 时退回 data0）。字段：N/EL/XL/ES/XS/units/stop/equity/d1；有挂单时附 pend/ids；模拟/实盘附 `acctSym`（落地合约≠data1 时）、`pdir/acctL/acctS/acctAvgL/acctAvgS/acctOk`；当日有 NR 事件时附 `NRH/NRL/nrF` |
 | `ORDER` / `FILL` | OnOrder/OnFill 回报；`FILL` 含 `id`/`fillId`/`fillVol`（模拟/实盘；回测不触发） |
 | `ORDER_CH` | OnInit：本次运行的下单通道（模拟/实盘=`A_*` 账户接口；回测=图表信号） |
 | `ORDER_SEND` | 委托已发出（模拟/实盘 `via=acct`：`reason/sym/dir/close/lots/pxReal/pxChart/rollover/ids/ok`；回测无此行） |
@@ -681,6 +681,11 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
   复权图价 11426.5 / 真实价 9308（r=1.2276）时，手数被 10% 保证金上限压到 7 手，真实口径应为
   9 手；实际保证金占用约 7.4% 而非设计的 10%。`Rollover()` 无效/≤0 时回退 r=1。
   **改后尚未在 TB 编译**，需在模拟盘核对 `lots` 变化（7→9@1M 风险资金、p≈8850）及真实委托价不变。
+- 2026-11-08 DAILY 合约标签修正：前缀由 `MainSymbol()`（平台当前主力）改为 data1 合约（指标来源）；
+  切片回测不再显示无关的 p2701；模拟/实盘落地合约与 data1 不同（连续图→真实主力）时附
+  `acctSym=`（取 `RefreshAccountPosition` 的落地合约）。无 data1 时退回 data0，避免非法访问 Data1。
+  **仅日志文本变更，改后尚未在 TB 编译**；v3.2 回归基准需在编译后重新落。现有 `baselines/slice4-6`
+  采集于 2026-10-06（对应已废弃的 v3.1，无 STALL/NR），不适用于 v3.2-TB，DAILY 行也不再逐字匹配。
 - 事件链探针（RateCheckProbe，2026-10-19，TB 期货模拟 p2701，1 手开平）：
   OnOrder 回调 1→2→5，OnFill 的 side/combOffset/volume/price/fillPrice 有效；
   MarketPosition 下单即翻转、账户持仓成交后更新。结论仅限模拟盘，实盘柜台未验证。
@@ -705,4 +710,4 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 
 ---
 
-*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1 · 2026-11-01 同步 NR6 收缩并行入场 + S1Skip 默认 1 · 2026-11-04 同步 S1Scope/TradeReason + STALL tie + NrN>=2 + NR 重试 · 2026-11-05 模拟/实盘手数复权口径修正，待 TB 编译/回测）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
+*版本：v3.2-TB（2026-10-17 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1 · 2026-11-01 同步 NR6 收缩并行入场 + S1Skip 默认 1 · 2026-11-04 同步 S1Scope/TradeReason + STALL tie + NrN>=2 + NR 重试 · 2026-11-05 模拟/实盘手数复权口径修正，待 TB 编译/回测 · 2026-11-08 DAILY 合约标签修正，待 TB 编译）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
