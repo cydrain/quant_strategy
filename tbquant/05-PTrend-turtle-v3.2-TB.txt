@@ -1,78 +1,40 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2（TBQuant · 双图层 + STALL 极值停滞 / NR 收缩并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
-// 移植: joinquant/05-PTrend-turtle-v3.2.py（聚宽 · 棕榈油 P STALL + NR 版）/ tbquant/05-PTrend-turtle-v3.1-TB.txt
+// 移植: joinquant/05-PTrend-turtle-v3.2.py
 //------------------------------------------------------------------------
-// v3.2 = v3.1 海龟逻辑（N/四通道/手数/unit/止损/加仓/出场/台账自愈/移仓）原样 + STALL 与 NR 收缩并行入场。
-// 指标与 STALL/NR 口径 = data1 图层周期（默认日线；30m 等日内周期为实验口径，收完即推进，
-// 且 Data1[0]/[1] 盘中对齐未复验、与聚宽不可比）。窗口头恒为最新一根已完成 data1 K线，
-// 每根新 bar 在 OnBarOpen 刷新一次（实盘形成中 bar 的逐 tick OnBar 不重算）；全局状态随 OnInit 复位。
+// 指标与 STALL/NR 口径 = data1 图层周期（默认日线；30m 等日内周期为实验口径，与聚宽不可比）。
+// 窗口头为最新一根已完成 data1 K线，OnBarOpen 每根新 bar 刷新一次；全局状态随 OnInit 复位。
 //
-// STALL 并行入场（StallPeriod>0 启用，0=关闭）:
-//   事件：某根 data1 bar 创此前 StallPeriod 根新低（多）/新高（空），严格不等；
-//   触发：data1 推进后的首根 1m 上，最新完成 bar 距最近事件恰 StallPeriod 根 → 市价开 1 unit
-//   （空仓且 FixedDir 允许；与突破并行、先达成先入场；FixedDir=0 且多空同达成 → 放弃本次）；
-//   边沿每根 data1 bar 只评判一次，首次仅建基线；持仓/挂单/预热期达成 = 错过不补。
-//   与聚宽一致（2026-11-04 起）：聚宽夜盘 21:00 可见刚完成日线，STALL 边沿延后到首根真实 1m（21:01）；
-//   TB 在 data1 推进后的首根 1m 触发（1d 通常夜盘 21:01）。回测均按该 1m 收盘价成交。
-//   窗口上限 2*StallPeriod+5 ≤ WinSize()（默认 61 → 最大 28），超限 OnInit 停用 STALL 并记 ERROR。
+// STALL（StallPeriod>0）：data1 创此前 StallPeriod 根新低/新高后，最新完成 bar 距该事件
+//   恰 StallPeriod 根 → 下一根 1m 市价开 1 unit。空仓才触发；FixedDir=0 多空同达成则放弃；
+//   每根 data1 bar 只评判一次，持仓/挂单/预热期达成 = 错过不补。
+//   触发时点与聚宽一致：data1 推进后的首根 1m（日线通常夜盘 21:01）。
+// NR（NrN>=2，默认 6）：最新完成 bar 为近 NrN 根振幅最小者 → 下一根 data1 bar 内 1m
+//   触及该 bar 高/低点入场。优先级 STALL > NR > EntryN 突破；每事件仅一次，
+//   开仓失败下一分钟重试；事件在下一根 data1 bar 内有效（1d 从夜盘 21:01 起）。
+// 系统1 跳过（S1Skip>0）：S1Scope='breakout'（默认）仅 20 日突破首仓盈利武装并消费；
+//   'breakout_nr' 突破/NR 各自独立；'current' 任意盈利首仓都武装突破+NR。STALL 不参与。
 //
-// NR 收缩并行入场（NrN>=2 启用，0/1=关闭；默认 6）:
-//   事件：最新完成 data1 bar 的振幅（High-Low）为近 NrN 根最小（并列算）→ 触发沿 = 该 bar 高/低点；
-//   触发：下一根 data1 bar 期间，1m 价格触及触发沿 → 市价开 1 unit（空仓且 FixedDir 允许）；
-//   优先级：STALL 边沿 > NR > EntryN 突破；每事件至多入场一次（手数不足/拒单下一分钟重试，同聚宽）；
-//         持仓/预热期达成 = 错过不补，挂单期间不动作。
-//   NrN 须 ≤ WinSize()，超限 OnInit 停用并记 ERROR。
-//   与聚宽一致（2026-11-04 起）：NR 事件在 data1 推进后的下一根 data1 bar 内有效（1d 从夜盘 21:01 起），
-//   两平台均从 21:01 首根 1m 开始可触发。
+// 挂载（两图层缺一不可；K线收盘模型）：
+//   data0=1分钟（信号/执行）；data1=同合约日线（只读指标源）。
+//   MapToMain=True：主连图（后复权/映射真实价/自动换仓/委托映射主力）；
+//   单合约切片回测必须改 False。模拟/实盘要求 data0=data1=MainContSymbol 且 MapToMain=True。
+//   模拟/实盘挂单未完成时禁发新单；非实时 bar（历史回放）不下单；图表自动交易模式一律不发单。
+//   模拟/实盘下单走 A_* 账户接口（落地合约+真实价）；回测走 Buy/SellShort/Sell/BuyToCover。
 //
-// 系统1 跳过（S1Skip>0；武装后不分方向；STALL 入场自身从不消费 skip）:
-//   参与范围 S1Scope：'breakout'（默认）=仅 20 日突破首仓盈利武装并消费；'breakout_nr'=突破与 NR
-//   各自独立；'current'=任意盈利首仓都武装突破+NR（旧行为，含 STALL 盈利平仓）。突破：记录被跳过
-//   价位，等通道刷新出新极值再恢复；NR：作废当前事件，等下一 NR 事件。
+// 读法红线（改代码勿破）：
+//   1) N=Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点；通道=Data1[1..EntryN/ExitN]。
+//   2) 信号/风控只读 Data1[1] 及更早；Data1[0] 是禁区（回测=look-ahead，仅 DEBUG d0diag 例外）。
+//   3) 禁 GetBar；Data1[1] 恒为最新完成K。
+//   4) 信号体只放 Range[0:0]，Range[0:1] 会每图层各跑一遍。
+//   5) Data1 仅出现在「数据源约定」访问器段。
 //
-// 挂载（两图层缺一不可；运行模式「K线收盘模型」）:
-//   data0 = 1 分钟：全部信号/风控/下单；data1 = 同合约日线：纯只读指标源。
-//   追加：策略单元右键数据源 → 周期 1d → 追加；两图层都「同步为主商品数据范围」。
-//   MapToMain=True（默认，模拟/实盘安全口径）：主连图，后复权/映射真实价/自动换仓/委托映射主力；
-//   单合约切片回测必须改 False（不复权、不映射，否则委托映射到当前主力）。
-//   模拟/实盘校验：data0=data1=MainContSymbol（默认 p9888.DCE，区分大小写与后缀）且 MapToMain=True，
-//   否则禁开新仓；OnInit 时 data1 未就绪 → 首个齐备 bar 复核一次（MAPPING_RECHECK）。回测不校验合约。
-//   挂单门禁（模拟/实盘）：OnOrder 维护未完成委托集合（Declare/Declared/FillPart/Canceling），
-//   非空时拒发任何新委托（开/平/加/损；STALL 边沿遇挂单则放弃本次边沿，NR 挂单期间暂不动作）；只拦不撤；回测门禁不生效。
-//   回调实证（2026-10-19 RateCheckProbe，TB 期货模拟 p2701）：OnOrder 稳定 1→2→5，
-//   OnFill 的 side/combOffset/volume/price/fillPrice 有效；fillId 为 String，orderId/fillVolume 待实测。
-//   实盘柜台是否回调仍未验证。
-//
-// 下单通道（2026-10-27）：模拟/实盘一律走账户接口 A_Buy/A_SellShort/A_Sell/A_BuyToCover——
-//   显式落地合约（GetLayerOrderMapSymbols 首个，缺省 MainSymbol）与真实价（图价 ÷ Rollover()，
-//   按 RealTickSize 取整到可成交方向：买向上、卖向下）。账户委托不参与平台 bar 信号统计 → 不再
-//   "信号闪烁/成交回滚"；图表口径空仓时也能平掉映射仓。回测/图表回测仍用
-//   Buy/SellShort/Sell/BuyToCover（历史回测口径不变）。
-//   持仓真值：实时（QuoteStatus=RealTime）每根新 bar 用 4 参 A_GetPosition(落地合约) 对账；
-//   成交后跳 2 根、换月后跳 2 根新 bar 再对账（等柜台/换仓落地）；有未完成委托时不对账。
-//   账户有仓而台账为空/手数方向不符 → 自动接管重建（STATE_REBUILD src=acct），止损线按均价重推。
-//   发送前按账户持仓门禁：平仓手数收敛为实际同向持仓（无可平则跳过）；加仓须已有同向持仓；
-//   其余开仓须账户空仓；账户持仓不可读 → 禁开仓（平仓按台账兜底）。
-//   共用账户内其它策略/手工仓会被一并接管——本策略要求账户专用。
-//
-// 读法红线（MultiSrc 探针实测 43/43 锁定，改代码勿破）:
-//   1) N 窗口 = Data1[1..WinSize]，第 WinSize 根仅作前收盘锚点（TR 用 Close[idx+1]）；
-//      入场通道 = Data1.High/Low[1..EntryN]；出场通道 = Data1.High/Low[1..ExitN]。
-//   2) 信号/风控/下单只读 Data1[1] 及更早。Data1[0] 是禁区（回测=当天完整K=look-ahead，
-//      实盘=形成中逐 tick 变）；仅 DAILY 日志 DEBUG 级 d0diag（D1Close0Diag）例外，禁入判断。
-//   3) 禁 GetBar（回测返回全 0 Bar）；Data1[1] 恒为最新完成K（日线=昨日；30m=上一根）。
-//   4) 信号体只放 Range[0:0] 单块——Range[0:1] 会每图层各跑一遍（早期双图层事故即此，勿复现）。
-//   5) Data1 仅出现在 Defs「数据源约定」段访问器内，其余代码一律经访问器；层序变动只改该段一处。
-//
-// 预热与历史深度【切片5 事故点】：data1 在首个目标信号日前须已有 ≥61 根日线（WinSize=61，≈3 个月），
-//   短 1 根都不行——不足时窗口头部越界读数仍是"有效值"，守护不拦截 → N 静默偏高甚至假突破。
-//   修复：两图层数据范围同步提前到首个目标信号日前 ≥61 个交易日再跑。
-//   读取确为无效值/0 时守护才生效（ERROR、拒下单、每根新 bar 重试；日志按交易日节流）。
-//
+// 预热：首个目标信号日前 data1 须已有 >=61 根日线（WinSize=61，约 3 个月）；不足时
+//   窗口越界读数可能仍是有效值 → N 偏高/假突破。两图层数据范围要同步提前。
 //------------------------------------------------------------------------
 Params
     // ---- 策略参数（对应聚宽 PARAMS）----
@@ -82,33 +44,33 @@ Params
     Integer EntryN(20);           // 突破入场通道周期（系统1=20）
     Integer ExitN(10);            // 反向突破出场通道周期（系统1=10）
     Integer StallPeriod(10);      // 并行入场：连续 N 根 data1 极值停滞（未创新低/新高）→入场；0=关闭
-    Integer NrN(6);               // 并行入场：最近 NrN 根 data1 振幅最小者（NRn）的极值突破 → 入场；0=关闭（<2 亦停用）
+    Integer NrN(6);               // 并行入场：最近 NrN 根 data1 振幅最小者（NRn）的极值突破 → 入场；0/1=关闭
     Numeric UnitRisk(0.01);       // 1 unit 风险预算（占风险资金比例）
     Numeric MarginCapPct(0.10);   // 保证金占用上限（占风险资金比例，0=不限）
     Integer MaxUnits(4);          // 最大 unit 数（含首仓）
     Numeric AddStepN(0.5);        // 顺向每 N*该值 加 1 unit
     Numeric StopDistN(2.0);       // 止损距离（N 倍数）
-    Integer S1Skip(1);            // 系统1跳过规则：1=上次同类交易盈利则跳过一次同类突破（参与范围见 S1Scope）
-    String S1Scope("breakout");   // skip 参与范围：breakout=仅 20 日突破（默认）/breakout_nr=突破与 NR 各自独立/current=任意盈利入场都武装（旧行为，含 STALL）；STALL 入场自身不消费
-    Integer TradeStartDate(20200313); // 开始交易日期(yyyymmdd)；之前仅预热不交易
+    Integer S1Skip(1);            // 系统1跳过：上次同类交易盈利则跳过一次同类突破
+    String S1Scope("breakout");   // breakout=仅20日突破（默认）/breakout_nr=突破与NR独立/current=任意盈利入场武装
+    Integer TradeStartDate(20200101); // 开始交易日期(yyyymmdd)；之前仅预热不交易
     // ---- 账户/撮合参数 ----
     Numeric InitCapital(1000000); // 初始资金（回测）；模拟/实盘风险资金上限
     Numeric MultiplierP(10);      // 合约乘数（元/点/手，P=10）
     Numeric MarginRateP(0.12);    // 保证金率
     Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
-    Numeric SlipTicks(1);         // 回测撮合滑点（跳）；模拟/实盘实际滑点由盘口/柜台成交决定
-    Numeric RealTickSize(1);      // 落地真实合约最小变动价，按合约填：p=1（2026-04-10 起）、ru=5、ag=1。主连图 MinMove 不可信（p9888=1），真实价取整必用本值
-    Bool MapToMain(True);         // True=主连图/模拟/实盘（换月全套+委托映射主力）；False=单合约切片图（不复权、不映射）
-    String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（须与日志 data0.Symbol 完全一致，区分大小写）
+    Numeric SlipTicks(1);         // 回测撮合滑点（跳）
+    Numeric RealTickSize(1);      // 真实合约最小变动价（p=1/ru=5/ag=1；主连 MinMove 不可信）
+    Bool MapToMain(True);         // True=主连图/模拟/实盘（换月+委托映射）；False=单合约切片图
+    String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（区分大小写）
     // ---- 日志 ----
-    Integer LogLevel(2);          // 日志级别阈值：消息级别≤本值才写出（0=仅ERROR 1=+WARNING 2=+INFO正常 3=+DEBUG调试）
-    Bool PrintToUI(True);         // 界面镜像：True=同步 Print 到 K 线图控制台（与文件同阈值）；无图表单元无控制台，只能看日志文件；长回测/批量优化嫌刷屏置 False
-    String LogDir("C:/Users/MI/work/quant_strategy/tbquant/logs/"); // 日志目录（本机绝对路径，换机器/云需改；留空=平台运行目录）；末位缺 / 时自动补（OnInit 日志打印实际路径）
+    Integer LogLevel(2);          // 0=ERROR 1=+WARN 2=+INFO 3=+DEBUG
+    Bool PrintToUI(True);         // 同步 Print 到图表控制台；长回测/批量优化建议 False
+    String LogDir("C:/Users/MI/work/quant_strategy/tbquant/logs/"); // 日志目录（留空=平台运行目录）；末位自动补 /
     Integer LogHour(14);          // 每日定时日志时刻
     Integer LogMinute(45);
 
 Vars
-    // ---- N 与四通道（来源 Data1[1..]；每根新 bar 在 OnBarOpen 刷新，见该事件）----
+    // ---- N 与四通道（来源 Data1[1..]；OnBarOpen 每根新 bar 刷新）----
     Global Numeric NVal;
     Global Numeric EntryLongLv;
     Global Numeric EntryShortLv;
@@ -120,76 +82,76 @@ Vars
     Global Numeric LastUnitPrice; // 最近一个 unit 的入场价
     Global Integer UnitCount;     // unit 计数
     Global Numeric StopLine;      // 共享止损线
-    Global String TradeReason;    // 本笔交易首仓入场类型（entry/entry_stall/entry_nr；加仓/换月不变；平仓或空仓清理后清空）
+    Global String TradeReason;    // 首仓入场类型（entry/entry_stall/entry_nr；加仓/换月不变）
     // ---- 系统1 跳过 ----
-    Global Bool SkipNextBreakout; // 系统1：跳过一次 20 日突破（由 DoCloseAll 按 S1Scope×TradeReason 武装）
-    Global Numeric SkipLevel;     // 被跳过的 20 日突破价位（同价位不再入场，直到通道刷新）
+    Global Bool SkipNextBreakout; // 下一次 20 日突破跳过（按 S1Scope×TradeReason 武装）
+    Global Numeric SkipLevel;     // 被跳过的突破价位（同价不再入场，直到通道刷新）
     Global Integer SkipDir;       // 跳过方向：+1 多 / -1 空 / 0 无
     // ---- STALL 极值停滞并行入场（v3.2）----
-    Global Bool StallEnabled;     // OnInit 校验：StallPeriod>0 且 2*StallPeriod+5<=WinSize()
+    Global Bool StallEnabled;     // StallPeriod>0 且 2*StallPeriod+5<=WinSize()
     Global Bool StallInit;        // 首次有效读取仅建基线
     Global Numeric StallSigO;     // 上次评判的 Data1[1] OHLC 签名
     Global Numeric StallSigH;
     Global Numeric StallSigL;
     Global Numeric StallSigC;
-    Global Integer StallLongCnt;  // 最近一次边沿的多头停滞计数（-1=窗口内无事件）
+    Global Integer StallLongCnt;  // 最近事件距最新 bar 的根数（-1=窗口内无事件）
     Global Integer StallShortCnt; // 空头镜像
-    Global String StallRefSym;    // 签名归属：D1Sym()|MainSymbol()，变化=换月/换层→重基线
-    Global String D1LogSig;       // 完整 D1 行去重指纹（合约|OHLC），同一根 data1 bar 只打一次
-    // ---- NR 收缩并行入场（v3.2 新增，与 STALL/突破并列）----
-    Global Bool NrEnabled;        // OnInit 校验：NrN>=2 且 NrN<=WinSize()
+    Global String StallRefSym;    // 签名归属（合约|主力）；变化=换月/换层→重基线
+    Global String D1LogSig;       // D1 行去重指纹（同一根 data1 bar 只打一次）
+    // ---- NR 收缩并行入场（v3.2 新增）----
+    Global Bool NrEnabled;        // NrN>=2 且 NrN<=WinSize()
     Global Bool NrHasEvent;       // 最新完成 data1 bar 是否为近 NrN 根振幅最小者
-    Global Bool NrFired;          // 本事件已入场/已跳过（每根新 data1 bar 复位；开仓失败不置位 → 下分钟重试）
-    Global Bool NrSkipNext;       // 系统1：上次交易盈利 → 跳过一次 NR 突破（仅 S1Scope=current/breakout_nr 消费）
+    Global Bool NrFired;          // 本事件已入场/已跳过（新 data1 bar 复位；开仓失败不置位）
+    Global Bool NrSkipNext;       // 系统1：下一次 NR 突破跳过
     Global Numeric NrHighLv;      // 事件触发上沿 = 收缩 bar High
     Global Numeric NrLowLv;       // 事件触发下沿 = 收缩 bar Low
-    Global String NrD1Sig;        // 上次评判的 data1 OHLC 指纹（合约|OHLC）
+    Global String NrD1Sig;        // 上次评判的 data1 OHLC 指纹
     // ---- 移仓跟踪 ----
     Global String LastMainSym;    // 上次主力合约；变化=发生移仓
     Global Bool MainSymInit;      // 主力字符串初始化标记
     // ---- 运行状态 ----
     Global Integer BarCnt;
     Global Integer LastLogYmd;
-    Global Integer LastSkipYmd;   // OPEN_SKIP 日志节流：当日已记过即静默（拒因当日不解除）
-    Global Integer LastRefreshErrYmd; // N/四通道失败日志节流：失败态每根新 bar 重试下同交易日只记首条（不去重会刷屏）
+    Global Integer LastSkipYmd;   // OPEN_SKIP 日志节流（每交易日首条）
+    Global Integer LastRefreshErrYmd; // N/通道刷新失败日志节流（每交易日首条）
     Global Bool FinalDone;
-    Global Bool ParamsOk;         // OnInit 参数校验：False=禁开新仓/加仓（止损/平仓保留）
-    Global Bool CalcOk;           // 计算口径参数有效：False=N/四通道保持 0（OnInit 已记 ERROR）
+    Global Bool ParamsOk;         // False=禁开新仓/加仓（止损/平仓保留）
+    Global Bool CalcOk;           // False=N/四通道保持 0
     // ---- 回报事件（OnOrder 维护挂单门禁；OnFill 仅日志）----
     Global Integer FillCnt;
     Global Integer OrderCnt;
-    // ---- 模拟/实盘挂图合法性（OnInit：data0/data1 同一主连 + MapToMain=True；回测不校验）----
+    // ---- 模拟/实盘挂图合法性（回测不校验）----
     Global Bool MappingOk;
-    Global Bool MappingRecheck;   // OnInit 判定失败时置位：首个 data1 就绪的 bar 复核一次（防 data1 晚挂载误锁）
-    // ---- 挂单门禁（模拟/实盘：OnOrder 维护 + 每根 bar 按平台未成交列表校正；回测不触发）----
-    Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（Declare/Declared/FillPart/Canceling）
-    Global Integer LastGateYmd;       // ORDER_GATE 日志节流：每交易日仅首条
-    Global Integer LastSyncWarnYmd;   // PEND_SYNC_FAIL 查询失败日志节流：每交易日仅首条
-    Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流：每交易日仅首条
-    Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流：每交易日仅首条
+    Global Bool MappingRecheck;   // OnInit 判定失败时，首个 data1 就绪的 bar 复核一次
+    // ---- 挂单门禁（模拟/实盘；回测不触发）----
+    Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合
+    Global Integer LastGateYmd;       // ORDER_GATE 日志节流
+    Global Integer LastSyncWarnYmd;   // PEND_SYNC_FAIL 日志节流
+    Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流
+    Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流
     Global Array<String> SyncMapSyms; // 挂单同步查询合约缓存
-    // ---- 回放期门禁（模拟/实盘：启动回放或非实时 bar 不允许交易）----
-    Global Bool ReplayGateLogged;     // REPLAY_GATE 日志仅首条
-    Global Bool RealtimeLogged;       // REALTIME_BAR 日志仅首条（回放转实时留痕）
-    // ---- 账户真值对账（模拟/实盘：4 参 A_GetPosition 读落地合约；回测不用）----
-    Global Integer PDir;              // 台账持仓方向：+1 多 / -1 空 / 0 空仓（模拟/实盘以此为准）
-    Global Bool AcctPosOk;            // 最近一次账户持仓读取是否成功（False → 禁开仓）
+    // ---- 回放期门禁（模拟/实盘非实时 bar 不允许交易）----
+    Global Bool ReplayGateLogged;     // REPLAY_GATE 仅首条
+    Global Bool RealtimeLogged;       // REALTIME_BAR 仅首条
+    // ---- 账户真值对账（模拟/实盘；回测不用）----
+    Global Integer PDir;              // 台账持仓方向：+1 多 / -1 空 / 0 空仓
+    Global Bool AcctPosOk;            // 账户持仓读取成功（False → 禁开仓）
     Global Numeric AcctLong;          // 账户落地合约多头手数
     Global Numeric AcctShort;         // 账户落地合约空头手数
     Global Numeric AcctLongAvg;       // 账户多头均价（真实价）
     Global Numeric AcctShortAvg;      // 账户空头均价（真实价）
-    Global String AcctSym;            // 本次读取的落地合约（诊断）
+    Global String AcctSym;            // 本次读取的落地合约
     Global Integer SyncBlockBars;     // 对账宽限：刚成交/刚换月时跳过的新 bar 数
     Global String LastSyncBarSig;     // 对账去重：同一根 bar 只对账一次
-    Global Integer LastAcctPosWarnYmd;// ACCT_POS_FAIL 日志节流：每交易日首条
-    Global Integer LastCloseSkipYmd;  // 平仓无可平持仓 ORDER_SKIP 日志节流：每交易日首条
-    Global Integer LastSentLots;      // 最近一次成功委托的实际手数（平仓收敛后，供日志/盈亏）
-    Global Array<String> AcctSyms;    // 账户持仓合约清单（区分"空仓"与"读取失败"）
+    Global Integer LastAcctPosWarnYmd;// ACCT_POS_FAIL 日志节流
+    Global Integer LastCloseSkipYmd;  // 平仓无可平持仓日志节流
+    Global Integer LastSentLots;      // 最近一次成功委托的实际手数
+    Global Array<String> AcctSyms;    // 账户持仓合约清单（区分空仓与读取失败）
 
 Defs
     // ---------- 基础辅助 ----------
 
-    // 日志目录规范化：非空且末位不是 / 时自动补 /（参数漏写结尾斜杠不再拼坏文件名）
+    // 日志目录规范化：非空且末位不是 / 时自动补 /
     String EffectiveLogDir() {
         If (LogDir == "") {
             Return "";
@@ -205,9 +167,7 @@ Defs
         Return StrategyMode() <> Enum_Mode_Strategy_Trade() And StrategyMode() <> Enum_Mode_Strategy_Chart();
     }
 
-    // 日志路径：有效日志目录（可空=平台运行目录）+ 公式名 + data0 合约 + [非交易 _BT] + 平台当前日期
-    // （实盘按物理日分文件；非交易模式：简单回测/图表历史计算/图表回测，统一写 _BT 文件与模拟隔离；
-    //   平台不区分“图表回测”和“模拟前历史重算”，两者都写、都不删；P/RU 多实例同目录也不混）
+    // 日志路径：目录 + 公式名 + data0 合约 + [非交易 _BT] + 平台日期
     String LogPath() {
         String modeTag = "";
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
@@ -225,12 +185,7 @@ Defs
         Return DateTimeToString(CurrentDate());
     }
 
-    // 日志核心：Param LogLevel 阈值过滤（消息级别 ≤ LogLevel 才写出），行首标记=级别：
-    //   !!! [Error] !!! 策略无法按预期工作（数据缺失/委托被拒） · [Warn] 异常已自愈/机会丢失/换月
-    //   [Info] 正常心跳与成交 · [Debug] 诊断细节
-    //   （.tbf 为 TB 加密日志文件（非纯文本），无颜色通道，ERROR 以 !!! [Error] !!! 醒目化替代红色）
-    // 双写：文件 +（PrintToUI=True 时）K 线图控制台，同一阈值。
-    // 模式：非交易（简单回测/图表历史计算/图表回测）→*_BT_日志_*；模拟/实盘→*_日志_*；所有模式都写。
+    // 日志核心：LogLevel 阈值过滤；文件 +（PrintToUI 时）图表控制台双写
     Integer WLogCore(Integer need, String tag, String ts, String s) {
         If (LogLevel >= need) {
             String msg = ts + " | " + tag + " " + s;
@@ -304,17 +259,13 @@ Defs
         Return 0;
     }
 
-    // 窗口根数（对齐聚宽 attribute_history(need+1) 与 v3.0 环容量）；STALL 计数窗口 2*StallPeriod+5 必须 ≤ 本值
+    // 窗口根数（对齐聚宽 attribute_history(need+1)）；STALL 计数窗口 2*StallPeriod+5 必须 <= 本值
     Integer WinSize() {
         Return IntPart(Max(60, NPeriod * 3)) + 1;
     }
 
-    // ---------- 参数校验（OnInit 调用一次）----------
-    // 核心参数非法 → 只禁开新仓/加仓，止损与平仓路径不受影响。
-    // 计算口径参数（NPeriod/NSmooth/EntryN/ExitN/窗口）另汇总为 CalcOk：
-    // 非法时 RefreshNChannels 直接保持五值 0，避免带病计算。
-    // SetMarginRate/SetCommissionRate/SetSlippage 返回值均不校验（False 在图表/回测/模拟下可能是
-    // 正常返回，设置仍生效）；SlipTicks 仍要求 >=0。
+    // 参数校验：核心参数非法只禁开新仓/加仓，止损与平仓不受影响；
+    // 计算参数另汇总 CalcOk，非法时 N/四通道保持 0。
     Integer ParamErr(String name, String value, String rule) {
         WLogInitE("参数非法: " + name + "=" + value + "，要求 " + rule);
         Return 0;
@@ -436,8 +387,7 @@ Defs
         Return Data1.Close[0];
     }
 
-    // 日线第 idx 根的真实波幅（idx>=1；用 idx 与 idx+1 两根，第 idx+1 根作前收盘锚点）
-    // 写法=探针验证版直读的访问器封装（语义等价）；禁 GetBar。
+    // 日线第 idx 根的真实波幅（idx>=1；用 idx 与 idx+1 两根，后者作前收盘锚点）；禁 GetBar。
     Numeric D1TR(Integer idx) {
         Numeric t1 = D1High(idx) - D1Low(idx);
         Numeric t2 = Abs(D1High(idx) - D1Close(idx + 1));
@@ -445,10 +395,8 @@ Defs
         Return Max(Max(t1, t2), t3);
     }
 
-    // N：经典海龟口径（与聚宽 calc_n 同式）：前 NPeriod 个 TR 均值初始化，
-    // 再按 N=((NSmooth-1)*N+TR)/NSmooth 递推到最新。
-    // 窗口 Data1[1..win]（base=1）；第 win 根仅作前收盘锚点。
-    // 与 v3.0 环口径探针实测逐值全等（M3 43/43 MATCH 61@base1）。调用前须通过 RefreshNChannels 守卫。
+    // N：经典海龟口径（同聚宽 calc_n）：前 NPeriod 个 TR 均值作种子，再按
+    // N=((NSmooth-1)*N+TR)/NSmooth 递推。窗口 Data1[1..win]，第 win 根仅作前收盘锚点。
     Numeric CalcD1N(Integer win) {
         Integer t;
         Numeric n = 0;
@@ -459,9 +407,7 @@ Defs
         For t = NPeriod + 1 To win - 1 {
             n = ((NSmooth - 1) * n + D1TR(win - t)) / NSmooth;
         }
-        // NaN 守卫：NPeriod/NSmooth ≤0 等参数滥用产生除零 → 无效值/无穷；
-        // 无效值会使 CanTradeNow 的 NVal<=0 比较恒 False 而漏过门禁 → 此处归一为 0
-        //（RefreshNChannels 见 0 记 ERROR 并保持五值全 0，拒绝交易、每根新 bar 自动重试；错误日志按交易日节流）
+        // NaN 守卫：参数滥用产生除零 → 归一为 0，由 RefreshNChannels 记 ERROR 并拒交易
         If (NumValid(n)) {
             Return n;
         }
@@ -501,21 +447,9 @@ Defs
         Return 0;
     }
 
-    // N 与四通道的刷新入口（编排器：零化 → 守卫 → 计算，数学都在被调函数里）。
-    // 概念映射：NVal ← CalcD1N(win)（经典海龟 N：前 NPeriod 个 TR 均值种子 + Wilder 递推）；
-    //           四通道 ← CalcChannels()（唐奇安 EntryN 入场 / ExitN 出场极值）。
-    // 调用时机：OnBarOpen（每根新 bar 生成时一次；正常历史回放与实盘均驱动）——实盘 OnBar
-    //           会随形成中 bar 逐 tick 重复，故刷新不放 OnBar；TryStallEntry 消费新 data1 边沿时
-    //           补刷一次（防 OnBarOpen 仍读到旧 Data1[1]）。值随 data1 窗口头推进更新：
-    //           Data1[1]=最新一根已完成 data1 K线，日线仅换日推进（探针 M3 实测 43/43 对齐
-    //           v3.0 环）——同一根 K 期间与旧版「换日一刷」取值一致；30 分钟等日内周期每根收完即推进。
-    // 数据窗口：data1 图层经 D1* 访问器按 base=1 取 win=WinSize() 根，第 win 根仅作前收盘锚点。
-    // 守卫顺序：① CalcOk（OnInit 参数校验：NPeriod/NSmooth/EntryN/ExitN/窗口）
-    //           ② DataCount≥2（有 data1 图层）③ data1 与 data0 同合约（错位拒交易，
-    //           防拿错合约的 N/通道下单）④ D1Close(1)/(win) 有效且 >0（历史深度）。
-    // 失败语义：五值先全部置 0；CalcOk=False → 静默保持 0（OnInit 已记 ERROR）；
-    //           其余守卫不过 → 保持 0 + ERROR（按日节流）→ CanTradeNow 拒绝，下根新 bar 自动重试。
-    // 后置保证：成功返回时 NVal 与四通道均 >0；CalcD1N/CalcChannels 只允许本函数在守卫通过后调用。
+    // N/四通道刷新：先清零，再依次检查 CalcOk、data1 存在且同合约、历史深度，
+    // 通过后调用 CalcD1N/CalcChannels；任何失败保持五值 0 并拒交易。
+    // 调用时机：OnBarOpen 每根新 bar 一次；TryStallEntry 消费新 data1 边沿时补刷一次。
     Integer RefreshNChannels() {
         Integer win = WinSize();
         ResetChannels();
@@ -558,8 +492,7 @@ Defs
         Return StrategyMode() == Enum_Mode_Strategy_Trade();
     }
 
-    // 实盘/模拟判定（全部资金读取的岔路口）：策略交易模式 + 0 号账户数据已就绪。
-    // 第二条件防"模式对了但账户未连线/未就绪"；回测下 A_AccountDataExist=False（探针 R6 实测）。
+    // 实盘/模拟判定：策略交易模式 + 账户数据已就绪（回测 A_AccountDataExist=False）
     Bool IsLiveTrade() {
         If (IsStrategyTradeMode() == False) {
             Return False;
@@ -652,12 +585,8 @@ Defs
 
     // ---------- 手数计算（复刻聚宽 unit_lots + fit_margin + fit_cap）----------
 
-    // 开仓手数计算：三段连续削峰（风险定量 → 资金 → 占用上限），逐段只能更小。
-    // 风险基数 = Min(InitCapital, 当前权益)；② 用实际可用资金。
-    // 唯一调用点 DoOpenUnitCore（传当前价 Close()）；price 仅用于估算每手保证金。
-    // 模拟/实盘：权益是真实资金，而 price/NVal 是主连复权口径 → 按 Rollover 折回真实口径
-    // （真实价=图价/r、真实N=N/r），否则风险手数偏小 r 倍、保证金占用被高估 r 倍；
-    // 回测成交/权益/指标同为图口径，r=1 保持原行为。
+    // 开仓手数：风险定量 → 可用资金 → 占用上限，三段逐级取小。
+    // 模拟/实盘按 Rollover 把图价/N 折回真实口径；回测 r=1。
     Integer CalcLots(Numeric price) {
         Numeric eq = RiskCapital();
         Numeric roll = 1;
@@ -684,10 +613,7 @@ Defs
 
     // ---------- 订单封装 ----------
 
-    // 委托价解析：理论触发价 refPrice → 实际可成交价。
-    // orderDir = 委托方向（+1 买 / -1 卖；平仓调用方传入持仓方向取反）。
-    // 实盘：买吃卖一、卖吃买一（跨价差保成交）；盘口无效(≤0，如未连线/休市)退回 refPrice。
-    // 回测：开盘跳空越过触发价时按开盘价成交（对委托方向更不利的价），否则按 refPrice。
+    // 委托价：实盘取对手价（盘口无效退回 refPrice）；回测按触发价，跳空时按开盘价。
     Numeric CalcOrderPrice(Integer orderDir, Numeric refPrice) {
         If (IsLiveTrade()) {
             Numeric qp = Q_BidPrice(0);   // 卖方向默认取买一
@@ -709,9 +635,7 @@ Defs
     }
 
     // ---------- 挂单门禁（模拟/实盘）----------
-    // OnOrder 是唯一能拿到未完成委托的回报入口（A_SendOrderEx 可直取 orderId，本策略用
-    // Buy/SellShort 只能靠事件）。活跃状态入集合，其余状态（含未知）一律视为终态移除，
-    // 避免状态枚举扩展时出现永不解除的死锁。回测不触发事件 → 集合恒空。
+    // OnOrder 维护未完成委托集合；状态枚举扩展时未知状态按终态移除，避免死锁。
     Bool OrderIsPending(Integer st) {
         Return (st == Enum_Declare Or st == Enum_Declared Or st == Enum_FillPart Or st == Enum_Canceling);
     }
@@ -827,9 +751,7 @@ Defs
         Return t;
     }
 
-    // 图价 → 真实价并取整到可成交方向：买向上、卖向下（跨价保成交）。
-    // 复权系数：真实价 = 图价 / Rollover()（MapPositionProbe 2026-10-22 实测：
-    // 图 11741.97 / 1.22759769 ≈ 9565，再按 RealTickSize 取整后委托）。任一步无效 → InvalidNumeric。
+    // 图价 → 真实价，并按委托方向取整（买向上/卖向下）。真实价 = 图价 / Rollover()。
     Numeric RealOrderPrice(Numeric chartPx, Integer orderDir) {
         If (NumValid(chartPx) == False) {
             Return InvalidNumeric;
@@ -863,10 +785,8 @@ Defs
         Return px;
     }
 
-    // 读取落地合约的账户持仓（4 参 A_GetPosition；图表口径/1 参读不到映射仓）。
-    // A_GetPosition 返回 False 时用账户持仓清单区分：清单可用且不含该合约 = 真空仓（AcctPosOk=True）；
-    // 否则视为读取失败（AcctPosOk=False → 禁开仓）。日志按交易日节流。
-    // 注：账户为策略单元共享——其它策略/手工仓会一并读入，本策略要求账户专用。
+    // 读取落地合约账户持仓（4 参 A_GetPosition）。读取失败时用持仓清单区分真空仓与失败。
+    // 账户为策略专用；其它策略/手工仓会被一并接管。
     Integer RefreshAccountPosition() {
         String sym = OrderMapSym();
         AcctSym = sym;
@@ -910,13 +830,8 @@ Defs
         Return 0;
     }
 
-    // 以账户真值为准整体重建台账（模拟/实盘唯一重建入口；回测走 RebuildLedger 图表分支）。
-    // 场景：重启台账归零、委托映射后图表口径全 0、部分成交/人工干预、换月后。
-    // 映射：PLots/PDir ← 账户同合约多空手数；PCost/LastUnitPrice ← 账户均价 × Rollover()（图口径）；
-    //       UnitCount 至少 1；StopLine 按均价 − dir×StopDistN×NVal 重推（N 无效置 0）。
-    // 局限：加仓次数/末次入场价无法从账户恢复——加仓步进以均价为基准、止损线偏保守；
-    //       不支持同合约多空对锁（读到对锁 = 记 ERROR + 停交易，需人工处理）。
-    //       TradeReason 属本笔交易，不随重建改写（进程重启接管的持仓类型不可知 → 平仓后不武装 skip）。
+    // 以账户真值整体重建台账（模拟/实盘唯一重建入口）。均价按 Rollover 折回图口径；
+    // 加仓次数/末次入场价无法恢复，止损线按均价重推。不支持同合约多空对锁。
     Integer RebuildLedgerFromAcct() {
         RefreshAccountPosition();
         If (AcctPosOk == False) {
@@ -979,10 +894,8 @@ Defs
         Return 0;
     }
 
-    // 账户接口下单（模拟/实盘唯一出口）：真实落地合约 + 真实价 + 发送前账户持仓门禁。
-    // 门禁：①平仓手数=实际同向持仓（账户不可读时退回台账手数；无可平 → 跳过）
-    //       ②加仓须账户已有同向持仓 ③其余开仓须账户多空均为 0（有仓 → 重建台账并跳过）
-    // 成功返回 True，并把平台返回的 orderId 加入挂单门禁集合。
+    // 账户接口下单（模拟/实盘唯一出口）：查询账户持仓 → 发送前门禁 → 真实价委托。
+    // 平仓手数收敛为实际同向持仓；加仓须已有同向持仓；开仓须账户空仓。
     Bool SendAcctOrder(Integer orderDir, Integer lots, Numeric chartPx, Bool isClose, String reason) {
         String sym = OrderMapSym();
         RefreshAccountPosition();
@@ -1084,9 +997,7 @@ Defs
         Return ok;
     }
 
-    // 每根新 bar 对账（模拟/实盘实时）：把台账校正到账户真值。
-    // 跳过：同一根 bar 已对账 / 有未完成委托（等终态）/ 成交或换月后的宽限期。
-    // 重建条件：手数或方向不符，或有仓但止损线缺失（接管首 bar 补上）。
+    // 每根新 bar 按账户真值校正台账；有挂单或宽限期内跳过。
     Integer SyncAcctOnNewBar() {
         If (IsLiveTrade() == False) {
             Return 0;
@@ -1131,10 +1042,8 @@ Defs
         Return 0;
     }
 
-    // 发送委托：开仓/平仓共用入口；失败记 FAIL 日志并返回 False（调用方放弃本次动作）。
-    // orderDir = 委托方向（+1 买 / -1 卖）；isClose=True 平仓（卖平/买平），False 开仓（买开/卖开）。
-    // 日志中 dir= 恒为委托方向（平仓被拒时与持仓方向符号相反，便于对照委托本身）。
-    // 注意：分发必须用 If 块——IIF 两侧都会求值，会把两种指令都发出去。
+    // 发单入口：开/平仓共用；无效价与挂单门禁在此拦截。
+    // 分发必须用 If 块——IIF 两侧都会求值，会重复发单。
     Bool DoSendOrder(Integer orderDir, Integer lots, Numeric price, Bool isClose, String reason) {
         // 无效委托价兜底：NumValid 不通过（InvalidNumeric≈1.79e308 或 <=0）一律不发单——
         // 防历史回放/盘口未就绪时把无效价送进交易层（TBCore: trade Error Args）
@@ -1187,8 +1096,7 @@ Defs
         Return ok;
     }
 
-    // 开 1 个 unit 的公共实现：价格已解析；台账按预期成交价记账
-    // 开仓/加仓唯一出口：ParamsOk=False（OnInit 参数校验失败）在此兜底拒绝
+    // 开 1 个 unit 的公共实现：按预期成交价记账；开仓/加仓唯一出口。
     Integer DoOpenUnitCore(Integer dir, Numeric orderPrice, String reason) {
         If (ParamsOk == False) {
             Return 0;
@@ -1247,8 +1155,7 @@ Defs
         Return 0;
     }
 
-    // 全部平仓（止损/反向突破）；委托失败则保留台账下一 bar 重试。
-    // 盈利平仓按 S1Scope × 首仓入场类型（TradeReason）武装 skip，再清台账。
+    // 全部平仓；盈利时按 S1Scope × TradeReason 武装 skip，再清台账。
     Integer DoCloseAll(Integer dir, Numeric refPrice, String reason) {
         If (PLots <= 0) {
             Return 0;
@@ -1323,20 +1230,8 @@ Defs
 
     // ---------- 台账一致性：重启/部分成交后按平台持仓重建 ----------
 
-    // 台账重建：唯一「以平台为准」的写入口——乐观台账（下单成功即记账）与平台失同步时整体覆盖。
-    // 触发场景：① ManagePosition 每 bar 数量对账失配（重启全局归零 / 部分成交 / 手工干预等）；
-    //          ② 换月——UpdateMainSymbol 检测到主力变化且持仓≠0（回测立即重建；模拟/实盘延后 2 根
-    //             新 bar 由 SyncAcctOnNewBar 按账户真值重建，避开换仓/映射中间态）。
-    // 数据映射：PLots ← CurrentContracts；
-    //          UnitCount ← CurrentEntries（下限 1）；
-    //          PCost ← AvgEntryPrice×cc（≤0 退回收盘价）；
-    //          LastUnitPrice ← LastEntryPrice（≤0 退回均价）；
-    //          StopLine ← LastUnitPrice − dir×StopDistN×NVal（按海龟规则再推导）；
-    //          TradeReason 不改写（同一笔交易的首仓类型，重建只覆盖数量/价格/止损）。
-    // 局限：StopLine 用的是重建时的 NVal，非同 unit 入场时值——ATR 已变则偏差 ≈ 2×ΔN；
-    //       仅数量失配触发——发单价 vs 成交价的纯价格偏差不在此清除（留待下次数量失配顺带重建）。
-    // 后置保证：返回后 PLots 与平台手数一致（守卫收敛，不会连续重建）；调用点均在意向判断
-    //           （止损/加仓/入场）之前，同 bar 风控即使用修复后的台账。
+    // 台账重建：以平台持仓为准整体覆盖（数量失配/部分成交/换月）。
+    // StopLine 用重建时的 NVal 重推，ATR 已变时与原始止损有偏差。
     Integer RebuildLedger() {
         // 模拟/实盘：图表口径看不到映射仓，只能按账户真值重建
         If (IsLiveTrade()) {
@@ -1373,15 +1268,8 @@ Defs
 
     // ---------- 主力移仓跟踪（原生自动换仓后重建基准）----------
 
-    // 主力换月检测：比较 MainSymbol() 字符串，变化=换月——留 ROLLOVER 日志，持仓≠0 时重建台账
-    // 基准（TB 原生自动换仓把平台均价换到新合约价格口径，策略台账需跟随重建）。
-    // 调用时机：OnBar 每 bar 无条件（不放 ManagePosition 内——空仓时换月日志也要记）。
-    //           回测：换月 bar 立即重建，紧贴同 bar 交易判断（旧口径 StopLine 不漏判）；
-    //           模拟/实盘：图表口径无映射仓，只置对账宽限，由下一根实时新 bar 的
-    //           SyncAcctOnNewBar（OnBarOpen，先于 OnBar）按账户真值重建。
-    // 盲区：停机期间发生换月时，重启后 MainSymInit 走静默分支不报 ROLLOVER——一致性由
-    //       RebuildLedger 的数量守卫兜底，仅缺日志条（增强备选：按换月日历时间兜底检测）。
-    // 后置保证：返回后 LastMainSym == 当前 MainSymbol()，同一换月不会重复触发。
+    // 主力换月检测：MainSymbol 变化即换月；有持仓时重建台账。
+    // 回测立即重建；模拟/实盘延后 2 根新 bar，由账户真值重建。
     Integer UpdateMainSymbol() {
         // 平台当前主力合约代码（主连/映射模式下随换月切换）
         String ms = MainSymbol();
@@ -1443,8 +1331,7 @@ Defs
         Return 0;
     }
 
-    // 交易统一门槛：挂图合法（MappingOk）+ 模拟/实盘账户已就绪 + 已到 TradeStartDate + N/四通道五值均 >0。
-    // 不通过 = 不走 ManagePosition；实盘/模拟在 data1 失效期另由 ManageStopOnly 保留止损保护。
+    // 交易统一门槛：挂图合法 + 模拟/实盘账户就绪 + 已到 TradeStartDate + N/四通道有效。
     Bool CanTradeNow() {
         // 模拟/实盘挂图不合法（非主连/两图层不一致/MapToMain=False）→ 禁止开新仓
         If (MappingOk == False) {
@@ -1469,14 +1356,9 @@ Defs
         Return True;
     }
 
-    // 入场判断：空仓时检查价格是否突破前 EntryN 根 data1 极值（唐奇安通道上/下沿；随最新完成 data1 K线刷新）。
-    // 概念映射：多头触发 = High() ≥ EntryLongLv；空头触发 = Low() ≤ EntryShortLv；评估粒度 = 分钟 bar。
-    // 系统1 跳过：S1Skip>0 且 SkipNextBreakout 置位（按 S1Scope 武装，默认仅突破首仓盈利）→ 本次突破取消并记录价位；
-    // 同价位不再入场，直到通道刷新出新极值（SKIP_RELEASED）后恢复。
-    // 调用前提：仅由 ManagePosition 空仓分支调用（平台空仓、台账已清后）。
-    // 互斥/单动作：多头分支 Return 后不再评估空头——同 bar 双突破时多头优先；每 bar 至多开 1 unit。
-    // 后置：开仓交给 DoOpenUnit（实际价由 CalcOrderPrice、手数由 CalcLots 解析）；手数不足时逐 bar
-    //       重试、OPEN_SKIP 日志按日节流。
+    // 突破入场：空仓时检查 1m 价格是否触及 EntryN 通道上/下沿。
+    // 系统1 跳过：被跳过价位同价不再入场，直到通道刷新出新极值。
+    // 每 bar 至多开 1 unit；多头分支优先。
     Integer TryEntry() {
         // 参数校验失败：不开新仓，且不消费 SkipNextBreakout / 不写 BREAKOUT_SKIP
         If (ParamsOk == False) {
@@ -1580,10 +1462,8 @@ Defs
         Return 0;
     }
 
-    // STALL 边沿评判与入场。返回 True = 本 bar STALL 分支已占用（尝试开仓 / 挂单放弃），OnBar 跳过常规 ManagePosition。
-    // 边沿 = Data1[1] 的 OHLC 签名变化；每根 data1 bar 只消费一次，首次仅建基线；
-    // 持仓/挂单/预热期达成 = 错过，不补触发。换月/换层导致引用键变化时重基线，防复权值跳变误触发。
-    // allowOrder=False（历史回放期）：仍推进签名基线与 N/通道，但不下单。
+    // STALL 边沿评判与入场。返回 True = 本 bar STALL 分支已占用。
+    // 边沿 = Data1[1] OHLC 签名变化；首次仅建基线，持仓/挂单/预热期达成不补。
     Bool TryStallEntry(Bool allowOrder) {
         // 参数校验失败：不开新仓（基线推进一并无意义——参数整轮不变）
         If (ParamsOk == False) {
@@ -1753,10 +1633,8 @@ Defs
         Return 0;
     }
 
-    // NR 突破入场。返回 True = 本 bar 已处理 NR（开仓尝试或跳过），OnBar 不再走常规 ManagePosition。
-    // 触发 = 1m High/Low 触及收缩 bar 的高/低点；空仓才动作。
-    // 开仓成功才置 NrFired（手数不足/拒单下一分钟重试，同聚宽 open_unit）；skip 消费立即生效。
-    // 市价单（与聚宽 order()/STALL 一致）：回测按当前 1m 收盘，实盘按盘口对手价。
+    // NR 突破入场。返回 True = 本 bar 已按 NR 处理（开仓/跳过/挂单暂缓）。
+    // 开仓成功才置 NrFired；手数不足/拒单下一分钟重试。
     Bool TryNrEntry() {
         Integer prevLots = 0;
         If (ParamsOk == False Or NrEnabled == False Or NrHasEvent == False Or NrFired) {
@@ -1893,13 +1771,8 @@ Defs
         Return 0;
     }
 
-    // 交易主流程（每分钟）：按持仓状态路由，每 bar 至多执行一个动作。
-    // 空仓分支：清残留台账（LEDGER_CLEAN）→ TryEntry 尝试突破入场。
-    // 持仓分支：数量对账（失配 → RebuildLedger）→ 按优先级执行：止损 > 反向突破出场 > 加仓，
-    //           先保护后进攻；任一动作完成后立即 Return，本 bar 不再做第二个动作。
-    // 概念映射（对齐聚宽）：止损 = 共享 2N 线；出场 = ExitN 反向通道；加仓 = 顺向 AddStepN×N 步进；
-    //           入场 = EntryN 唐奇安突破（细节见 TryEntry）。
-    // 调用前提：OnBar 第 2 步且 CanTradeNow() 通过（MappingOk + TradeStartDate + N/四通道有效）。
+    // 交易主流程：每 bar 至多一个动作。空仓→突破入场；
+    // 持仓→止损 > 反向突破出场 > 加仓，任一动作后立即返回。
     Integer ManagePosition() {
         // 空仓分支：先清残留台账（手工平仓/异常后可能残留），再尝试入场
         If (PosLotsNow() == 0) {
@@ -1953,11 +1826,7 @@ Defs
         Return 0;
     }
 
-    // data1 失效时的仅止损兜底（只对实盘/模拟启用）：
-    // N/四通道归 0 后 CanTradeNow=False，不能走 ManagePosition
-    // （重建会把 StopLine 推到末次入场价（NVal=0 按保本线兜底），零通道也会误判出场/加仓）。
-    // 只用最后一次有效 StopLine 保护已有持仓；台账缺失（PLots<=0）时不动作。
-    // 注意：失效期间若恰逢换月，UpdateMainSymbol 的重建会把 StopLine 推到末次入场价（NVal=0 → 按保本线兜底）。
+    // data1 失效时的仅止损兜底（模拟/实盘）：只用最后有效 StopLine 保护持仓。
     Integer ManageStopOnly() {
         If (PosLotsNow() == 0 Or PLots <= 0 Or StopLine <= 0) {
             Return 0;
@@ -1981,8 +1850,7 @@ Defs
 
 Events
     OnInit() {
-        // 日志：所有模式只追加、不删除（同一天多次运行/回测都追加在同一文件）。
-        // 全局状态复位；N/通道、台账、STALL、日志节流走共用复位函数
+        // 全局状态复位（所有模式日志只追加、不删除）
         BarCnt = 0;
         MainSymInit = False;
         SkipNextBreakout = False;
@@ -2027,7 +1895,7 @@ Events
         Else {
             WLogInitE("参数校验失败：禁止开新仓（含加仓）；止损/平仓保留");
         }
-        // STALL 参数校验：2*StallPeriod+5 必须在 WinSize 预算内（不扩展 WinSize，避免改变 N 递归窗口）
+        // STALL 参数校验：2*StallPeriod+5 必须 <= WinSize()
         If (StallPeriod > 0) {
             If (StallPeriod * 2 + 5 > WinSize()) {
                 WLogInitE("STALL 停用: 2*StallPeriod+5=" + Text(StallPeriod * 2 + 5)
@@ -2037,7 +1905,7 @@ Events
                 StallEnabled = True;
             }
         }
-        // NR 参数校验：NrN<2 关闭（同聚宽 win>=2 守卫）；NrN>WinSize 越界关闭；NrN=0 关闭
+        // NR 参数校验：NrN<2 或 NrN>WinSize 时停用
         If (NrN > 0) {
             If (NrN < 2) {
                 WLogInitE("NR 停用: NrN=" + Text(NrN) + "（需 >=2；与聚宽 win>=2 守卫一致）");
@@ -2051,10 +1919,7 @@ Events
                 }
             }
         }
-        // 模拟/实盘校验：data0 与 data1 必须是同一主连合约（MainContSymbol），且 MapToMain=True；回测不校验。
-        // TB 公式无法直接查询"图表是否主连"，以 Symbol 与主连代码参数精确匹配判定。
-        // 不满足 → CanTradeNow 恒 False（不开新仓）；映射/换月只按 data0 是否主连 + MapToMain 下发。
-        // 判定必须先于下方 Range 内的换月/映射设置。
+        // 模拟/实盘：data0/data1 必须同为 MainContSymbol 且 MapToMain=True；回测不校验
         Bool isMainCont = False;
         Bool layerOk = False;
         MappingOk = True;
@@ -2074,9 +1939,7 @@ Events
                 MappingRecheck = True;
             }
         }
-        // 换月全套（后复权/映射真实价/自动换仓/委托映射主力）只在主连图/实盘（MapToMain=True）开启；
-        // 单合约切片图保持不复权（原始价口径）——与切片5 假突破无因果（真因=图表范围缺历史，见文件头「预热与历史深度」）
-        // 判定只依赖 data0 是否主连（Symbol 静态已知），不依赖 data1 就绪：data1 仅是只读指标源。
+        // 换月全套只在主连图/模拟/实盘（MapToMain=True）开启；单合约切片保持不复权
         Range[0:DataCount-1] {
             If (MapToMain And (StrategyMode() <> Enum_Mode_Strategy_Trade() Or isMainCont)) {
                 AddDataFlag(Enum_Data_RolloverBackWard());
@@ -2091,7 +1954,7 @@ Events
         WLogInit("data0.Symbol=" + Symbol + "(" + Frequency() + ")");
         If (DataCount() >= 2) {
             WLogInit("data1.Symbol=" + D1Sym() + "(" + D1Freq() + ")" + "（须与 data0 同合约；标准=日线，或其它周期）");
-            // 仅首屏告警；运行期强制（归 0 拒交易）由 RefreshNChannels 同合约守卫执行
+            // 仅首屏告警；运行期同合约守卫由 RefreshNChannels 执行
             If (D1Sym() <> Symbol) {
                 WLogInitE("数据源错位: data1.Symbol=" + D1Sym() + " ≠ data0.Symbol=" + Symbol + "（图层顺序/合约不符，检查图表数据源）");
             }
@@ -2164,15 +2027,13 @@ Events
             + " MapToMain=" + IIFString(MapToMain, "True(OrderMap2Main,RolloverOn)", "False(OrderMapOff,RolloverOff)"));
     }
 
-    // 新 bar 生成时驱动一次（正常历史回放与实盘均驱动；参数 indexs=本次新生成的图层数组，本公式不使用）
+    // 新 bar 生成时驱动（历史回放与实盘均驱动）
     OnBarOpen(ArrayRef<Integer> indexs) {
-        // [红线] 同 OnBar：只放 Range[0:0]——策略体只在 data0（1分钟）上下文执行一次（多图层防双跑）。
+        // [红线] 只放 Range[0:0]，避免多图层各跑一遍
         Range[0:0] {
-            // N/四通道刷新：每根新 bar 一次——实盘形成中 bar 的逐 tick OnBar 驱动不会重复重算。
-            // 刻意不做「仅 data1 新 bar 时」过滤：刷新幂等（值随 data1 头部推进才变）、边界读数最迟下根 bar 自纠。
-            // 失败（无 data1 源/合约错位/历史不足/参数越界）→ 五值归 0 拒交易，下根新 bar 自动重试；日志按交易日节流。
+            // N/四通道每根新 bar 刷新一次；失败归 0 拒交易，下根自动重试
             RefreshNChannels();
-            // 模拟/实盘实时：每根新 bar 把台账校正到账户真值（成交/换月后宽限 2 根；有挂单时跳过）
+            // 模拟/实盘实时：按账户真值对账（成交/换月后宽限 2 根）
             If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
                 SyncAcctOnNewBar();
             }
@@ -2180,20 +2041,18 @@ Events
     }
 
     OnBar(ArrayRef<Integer> indexs) {
-        // [红线] 只放 Range[0:0]：策略体只在 data0（1分钟）上下文执行一次。
-        // 若写成 Range[0:1]/[0:DataCount-1]，每个图层上下文各跑一遍 → 双跑事故。
+        // [红线] 只放 Range[0:0]：每个图层各跑一遍会导致双跑
         Range[0:0] {
             BarCnt = BarCnt + 1;
 
-            // 首 bar 再清一次挂单集合：OnInit 内的数组操作若未生效，避免上次运行的 orderId 残留致门禁死锁
+            // 首 bar 再清一次挂单集合，防上次运行 orderId 残留
             If (BarCnt == 1) {
                 PendingClear();
             }
-            // 每根 bar 用平台未成交委托列表校正挂单集合（模拟/实盘）：OnOrder 漏报终态不会永久锁死门禁
+            // 每根 bar 按平台未成交列表校正挂单集合（模拟/实盘）
             SyncPendingFromAccount();
 
-            // 实盘防呆：TradeStartDate 未到时 CanTradeNow 恒 False、静默不交易 → 首 bar 警告一次（重启复现）。
-            // 放在首 bar 而非 OnInit：YMD() 依赖 bar 上下文，OnInit 里判不了；挂上策略的第一分钟即可见。
+            // 首 bar 警告：实盘未到 TradeStartDate
             If (BarCnt == 1 And IsLiveTrade() And YMD() < TradeStartDate) {
                 WLogW("TRADE_GATE 实盘未到 TradeStartDate=" + Text(TradeStartDate) + "，不会产生交易动作");
             }
@@ -2207,11 +2066,7 @@ Events
             RefreshNrEvent();
 
             // ---- 3. STALL / NR 并行入场（先于常规海龟检查）----
-            // 回放期门禁：模拟/实盘非实时 bar 不下单（否则历史 bar 委托被拒→乐观台账→
-            // 下一 tick 清理→重试，形成 OPEN_FAIL/信号闪烁循环）。只推进 STALL/NR 基线与通道，
-            // 不调用 ManagePosition；QuoteStatus=RealTime 的首根 bar 恢复交易。回测不受影响。
-            // 两种不可交易阶段：①模拟/实盘的非实时 bar ②图表模式自动交易开（图表交易）。
-            // 账户未就绪另由 CanTradeNow 拦。
+            // 非实时 bar（历史回放）只推进基线与通道，不下单；回测不受影响。
             If (IsTradablePhase() == False) {
                 If (ReplayGateLogged == False) {
                     ReplayGateLogged = True;
@@ -2227,10 +2082,9 @@ Events
                         WLog("REALTIME_BAR QuoteStatus=" + Text(QuoteStatus()) + " 恢复交易");
                     }
                 }
-                // True=边沿命中，STALL 分支已占用（尝试开仓或挂单放弃）→ 本 bar 跳过常规检查
-                // （对齐聚宽 stall 分支的 elif）；False=无边沿/边沿已消费 → 再判 NR；NR 未处理时才走常规检查。
+                // True=边沿命中，STALL 分支已占用；否则再判 NR，最后走常规检查
                 If (TryStallEntry(True) == False) {
-                    // NR 触发/跳过/挂单暂缓时返回 True，本 bar 不再走 ManagePosition（同聚宽 return 语义）
+                    // NR 已处理（触发/跳过/挂单暂缓）→ 本 bar 不再走 ManagePosition
                     If (TryNrEntry() == False) {
                         // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
                         If (CanTradeNow()) {
@@ -2258,8 +2112,8 @@ Events
                 }
             }
 
-            // ---- 4. 每日定时日志（14:45，同聚宽 signal_time）----
-            // 回测照写；模拟/实盘仅实时（历史回放阶段不写）。
+            // ---- 4. 每日定时日志（14:45）----
+            // 回测照写；模拟/实盘仅实时
             Bool dailyLogOk = True;
             If (IsStrategyTradeMode()) {
                 dailyLogOk = (QuoteStatus() == Enum_QuoteStatus_RealTime);
@@ -2271,12 +2125,12 @@ Events
                 String pendseg = "";
                 If (DataCount() >= 2) {
                     d1s = Text(D1Close(1), 1);
-                    // d0diag 仅 DEBUG 级：经 D1Close0Diag 读 D0 禁区（回测=当天完整收盘/实盘=形成中）仅供诊断，禁入判断
+                    // d0diag 仅 DEBUG 级：读 Data1[0] 禁区仅供诊断，禁入判断
                     If (LogLevel >= 3) {
                         d0seg = " d0diag=" + Text(D1Close0Diag(), 1);
                     }
                 }
-                // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空 → 日志与 v3.1 一致）
+                // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空）
                 If (GetArraySize(PendingIds) > 0) {
                     pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr();
                 }
@@ -2303,13 +2157,7 @@ Events
                     + " d1=" + d1s + d0seg + pendseg + acctseg + nrseg);
             }
 
-            // ---- 5. 结束摘要：回测专用留痕（整段跑完的单行"期末对账"）----
-            // 本段主要为回测验收/回归对照而设：不翻全程日志，一行核对三件事——
-            //   ① 对账：pos/contracts（平台）vs lots（台账），不等=台账漂移（查 STATE_REBUILD）。
-            //   ② 收益：equity 期末权益为主指标；BarCnt=处理的1分钟bar数 → 证明整段跑完。
-            //   ③ 体检：DataCount=2（日线图层在）、N 应为合理正值、d1 日线源最新完成收盘。
-            // 触发 BarStatus()==2 = 最右末根（0=首根 / 1=中间 / 2=末根）：回测=整段最后一根，只此一次。
-            // 只在回测输出：实盘/模拟的最新 bar 天然最右，挂载后首根会命中并把初始快照误标成"运行结束"。
+            // ---- 5. 结束摘要：回测整段跑完的单行对账（只回测输出）----
             If (IsBacktestMode()) {
                 If (BarStatus() == 2 And FinalDone == False) {
                     FinalDone = True;          // 幂等守卫：只打一次，OnInit 复位
@@ -2326,11 +2174,9 @@ Events
         }
     }
 
-    // 每根 data0 bar 收盘时驱动一次（下一根 bar 开始前，末根不触发）。
-    // 逐 bar 诊断只在模拟/实盘实时行情输出：回测与历史回放不刷日志。
-    // indexs=本次驱动收盘的图层集：心跳只在含 0 时打，滤掉 data1 单独收盘的额外事件。
+    // data0 每根收盘驱动；诊断日志只在模拟/实盘实时输出
     OnBarClose(ArrayRef<Integer> indexs) {
-        // [红线] 同 OnBar：只放 Range[0:0]，避免多图层各跑一遍
+        // [红线] 只放 Range[0:0]
         Range[0:0] {
             If (IsStrategyTradeMode()) {
                 If (QuoteStatus() == Enum_QuoteStatus_RealTime) {
@@ -2344,17 +2190,11 @@ Events
     }
 
     // ==================== 回报事件 ====================
-    // 回测不触发（EventProbe 实测 0 次）；模拟盘实测回调正常（RateCheckProbe 2026-10-19：
-    // OnOrder 1(Declare)→2(Declared)→5(Filled)，OnFill 的 side/combOffset/price/fillPrice 有效）；
-    // 实盘是否回调仍由柜台决定。
-    // OnOrder 维护挂单门禁（PendingIds，每根 bar 再由 SyncPendingFromAccount 按平台列表校正），
-    // 不改台账；OnFill 仅日志，不动 PLots/PCost/StopLine（只延后账户真值对账，防读到成交前/中间态）。
-    // FillRef：volume/fillVolume/orderId 为 Integer，fillId 为 String（勿套 Text）；
-    // 后三字段模拟盘填充待实测，仅日志留痕。
+    // 回测不触发；OnOrder 维护挂单门禁，OnFill 仅日志并延后对账 2 根。
 
     OnFill(FillRef ordFill) {
         FillCnt = FillCnt + 1;
-        // 成交后 A_GetPosition 更新可能滞后：延后 2 根新 bar 再对账
+        // 成交后账户持仓可能滞后：延后 2 根新 bar 再对账
         SyncBlockBars = Max(SyncBlockBars, 2);
         WLogEvt("FILL #" + Text(FillCnt)
             + " id=" + Text(ordFill.orderId)
@@ -2407,7 +2247,6 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-TB  2026/10/17  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL 极值停滞并行入场）
+// 版本: v3.2-TB  2026/10/17  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
-// 对应前版: tbquant/05-PTrend-turtle-v3.1-TB.txt（双图层 · 无 STALL）
 //------------------------------------------------------------------------

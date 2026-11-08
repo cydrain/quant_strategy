@@ -8,7 +8,7 @@
 > 新增 **STALL 极值停滞并行入场** 与 **NR 收缩并行入场**；同时补齐模拟/实盘运行硬化：主连挂图校验、挂单门禁、
 > **历史回放期门禁**（模拟/实盘仅 `QuoteStatus()==RealTime` 可交易；图表模式开启自动交易则一律
 > 不发单）、实时 `HB`/`D1BAR` 诊断日志、OnOrder/OnFill 回报日志、`SlipTicks` 命名。
-> `StallPeriod=0` 且 `NrN=0`、`S1Skip=0` 时**回测交易逻辑**应与 v3.1 一致（回放期门禁不作用于简单回测与图表回测；
+> `StallPeriod=0` 且 `NrN=0`、`S1Skip=0` 时**回测交易逻辑**退化为无 STALL/NR 的经典海龟路径（回放期门禁不作用于简单回测与图表回测；
 > 模拟/实盘另有主连校验、挂单门禁与回放期门禁）。
 > 2026-10-27 起模拟/实盘**改走账户接口下单**（`A_Buy/A_SellShort/A_Sell/A_BuyToCover`：落地真实合约 +
 > 图价÷`Rollover()` + `RealTickSize` 取整）、**按账户持仓对账**（4 参 `A_GetPosition`）；
@@ -29,8 +29,8 @@
 | 文件 | 用途 |
 |---|---|
 | `tbquant/05-PTrend-turtle-v3.2-TB.txt` | **主策略公式**（用户应用），双图层挂载运行 |
-| `tbquant/05-PTrend-turtle-v3.1-TB.txt` | 前版（无 STALL），回归对照用 |
-| `tbquant/05-PTrend-turtle-v3.1-TB-说明.md` | 前版完整说明（回测/换月/预热细节仍适用） |
+| `tbquant/05-PTrend-turtle-v3.1-TB.txt` | 前版（无 STALL），**已废弃**，仅存档 |
+| `tbquant/05-PTrend-turtle-v3.1-TB-说明.md` | 前版说明，**已废弃**（回测/换月/预热细节可作参考） |
 | `tbquant/PTrendTurtle_MultiSrc_Probe.txt` | 双图层运行时假设探针（非交易） |
 | `tbquant/PTrendTurtle_EventProbe.txt` | 事件驱动探针（回测事件为 0 次的实测依据） |
 | `joinquant/05-PTrend-results.md` | 聚宽 v3.1/v3.2 六切片结果、STALL/NR 触发与收缩突破对照 |
@@ -166,8 +166,8 @@
 
 ### 5.3 v3.2 回测验收建议
 
-1. **NR 关闭回归**：`NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，trades/DAILY 应与 v3.1 一致
-   （仅头部参数行不同）；用于确认 NR 代码未干扰原有海龟路径。
+1. **NR 关闭回归**：`NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，trades/DAILY 应与聚宽 v3.2 同参数结果一致
+   （v3.1 已废弃，不再作为回归基准）；用于确认 NR 代码未干扰原有海龟路径。
 2. **STALL 触发日**：见第 6.3 节；单合约切片只核对信号日与方向，不要求与聚宽逐笔同价同时。
 3. **NR 触发日**：见第 6.5 节；核对 `NR_SET → NR_FIRE/NR_SKIP` 的日期、方向与触发沿，
    不要求与聚宽逐笔同价同时。
@@ -687,8 +687,8 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 - 首轮 TB 验收顺序：
   1. 跑首轮回测时检查 `data1.Symbol`、`MAPPING ok=True`、`STALL: enabled=True need=25`、
      `NR: enabled=True NrN=6`；
-  2. `NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，与 v3.1 的 trades/DAILY 对齐
-     （确认 NR 代码未干扰原海龟路径）；
+  2. `NrN=0` 且 `S1Skip=0` 跑切片 4/5/6，与聚宽 v3.2 同参数的 trades/DAILY 对齐
+     （v3.1 已废弃，不作回归基准；确认 NR 代码未干扰原海龟路径）；
   3. 跑第 6.3 节 7 个触发日（单合约切片），核对信号日/方向；触发时点应落在预期边沿 ±1 根 1m；
   4. NR：核对 `NR_SET → NR_FIRE/NR_SKIP` 的日期、方向、触发沿（样例见 6.5）；
      STALL 与 NR/突破同 bar → STALL 优先；NR 与突破同 bar → NR 优先；
