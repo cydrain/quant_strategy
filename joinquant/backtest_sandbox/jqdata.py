@@ -494,6 +494,9 @@ class PriceRelatedSlippage:
         self.value = x
 
 
+StepRelatedSlippage = PriceRelatedSlippage
+
+
 _SLIPPAGE = []
 
 # ==================== 沙盒装配（runner 调用） ====================

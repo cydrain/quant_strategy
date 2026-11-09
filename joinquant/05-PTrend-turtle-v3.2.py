@@ -714,7 +714,7 @@ def initialize(ctx):
         set_order_cost(OrderCost(open_commission=0.000023, close_commission=0.000023,
                                  close_today_commission=0.000023, open_tax=0, close_tax=0,
                                  min_commission=0), type='futures', ref=PARAMS['symbol'])
-        set_slippage(PriceRelatedSlippage(0.0003), type='futures')
+        set_slippage(StepRelatedSlippage(1), type='futures')   # 1 跳（对齐 TB SlipTicks=1）
         set_benchmark(f"{PARAMS['symbol']}9999.{PARAMS['exchange']}")
         log.set_level('order', 'error')
         log.set_level('system', 'error')
