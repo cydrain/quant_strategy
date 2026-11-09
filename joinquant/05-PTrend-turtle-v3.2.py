@@ -16,8 +16,9 @@
 #     上次交易盈利后跳过一次 NR 突破（该事件作废，等新 NR 事件再入场）。
 #   - 出场: 盘中触及"前 exit_n 根 bar 反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
-#   - 仓位: 1 unit = 账户权益 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）
-#   - 保证金占用上限: 整仓保证金 ≤ 当前权益 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
+#   - 仓位: 1 unit = 风险资金 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）；
+#     风险资金 = Min(起始资金, 当前权益)（与 TB 版同口径：盈利不放大手数，亏损按权益缩小）
+#   - 保证金占用上限: 整仓保证金 ≤ 风险资金 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
 #   - 系统1 跳过规则: 上次同类入场若盈利，则该类型跳过一次（不判方向；STALL 任何 scope 都不参与）
 #     ——参与范围由 s1_scope 决定：'breakout'（默认）仅突破盈利武装与消费；'breakout_nr' 突破与 NR
 #     各自独立；'current' 任意盈利入场都武装突破+NR。20 日突破记录被跳过价位并等通道刷新出新极值；
@@ -45,8 +46,8 @@ PARAMS = {
     'exit_n': 10,                 # 反向突破出场通道周期（系统1=10 / 系统2=20，单位=bar_freq 根）
     'stall_period': 10,           # 并行入场：连续 N 根指标周期 bar 极值停滞（未创新低/新高）→入场；0=关闭
     'nr_n': 6,                    # 并行入场：最近 nr_n 根 bar 振幅最小者（NRn）的极值突破 → 入场；0=关闭
-    'unit_risk': 0.01,            # 1 unit 风险预算（账户权益比例）
-    'margin_cap_pct': 0.10,       # 保证金占用上限（当前权益比例；0=不限，每档按剩余额度开满）
+    'unit_risk': 0.01,            # 1 unit 风险预算（风险资金比例，风险资金=Min(起始资金,当前权益)）
+    'margin_cap_pct': 0.10,       # 保证金占用上限（风险资金比例；0=不限，每档按剩余额度开满）
     'max_units': 4,               # 最大 unit 数（含首仓）
     'add_step_n': 0.5,            # 顺向每 N×该值 加 1 unit
     'stop_dist_n': 2.0,           # 初始/加仓后止损距离（N 倍数）
@@ -109,8 +110,13 @@ def fit_lots_to_margin(lots, price, multiplier, margin_rate, available_cash):
     return min(lots, int(available_cash / margin_per_lot))
 
 
+def risk_capital(ctx):
+    """风险资金 = Min(起始资金, 当前权益)：盈利不放大手数，亏损按权益缩小（与 TB 版同口径）"""
+    return min(ctx.portfolio.starting_cash, ctx.portfolio.total_value)
+
+
 def fit_lots_to_cap(ctx, lots, price):
-    """保证金占用上限（当前权益 × margin_cap_pct）：按剩余额度限手；0 = 不限"""
+    """保证金占用上限（风险资金 × margin_cap_pct）：按剩余额度限手；0 = 不限"""
     p = g.params
     if p['margin_cap_pct'] <= 0:
         return lots
@@ -119,17 +125,17 @@ def fit_lots_to_cap(ctx, lots, price):
         return lots
     # 已有持仓按当前价计保证金（price 即当前价，与平台逐日盯市口径一致）
     used = sum(l['lots'] for l in g.legs) * margin_per_lot
-    room = ctx.portfolio.total_value * p['margin_cap_pct'] - used
+    room = risk_capital(ctx) * p['margin_cap_pct'] - used
     return min(lots, int(room / margin_per_lot))
 
 
 def unit_lots(ctx, n_val):
-    """经典 unit 手数：权益 × unit_risk ÷ (N × 乘数)，向下取整（最低 1 手）"""
+    """经典 unit 手数：风险资金 × unit_risk ÷ (N × 乘数)，向下取整（最低 1 手）"""
     p = g.params
     denom = n_val * p['multiplier']
     if denom <= 0:
         return 1
-    return max(1, int(ctx.portfolio.total_value * p['unit_risk'] / denom))
+    return max(1, int(risk_capital(ctx) * p['unit_risk'] / denom))
 
 # ==================== 平台取数 ====================
 
