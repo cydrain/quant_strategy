@@ -4,6 +4,7 @@
 让 joinquant/ 下的策略文件**不做任何修改**即可在本地逐分钟回放。
 
 - 数据来源：local_data/ 目录（研究环境导出的 daily_*.csv / min1_*.csv / dominant.csv / trade_days.csv）
+  首次解析后缓存为 <data_root>/.sandbox_cache.npz，按 CSV 列表/大小/mtime 及 pandas/numpy 版本自动失效
 - 撮合模型（拟合自聚宽回测日志 27/27 成交样本）：
     买入成交价 = 当前分钟 bar 收盘价；卖出成交价 = 当前分钟 bar 收盘价 − 一个最小变动价位(tick)
 - 账户模型（对账验证）：权益 = 起始资金 + Σ已实现盈亏 − Σ手续费 + Σ浮动盈亏
@@ -13,7 +14,9 @@
 import bisect
 import datetime as dt
 import glob
+import json
 import os
+import sys
 
 import numpy as np
 import pandas as pd
@@ -70,20 +73,37 @@ log = _Logger()
 
 
 class _DataStore:
+    _CACHE_VERSION = 1
+
     def __init__(self, root):
         self.root = root
+        self.daily = {}
+        self.minute = {}
+        self.labels = set()
+        self._rh_cache = {}           # resampled_hist 缓存：(base, 周期, count, fields, 最后完成桶) -> 已完成聚合结果
+        self._daily_dates = {}        # 每合约日线交易日数组（datetime64[D]，升序，供二分定位截止日）
+        self._daily_hist_cache = {}   # attribute_history 1d 缓存：(base, 截止交易日, count, fields) -> 结果（只读）
+        self._lp_cache = {}           # last_price 缓存：(base, 时刻) -> 价格（同一事件内估值/成交复用）
+
+        cache_path = os.path.join(root, '.sandbox_cache.npz')
+        fp_json = json.dumps([self._CACHE_VERSION, pd.__version__, np.__version__,
+                              self._fingerprint(root)])
+        loaded = self._load_cache(cache_path, fp_json)
+        if loaded is not None:
+            for k, v in loaded.items():
+                setattr(self, k, v)
+            return
+
         td = pd.read_csv(os.path.join(root, 'trade_days.csv'))
         self.trade_days = [d.date() for d in pd.to_datetime(td['date'])]
         dm = pd.read_csv(os.path.join(root, 'dominant.csv'))
         self.dominant_map = {d.date(): c for d, c in zip(pd.to_datetime(dm['date']), dm['dominant'])}
-        self.daily = {}
-        self.minute = {}
-        self.labels = set()
-        self._rh_cache = {}   # resampled_hist 缓存：(base, 周期, count, fields, 最后完成桶) -> 已完成聚合结果
         for f in sorted(glob.glob(os.path.join(root, 'daily_*.csv'))):
             base = os.path.basename(f)[len('daily_'):-len('.csv')]
             df = pd.read_csv(f, index_col=0, parse_dates=True)
-            self.daily[base] = df[~df['close'].isna()]
+            df = df[~df['close'].isna()]
+            self.daily[base] = df
+            self._daily_dates[base] = df.index.values.astype('datetime64[D]')
         for f in sorted(glob.glob(os.path.join(root, 'min1_*.csv'))):
             base = os.path.basename(f)[len('min1_'):-len('.csv')]
             df = pd.read_csv(f, index_col=0, parse_dates=True)
@@ -94,7 +114,72 @@ class _DataStore:
                 'low': df['low'].values.astype(float),
                 'close': df['close'].values.astype(float),
             }
-            self.labels.update(df.index.strftime('%H:%M').unique())
+            # 分钟标签只用于 _session_grid：先取分钟数做 unique，再格式化少数唯一值（避免全索引 strftime）
+            tod = df.index.values.astype('datetime64[m]').astype(np.int64) % 1440
+            for m in np.unique(tod):
+                self.labels.add(f'{m // 60:02d}:{m % 60:02d}')
+
+        self._write_cache(cache_path, fp_json)
+
+    @staticmethod
+    def _fingerprint(root):
+        items = []
+        for pat in ('daily_*.csv', 'min1_*.csv', 'dominant.csv', 'trade_days.csv'):
+            for f in sorted(glob.glob(os.path.join(root, pat))):
+                st = os.stat(f)
+                items.append((os.path.basename(f), st.st_size, int(st.st_mtime_ns)))
+        return items
+
+    @staticmethod
+    def _load_cache(path, fp_json):
+        """npz 缓存（allow_pickle=False）：仅缓存 CSV 解析结果，避免每次启动重复 read_csv"""
+        try:
+            z = np.load(path, allow_pickle=False)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            print(f'[sandbox] data cache unreadable ({e.__class__.__name__}), rebuilding', file=sys.stderr)
+            return None
+        with z:
+            try:
+                meta = json.loads(str(z['meta']))
+                if meta['fp'] != fp_json:
+                    return None
+                daily = {}
+                daily_dates = {}
+                for base, cols in meta['daily'].items():
+                    idx = pd.to_datetime(z[f'd|{base}|index'])
+                    daily[base] = pd.DataFrame({c: z[f'd|{base}|{c}'] for c in cols}, index=idx)
+                    daily_dates[base] = idx.values.astype('datetime64[D]')
+                minute = {base: {k: z[f'm|{base}|{k}'] for k in ('ts', 'open', 'high', 'low', 'close')}
+                          for base in meta['minute']}
+                return {'trade_days': [dt.date.fromisoformat(s) for s in meta['trade_days']],
+                        'dominant_map': {dt.date.fromisoformat(k): v for k, v in meta['dominant']},
+                        'daily': daily, '_daily_dates': daily_dates,
+                        'minute': minute, 'labels': set(meta['labels'])}
+            except Exception as e:
+                print(f'[sandbox] data cache invalid ({e.__class__.__name__}), rebuilding', file=sys.stderr)
+                return None
+
+    def _write_cache(self, path, fp_json):
+        try:
+            meta = {'fp': fp_json,
+                    'trade_days': [d.isoformat() for d in self.trade_days],
+                    'dominant': [[d.isoformat(), c] for d, c in sorted(self.dominant_map.items())],
+                    'labels': sorted(self.labels),
+                    'daily': {b: list(df.columns) for b, df in self.daily.items()},
+                    'minute': sorted(self.minute)}
+            arrays = {'meta': np.array(json.dumps(meta))}
+            for base, df in self.daily.items():
+                arrays[f'd|{base}|index'] = df.index.values.astype('datetime64[ns]').astype(np.int64)
+                for c in df.columns:
+                    arrays[f'd|{base}|{c}'] = df[c].to_numpy()
+            for base, m in self.minute.items():
+                for k, v in m.items():
+                    arrays[f'm|{base}|{k}'] = v
+            np.savez(path, **arrays)
+        except OSError as e:
+            print(f'[sandbox] data cache not writable ({e}), continuing without cache', file=sys.stderr)
 
     @staticmethod
     def base(sec):
@@ -109,14 +194,25 @@ class _DataStore:
         return {k: v[j:i] for k, v in m.items()}
 
     def last_price(self, sec, t):
-        sl = self.minute_slice(sec, t, 1)
-        if sl is not None and len(sl['close']):
-            return float(sl['close'][-1])
-        df = self.daily.get(self.base(sec))
-        if df is None:
-            return None
-        sub = df[df.index <= pd.Timestamp(t)]
-        return float(sub['close'].iloc[-1]) if len(sub) else None
+        base = self.base(sec)
+        key = (base, pd.Timestamp(t))
+        if key in self._lp_cache:
+            return self._lp_cache[key]
+        m = self.minute.get(base)
+        val = None
+        if m is not None:
+            i = int(np.searchsorted(m['ts'], np.datetime64(key[1]), side='right'))
+            if i:
+                val = float(m['close'][i - 1])
+        if val is None:
+            df = self.daily.get(base)
+            if df is not None:
+                sub = df[df.index <= key[1]]
+                val = float(sub['close'].iloc[-1]) if len(sub) else None
+        if len(self._lp_cache) >= 16:
+            self._lp_cache.clear()
+        self._lp_cache[key] = val
+        return val
 
     def _trading_day(self, t):
         """t 所属交易日：夜盘（21:00 起）属于下一交易日，日盘属于当日"""
@@ -129,12 +225,15 @@ class _DataStore:
         return t.date()
 
     def daily_hist(self, sec, t, count):
-        df = self.daily.get(self.base(sec))
+        base = self.base(sec)
+        df = self.daily.get(base)
         if df is None:
             return pd.DataFrame()
-        # 排除当前交易日正在形成的日线（日线索引=交易日）：
-        # 夜盘属于下一交易日，当日 15:00 已完成的日线可见；不能按日历日排除
-        return df[df.index.date < self._trading_day(t)].tail(count)
+        # 排除当前交易日正在形成的日线（日线索引=交易日；夜盘属于下一交易日，当日 15:00 已完成的日线可见）：
+        # 用预计算交易日数组二分，避免每根分钟 bar 对全帧做 df.index.date 掩码
+        cutoff = self._trading_day(t)
+        i = int(np.searchsorted(self._daily_dates[base], np.datetime64(cutoff), side='left'))
+        return df.iloc[max(0, i - count):i]
 
     # 会话区间（分钟标签 = bar 结束分钟：09:01..11:30 / 13:31..15:00 / 21:01..23:00）
     _SESSIONS = ((9 * 60, 11 * 60 + 30), (13 * 60 + 30, 15 * 60), (21 * 60, 23 * 60))
@@ -349,14 +448,25 @@ class _Portfolio:
 def attribute_history(security, count, unit='1d', fields=('open', 'close', 'high', 'low', 'volume', 'money'),
                       skip_paused=True, df=True, fq='pre'):
     """日线：截至当前日期前一个交易日的最近 count 根（不含当日）；
-    盘中周期 `Nm`（15m/30m/60m 等，任意分钟数）：由分钟数据聚合，仅含已完成 bar"""
+    盘中周期 `Nm`（15m/30m/60m 等，任意分钟数）：由分钟数据聚合，仅含已完成 bar。
+    日线结果按（合约, 截止交易日, count, fields）缓存：同一交易日截面内重复调用直接复用
+    （日线只在 21:00 夜盘开盘可见，分钟级重复取数无需重建 DataFrame；返回帧只读，调用方不得修改）"""
     if len(unit) > 1 and unit[-1] == 'm' and unit[:-1].isdigit():
         period_min = int(unit[:-1])
         return _store.resampled_hist(security, context.current_dt, count, period_min, list(fields))
     if unit != '1d':
         raise NotImplementedError(f'attribute_history unit={unit} 未实现（策略仅用 1d 与 Nm 盘中周期）')
+    base = _store.base(security)
+    key = (base, _store._trading_day(context.current_dt), count, tuple(fields))
+    cached = _store._daily_hist_cache.get(key)
+    if cached is not None:
+        return cached
     sub = _store.daily_hist(security, context.current_dt, count)
-    return sub[list(fields)].copy()
+    out = sub[list(fields)].copy()
+    if len(_store._daily_hist_cache) >= 512:   # 上限仅防多品种/多参数组合膨胀
+        _store._daily_hist_cache.clear()
+    _store._daily_hist_cache[key] = out
+    return out
 
 
 def get_bars(security, count, unit='1m', fields=None, include_now=False, end_dt=None,
@@ -379,7 +489,10 @@ def get_bars(security, count, unit='1m', fields=None, include_now=False, end_dt=
             cols.append(np.zeros(len(sl['ts'])))
         else:
             raise NotImplementedError(f'get_bars field={f} 未实现')
-    return np.rec.fromarrays(cols, names=list(fields))
+    out = np.empty(len(cols[0]), dtype=[(f, c.dtype) for f, c in zip(fields, cols)])
+    for f, c in zip(fields, cols):
+        out[f] = c
+    return out
 
 
 class _SecData:
