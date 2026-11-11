@@ -24,7 +24,14 @@
 > 2026-11-11 **v3.2-20261111 挂单集合跨日清理**：日盘收盘（15:00 回调）清空本地挂单集合
 > （`PEND_DAYCLOSE`）；对账宽限 `SyncBlockBars` 随 bar 无条件老化；`OnBarOpen` 改为先
 > `SyncPendingFromAccount` 后对账。修复陈旧 orderId 跨日冻结对账（11-10 事故：09:03 才 `STATE_REBUILD`）。
-> 门禁分级（平仓不受挂单阻塞）与超时撤单/残量重报属于后续治理版本，本次未做。
+> 开仓超时撤单/残量重报属于后续治理版本，本次未做。
+> 2026-11-11 **v3.2-20261111-2156 开仓委托定价缓冲**：新增 `OrderBufTicks`（默认 2 跳）；模拟/实盘
+> 开仓/加仓委托按方向让价（买 +N 跳、卖 −N 跳），提高盘口跳动/部分成交时的成交率（11-10 挂 9 成交 4 事故）；
+> 平仓/止损不加缓冲；回测/图表回测不生效。日志关键字 `ORDER_BUF`。
+> 2026-11-11 **v3.2-20261111-2222 挂单门禁分级**：开仓/加仓仍被任何未完成委托阻塞；平仓/止损
+> 只被平仓未完成委托挡（`ClosePendIds` 防重复平仓），发送前先逐笔 `A_DeleteOrderEx` 撤掉残余开仓单
+> （`EMERG_CANCEL`，不用账户级全撤），随后本 bar 照发平仓；平仓无委托号冷却 2 根（`CLOSE_NO_ID`）。
+> 修复 11-10 事故暴露的“开仓挂单卡住 → 止损发不出去”。
 
 ---
 
@@ -54,10 +61,11 @@
 | `MapToMain` 默认值 | False | **True**（模拟/实盘安全口径；单合约切片回测必须显式改 False） |
 | `MainContSymbol` | 无 | 新增，默认 `p9888.DCE` |
 | 模拟/实盘挂图校验 | 无 | data0/data1 必须同一主连 + `MapToMain=True`，否则禁止开新仓 |
-| 挂单门禁 | 无 | OnOrder 未完成委托集合非空时拒发任何新委托；每根 bar 按平台未成交列表校正集合（`PEND_SYNC`），日盘收盘清空（`PEND_DAYCLOSE`），回调漏报不会永久锁死 |
+| 挂单门禁 | 无 | **分级（v3.2-20261111-2222）**：开仓/加仓遇任何未完成委托拒发；平仓/止损只被平仓挂单挡（防重复），发送前逐笔撤残余开仓单（`EMERG_CANCEL`）；每根 bar 按平台未成交列表校正集合（`PEND_SYNC`），日盘收盘两集合一起清空（`PEND_DAYCLOSE`），回调漏报不会永久锁死 |
 | 模拟/实盘下单通道 | 图表下单接口（`Buy/SellShort/Sell/BuyToCover`） | **账户接口 `A_*`**：落地真实合约 + 真实价（图价÷`Rollover()`，按 `RealTickSize` 取整）；不进平台 bar 信号统计 → 不再信号闪烁 |
 | 持仓口径 | 图表口径（映射后读不到真实仓） | 模拟/实盘以**账户真值**为准：每根实时新 bar 4 参 `A_GetPosition` 对账，不符即 `STATE_REBUILD src=acct` |
 | `RealTickSize` | 无 | 新增，默认 **1**（p=1、ru=5、ag=1，按合约手填）；真实委托价取整用 |
+| 开仓定价缓冲 | 无 | 新增 `OrderBufTicks`（默认 **2** 跳）：模拟/实盘开仓/加仓按方向让价（买 +、卖 −，叠加在盘口价取整后）；平仓/止损不加；回测不生效 |
 | 历史回放期门禁 | 无 | 模拟/实盘启动回放阶段只更新 STALL/NR 事件与 N/通道，`QuoteStatus()<>RealTime` 期间不下单；图表模式开启自动交易（图表交易）一律不发单；简单回测/图表回测不生效 |
 | 实时诊断日志 | 无 | 模拟/实盘实时行情：data0 每根 `HB` 心跳、data1 每根 `D1BAR` 完整行；回测/历史回放不输出 |
 | 回报日志 | 无 | `ORDER`/`FILL`/`ORDER_SEND`/`ORDER_GATE`/`PEND_ADD`/`PEND_DEL`/`EXIT` |
@@ -73,10 +81,10 @@
 | data1 | 同合约日线（标准） | 同合约日线（标准） | 同合约日线（标准） |
 | MapToMain | 主连图 True / 单合约切片 False | **必须 True** | **必须 True** |
 | 委托通道 | `Buy/SellShort/Sell/BuyToCover`（图表信号） | `A_Buy/A_SellShort/A_Sell/A_BuyToCover`（账户接口，落地真实合约） | 同模拟 |
-| 下单价 | 触发价；跳空越过时按开盘价 | 盘口对手价（买吃卖一、卖吃买一）÷`Rollover()`，按 `RealTickSize` 取整（买上卖下）；盘口无效回退触发价 | 同模拟 |
+| 下单价 | 触发价；跳空越过时按开盘价 | 盘口对手价（买吃卖一、卖吃买一）÷`Rollover()`，按 `RealTickSize` 取整（买上卖下），开仓/加仓再加 `OrderBufTicks` 跳缓冲（买+/卖−）；盘口无效回退触发价 | 同模拟 |
 | 持仓口径 | 图表口径 | 账户真值（4 参 `A_GetPosition`，每根实时新 bar 对账） | 同模拟 |
 | 资金口径 | 风险基数 `Min(InitCapital, Portfolio_CurrentEquity)`；保证金 `Portfolio_CurrentCapital` | 风险基数 `Min(InitCapital, A_CurrentEquity)`；保证金 `A_FreeMargin` | 同模拟 |
-| 挂单门禁 | 不生效（事件不回调） | 生效（OnOrder） | 生效（OnOrder） |
+| 挂单门禁 | 不生效（事件不回调） | 生效（OnOrder；平仓已与开仓分级） | 生效（OnOrder；平仓已与开仓分级） |
 | 历史回放期 | 无此阶段，正常执行 | 只更新 STALL/NR 事件与 N/通道，不下单（`REPLAY_GATE`）；`QuoteStatus=RealTime` 后恢复（`REALTIME_BAR`） | 同模拟（实盘未验证 QuoteStatus 行为） |
 | 换月 | 主连图后复权；单合约图无 | 平台原生自动换仓 + 委托映射主力（换月后延 2 根按账户重建） | 同模拟 |
 
@@ -147,8 +155,8 @@
 6. 回测设置：初始资金 100 万；保证金/手续费/滑点由 OnInit 设置（12% / 0.000023 按金额 / 1 跳）。
    `SetMarginRate/SetCommissionRate/SetSlippage` 显示 False 属正常，设置仍生效。
 7. 跑完读回测报告与日志。
-   回测/图表回测仍走图表下单接口（`Buy/SellShort/Sell/BuyToCover`），`RealTickSize` 不参与回测撮合
-   （回测滑点用 `SlipTicks`）；账户接口与账户对账只在模拟/实盘生效。
+   回测/图表回测仍走图表下单接口（`Buy/SellShort/Sell/BuyToCover`），`RealTickSize`/`OrderBufTicks`
+   不参与回测撮合（回测滑点用 `SlipTicks`）；账户接口与账户对账只在模拟/实盘生效。
 
 ### 5.2 六切片参数与聚宽基准
 
@@ -278,7 +286,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
    - `参数C: ... RealTickSize=1`（按合约核对：p=1 / ru=5 / ag=1）；
    - `STALL: enabled=True StallPeriod=10 win=61 need=25 data1周期=1d`；
    - `NR: enabled=True NrN=6 win=61 data1周期=1d`；
-   - `参数B: ... S1Skip=1 S1Scope=breakout`（跳过口径：默认仅 20 日突破参与）；
+   - `参数B: ... S1Skip=1 S1Scope=breakout OrderBufTicks=2`（跳过口径：默认仅 20 日突破参与；开仓缓冲 2 跳）；
    - `IsLiveTrade=True`。
 5. **启动回放**：平台先回放历史 bar，此时 `QuoteStatus()<>RealTime`，处于**历史回放期门禁**：
    只推进 STALL/NR 基线、N/四通道，不调用 `ManagePosition`（不开仓/不止损/不重试），首条记
@@ -291,6 +299,8 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
    - `ORDER_SEND via=acct reason=... sym=落地合约 dir=... close=... lots=... pxReal=... pxChart=...
      rollover=... ids=1 ok=True`：`pxReal ≈ pxChart / rollover`，且是 `RealTickSize` 的整数倍；
      `ids` 为平台返回的委托号个数；
+   - 开仓/加仓在 `ORDER_SEND` 前多一条 `ORDER_BUF reason=... sym=... dir=... base=... buf=2 px=...`
+     （`px = base ± OrderBufTicks×RealTickSize`）；平仓/止损无此行；
    - 账户接口返回 ids 时，委托号在发出后即登记入挂单集合（`ORDER` 首行因此不一定带 `PEND_ADD`）；
      成交/撤单的终态行带 `PEND_DEL`、`pending=0`；
    - 成交时 `FILL id=... fillId=...` 可与账户成交记录对应，`fillVol`/方向/价格与 `OPEN`/`CLOSE` 行能对上；
@@ -305,29 +315,39 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 ### 7.1 挂单门禁规则与限制
 
 - OnOrder 收到 `Declare/Declared/FillPart/Canceling` → 加入未完成集合（账户接口返回的 ids 已在
-  `ORDER_SEND` 时登记，OnOrder 首条通常不再新增）；
-- 收到 `Filled/Canceled/Deleted`（或未知状态）→ 移出集合；
+  `ORDER_SEND` 时登记，OnOrder 首条通常不再新增）；平仓单同时登记到 `ClosePendIds`；
+- 收到 `Filled/Canceled/Deleted`（或未知状态）→ 同时移出两个集合；
 - **每根 bar 校正**：模拟/实盘调用 `SyncPendingFromAccount()`，用
   `A_GetUnFillOrderIDs(委托落地合约, ids)` 按平台未成交列表重建集合，变化时记 `PEND_SYNC`；
   查询失败保持原集合不动并记 `PEND_SYNC_FAIL`（每日首条）。OnOrder 漏报终态不会再永久锁死；
   自 v3.2-20261111 起在 `OnBarOpen` **先同步、后对账**（旧挂单残留不再阻塞开盘首根对账）；
-- **日盘收盘清空（v3.2-20261111）**：最后一根 data0 bar（14:59，收盘回调 15:00）清空本地集合
+- **日盘收盘清空（v3.2-20261111）**：最后一根 data0 bar（14:59，收盘回调 15:00）清空本地两个集合
   （`PEND_DAYCLOSE`，非空时每交易日一条）。当日委托 15:00 全部失效，清空不会误删活单；夜盘/次日
   开盘首根仍按平台真值重建。此前若当日无夜盘运行，陈旧 orderId 会跨日冻结对账（11-10 事故：
   09:03 才 `STATE_REBUILD`）；
-- 集合非空时 `DoSendOrder` **拒绝任何新委托**，包括止损/反向突破平仓/加仓（门禁分级属后续版本）；
+- **门禁分级（v3.2-20261111-2222）**：
+  - 开仓/加仓：`PendingIds` 非空 → 禁发（原规则不变，`ORDER_GATE` 每交易日首条）；
+  - 平仓/止损：只被 `ClosePendIds` 或 `CloseNoIdBars` 挡（`CLOSE_GATE`，防重复平仓）；发送前先
+    `CancelEntryPending()` 逐笔 `A_DeleteOrderEx` 撤掉残余开仓单（`EMERG_CANCEL`，跳过平仓单；
+    不用账户级全撤 `A_DeleteAccountOrder`），随后本 bar 照发平仓；
+  - 平仓成交成功但拿不到委托号（`CLOSE_NO_ID`）→ 冷却 2 根不重复平仓；平仓单集合连续 2 根
+    新 bar 的同步都不在平台未成交列表 → 判陈旧清空（`CLOSE_PEND_STALE`，只在 OnBarOpen 判定，
+    逐 tick 会误杀刚发出的平仓单），防撤单/成交漏回调卡死；
+  - `CLOSE_CLAMP`：平仓手数始终按账户同向持仓收敛，撤单/成交竞态下不会超量反手；
 - 回测/图表不调用同步 → 集合恒空，门禁不生效；
-- **只拦不撤**：仍没有撤单、超时重报或残量补报。真·未成交的委托会一直占着门禁（平台列表里仍在），
-  需人工/柜台撤单；但不会因漏回调而永久锁死，也不会跨日残留；
-- 启动前已经在场的委托：首 bar `PendingClear` 后立即按平台列表重建，真实未成交委托会重新入集合；
+- **开仓仍只拦不撤**：开仓单没有撤单、超时重报或残量补报（属后续治理版本）。真·未成交的开仓单
+  会一直占开仓门禁（平台列表里仍在），要等下一笔平仓触发 `EMERG_CANCEL` 或日盘收盘清空；
+  不会因漏回调而永久锁死，也不会跨日残留；
+- 启动前已经在场的委托：首 bar 清空本地集合（`MyArrayClear`）后立即按平台列表重建，真实未成交委托会重新入集合；
   旧委托若随后成交由 `STATE_REBUILD` 按平台持仓自愈；
 - 模拟盘已实测回调（RateCheckProbe 2026-10-19）；同步查询已实测双向闭环（2026-10-26，
   ag2612 挂单入集合 / 撤单出集合）；若实盘柜台完全不回调，门禁 fail-open
   （不会死锁），但也没有保护；
 - 查询合约取“委托落地合约”（层映射首个 → `MainSymbol()` → 图表合约），必须与真实挂单合约一致；
   `MappingOk=False` 时委托映射不启用，同步可能查空（策略本身也被拦住，不会重复下单）；
-- 因此：**PEND_SYNC 已在模拟验证；实盘前仍须验证 PEND_ADD/PEND_DEL 全链路与实盘柜台查询；
-  未成交单需人工撤单。**
+- 因此：**PEND_SYNC 已在模拟验证；实盘前仍须验证 PEND_ADD/PEND_DEL 全链路与实盘柜台查询，
+  以及 `A_DeleteOrderEx` 实盘撤单（v3.2-20261111-2222 新增）；未成交的开仓单需人工撤单或等
+  平仓/日盘收盘清理。**
 - 与账户对账的关系：有未完成委托时跳过对账（`ACCT_SYNC skip pending`）；宽限计数
   `SyncBlockBars` 自 v3.2-20261111 起**随每根 bar 无条件递减**（挂单期间也老化），不会再被挂单冻结跨日；
   `ORDER_NO_ID`（成交成功但无委托号）会延后对账 2 根，防止“台账先归零、随后又重建”。
@@ -335,8 +355,9 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 
 ### 7.2 已知风险（按严重度）
 
-1. 门禁连止损一起拦，且无撤单/超时 —— 实盘最大风险；2026-10-26 起每根 bar 按平台未成交
-   列表校正，回调漏报不再永久死锁，但真·未成交委托仍会占门禁；
+1. 开仓侧无撤单/超时：真·未成交的开仓单会一直占开仓门禁（平仓自 v3.2-20261111-2222 起已
+   分级绕开并应急撤残余开仓单；开仓侧超时撤单/残量重报属后续版本）。2026-10-26 起每根 bar
+   按平台未成交列表校正，回调漏报不再永久死锁；
 2. OnOrder/OnFill 回测确认不回调（EventProbe）；模拟盘已由 RateCheckProbe 实测回调正常
    （2026-10-19，p2701，Declare→Declared→Filled + OnFill 基础字段有效）；实盘柜台是否回调仍未验证；
 3. 台账是“发送即记账”的乐观台账：模拟/实盘每根实时新 bar 用账户真值对账校正（成交后/换月后
@@ -490,6 +511,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | CommissionRateP | 0.000023 | 手续费率（按成交金额） |
 | SlipTicks | 1 | 回测撮合滑点（跳；P 一跳=1 元/吨，ru=5、ag=1）；模拟/实盘实际滑点由盘口/柜台决定 |
 | RealTickSize | 1 | 落地真实合约最小变动价，真实委托价取整用；**按合约手填**：p=1（2026-04-10 起）、ru=5、ag=1。主连图 `MinMove` 不可信（p9888=1） |
+| OrderBufTicks | 2 | 开仓/加仓委托定价缓冲（真实跳数）：盘口价按 `RealTickSize` 取整后，买 `+N` 跳、卖 `−N` 跳；提高盘口跳动/部分成交时的成交率。平仓/止损不加；0=关闭；回测/图表回测不生效 |
 | MapToMain | True | True=主连/模拟/实盘（换月全套+委托映射主力）；False=单合约切片（不复权、不映射） |
 | MainContSymbol | p9888.DCE | 模拟/实盘唯一允许的主连合约；须与日志 data0.Symbol 完全一致 |
 | LogLevel | 2 | 日志阈值：0=仅ERROR 1=+WARNING 2=+INFO 3=+DEBUG |
@@ -528,6 +550,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | `ORDER` / `FILL` | OnOrder/OnFill 回报；`FILL` 含 `id`/`fillId`/`fillVol`（模拟/实盘；回测不触发） |
 | `ORDER_CH` | OnInit：本次运行的下单通道（模拟/实盘=`A_*` 账户接口；回测=图表信号） |
 | `ORDER_SEND` | 委托已发出（模拟/实盘 `via=acct`：`reason/sym/dir/close/lots/pxReal/pxChart/rollover/ids/ok`；回测无此行） |
+| `ORDER_BUF` | 开仓/加仓委托加定价缓冲（`reason/sym/dir/base/buf/px`；`px = base ± buf×RealTickSize`；平仓/止损无此行） |
 | `ORDER_REJECT` | 账户接口返回失败（价/量/权限等），下一 bar 按逻辑重试 |
 | `ORDER_NO_ID` | 成交成功但平台未返回委托号：挂单门禁无法登记，延后对账 2 根 |
 | `CLOSE_CLAMP` | 平仓手数按账户同向持仓收敛（台账手数多于账户时） |
@@ -537,8 +560,12 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | `PEND_ADD` / `PEND_DEL` | `ORDER` 行后缀：未完成委托集合增加/移除（账户接口返回 ids 的委托已提前登记，首行可能无 `PEND_ADD`） |
 | `PEND_SYNC` | 按平台未成交列表校正挂单集合（集合变化时一条：`before=[...] after=[...]`；v3.2-20261111 起每根 bar 在 OnBarOpen 先于对账执行一次） |
 | `PEND_SYNC_FAIL` | 未成交委托查询失败，沿用本地集合（每交易日首条） |
-| `PEND_DAYCLOSE` | 日盘收盘（15:00 回调）清空本地挂单集合（当日委托已全部失效；集合非空时每交易日一条） |
-| `ORDER_GATE` | 有未完成委托，拒发新单（按交易日首条） |
+| `PEND_DAYCLOSE` | 日盘收盘（15:00 回调）清空本地两个挂单集合（当日委托已全部失效；任一集合非空时每交易日一条，附 `closeIds`） |
+| `ORDER_GATE` | 有未完成委托，拒发开仓/加仓（按交易日首条；平仓/止损不受此门禁） |
+| `EMERG_CANCEL` | 平仓发送前应急撤掉残余开仓单（逐笔 `A_DeleteOrderEx`，跳过平仓单；不用账户级全撤） |
+| `CLOSE_GATE` | 平仓单未完成或平仓无委托号冷却中，暂缓重复平仓（按交易日首条，附 closeIds/noIdBars） |
+| `CLOSE_NO_ID` | 平仓成交成功但无委托号：冷却 2 根不重复平仓 |
+| `CLOSE_PEND_STALE` | 平仓单集合连续 2 根新 bar 同步均不在平台未成交列表 → 判陈旧并清空（防漏回调卡死） |
 | `REPLAY_GATE` | 进入不可交易阶段（模拟/实盘 `QuoteStatus<>RealTime`；图表模式已开自动交易）：只更新通道/STALL/NR 基线，不下单（每次启动首次进入时一条） |
 | `REALTIME_BAR` | `QuoteStatus=RealTime` 的首根 bar = 门禁解除、恢复交易（每次启动首次实时时一条） |
 | `ACCT_NOT_READY` | 交易模式但账户数据未就绪，暂停委托（每交易日首条） |
@@ -617,12 +644,33 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 
 ## 12. 验证状态
 
+- **2026-11-11（v3.2-20261111-2222 挂单门禁分级，未验证）**：开仓/加仓仍被任何未完成委托阻塞；
+  平仓/止损只被 `ClosePendIds`/`CloseNoIdBars` 挡，发送前逐笔 `A_DeleteOrderEx` 撤残余开仓单
+  （`EMERG_CANCEL`）；平仓无委托号冷却 2 根（`CLOSE_NO_ID`）；陈旧平仓单连续 2 根新 bar 后清空
+  （`CLOSE_PEND_STALE`）。**TB 编译通过（2026-11-11）；尚未模拟验证**。验证要点：
+  a) 开仓挂单未成交时触发止损/反向出场 → 先出现 `EMERG_CANCEL`（残余开仓单被撤）→ 随后
+  `ORDER_SEND ... close=True ok=True`，不被 `ORDER_GATE` 拦住；平仓后平台无残余开仓委托；
+  b) 平仓单尚未完成时再次触发平仓 → 被 `CLOSE_GATE` 挡住，不重复发平仓单（不再重复平仓）；
+  c) 开仓遇未完成委托 → 仍 `ORDER_GATE` 拒发（分级未放宽开仓侧）；
+  d) 本公式首次使用 `A_DeleteOrderEx`（返回 Bool，probe 见 Temp 目录 `PTrendTurtle_CancelProbe.txt`），
+  编译通过后先确认模拟撤单生效、且其它策略委托不受影响（未用 `A_DeleteAccountOrder`）；
+  e) 回测/图表路径无 `ClosePendIds`/`EMERG_CANCEL` 日志，成交与止损行为不变；
+  f) 通用数组工具 `MyArray*` 首次以 `ArrayRef<Numeric>` 作函数参数（v3.0 `PushRing` 有先例），
+  编译报错时优先看这 5 个函数（:668-714）。
+
+- **2026-11-11（v3.2-20261111-2156 开仓定价缓冲，未验证）**：新增 `OrderBufTicks=2`，模拟/实盘开仓/加仓
+  委托价 = 盘口价÷`Rollover()` 按 `RealTickSize` 取整后，买 +2 跳 / 卖 −2 跳；平仓/止损不加；回测不生效。
+  **TB 编译通过（2026-11-11）；尚未模拟验证**。验证要点：
+  a) 开仓/加仓 `ORDER_SEND` 前有 `ORDER_BUF ... base=... buf=2 px=...`，且 `px − base = ±2×RealTickSize`；
+  b) `FILL` 成交价买不高于、卖不低于 `pxReal`；台账均价随后按账户真值对齐；
+  c) 平仓/止损 `ORDER_SEND` 无 `ORDER_BUF` 行，`pxReal` 与此前一致。
+
 - **2026-11-11（v3.2-20261111 挂单集合跨日清理，未验证）**：日盘收盘清空挂单集合（`PEND_DAYCLOSE`）、
   宽限 `SyncBlockBars` 无条件老化、`OnBarOpen` 先同步后对账。仅静态复查（花括号平衡、
   引用一致性、`git diff --check`），**尚未在 TB 编译/模拟验证**。验证要点：
   a) 挂单未成交跨日盘收盘 → 15:00 `PEND_DAYCLOSE`，次一交易日首根不再出现连续
   `ACCT_SYNC skip pending`（对账/`STATE_REBUILD` 应在开盘首根发生）；
-  b) 有持仓且 `StopDistN` 较小触发止损时，平仓行为与此前一致（门禁分级/撤单重报属后续版本）。
+  b) 有持仓且 `StopDistN` 较小触发止损时，平仓不受残余开仓挂单阻塞（门禁分级见上方 2222 条目）。
 
 - **2026-11-04（与聚宽同步，未验证）**：对齐 JQ `f3399c6`/`197c148` 及 NR 语义——新增 `S1Scope`
   （默认 `breakout`）与 `TradeReason`（首仓类型，加仓/换月不变，平仓/空仓清理后清空）；S1 skip
@@ -733,4 +781,4 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 
 ---
 
-*版本：v3.2-20261111-TB（2026-11-11 挂单集合跨日清理 + 宽限老化 + 先同步后对账，待 TB 编译/模拟验证；前序 v3.2 记录：2026-10-17 初版 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1 · 2026-11-01 同步 NR6 收缩并行入场 + S1Skip 默认 1 · 2026-11-04 同步 S1Scope/TradeReason + STALL tie + NrN>=2 + NR 重试 · 2026-11-05 模拟/实盘手数复权口径修正，待 TB 编译/回测 · 2026-11-08 DAILY 合约标签修正 + 授权有效期至 2026-12-31（仅模拟/实盘，到期只禁开仓），待 TB 编译）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*
+*版本：v3.2-20261111-2222-TB（2026-11-11 挂单集合跨日清理 + 宽限老化 + 先同步后对账 + 挂单门禁分级（平仓不被开仓挂单阻塞，ClosePendIds 防重复平仓，EMERG_CANCEL 逐笔撤残余开仓单）+ 开仓定价缓冲 OrderBufTicks=2，TB 编译通过，待模拟验证；前序 v3.2 记录：2026-10-17 初版 · 2026-10-18 编译通过 · 2026-10-19 回调实证 + 日志路径自愈 · 2026-10-20 QuoteStatus 回放期门禁 + 实时 HB/D1BAR 日志模拟验证 · 2026-10-26 挂单门禁自愈 · 2026-10-27 账户接口下单 + 账户真值对账 · 2026-10-28 模拟整日验证 + RealTickSize 默认 1 · 2026-11-01 同步 NR6 收缩并行入场 + S1Skip 默认 1 · 2026-11-04 同步 S1Scope/TradeReason + STALL tie + NrN>=2 + NR 重试 · 2026-11-05 模拟/实盘手数复权口径修正，待 TB 编译/回测 · 2026-11-08 DAILY 合约标签修正 + 授权有效期至 2026-12-31（仅模拟/实盘，到期只禁开仓），待 TB 编译）· 对应 `tbquant/05-PTrend-turtle-v3.2-TB.txt` · 聚宽 v3.2 · 前版 v3.1-TB*

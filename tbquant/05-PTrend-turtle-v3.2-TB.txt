@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2-20261111（TBQuant · 双图层 + STALL / NR 并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2-20261111-2222（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
@@ -60,6 +60,7 @@ Params
     Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
     Numeric SlipTicks(1);         // 回测撮合滑点（跳）
     Numeric RealTickSize(1);      // 真实合约最小变动价（p=1/ru=5/ag=1；主连 MinMove 不可信）
+    Integer OrderBufTicks(2);     // 开仓/加仓委托定价缓冲（跳）：买+卖-；平仓/止损不加
     Bool MapToMain(True);         // True=主连图/模拟/实盘（换月+委托映射）；False=单合约切片图
     String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（区分大小写）
     // ---- 日志 ----
@@ -125,8 +126,12 @@ Vars
     Global Bool MappingOk;
     Global Bool MappingRecheck;   // OnInit 判定失败时，首个 data1 就绪的 bar 复核一次
     // ---- 挂单门禁（模拟/实盘；回测不触发）----
-    Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合
+    Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合（开仓门禁）
+    Global Array<Numeric> ClosePendIds; // 平仓未完成委托 orderId 集合（只挡重复平仓）
+    Global Integer ClosePendMissSyncs; // 平仓集合连续未出现在平台列表的新 bar 数（OnBarOpen 判定）
+    Global Integer CloseNoIdBars;     // 平仓无委托号冷却（剩余新 bar 数；期内不发重复平仓）
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流
+    Global Integer LastCloseGateYmd;  // CLOSE_GATE 日志节流
     Global Integer LastDayClearYmd;   // PEND_DAYCLOSE 日志节流
     Global Integer LastSyncWarnYmd;   // PEND_SYNC_FAIL 日志节流
     Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流
@@ -268,6 +273,7 @@ Defs
         LastSkipYmd = 0;
         LastRefreshErrYmd = 0;
         LastGateYmd = 0;
+        LastCloseGateYmd = 0;
         LastDayClearYmd = 0;
         LastSyncWarnYmd = 0;
         LastBadPxYmd = 0;
@@ -658,52 +664,99 @@ Defs
         Return (st == Enum_Declare Or st == Enum_Declared Or st == Enum_FillPart Or st == Enum_Canceling);
     }
 
-    Integer PendingIndex(Integer oid) {
-        Integer n = GetArraySize(PendingIds);
+    // 数值数组工具（ArrayRef 按引用传入；My 前缀避开 TB 内建 Array* 命名）
+    Integer MyArrayIndex(ArrayRef<Numeric> arr, Integer v) {
+        Integer n = GetArraySize(arr);
         Integer i;
         For i = 0 To n - 1 {
-            If (IntPart(PendingIds[i]) == oid) {
+            If (IntPart(arr[i]) == v) {
                 Return i;
             }
         }
         Return -1;
     }
 
-    Integer PendingAdd(Integer oid) {
-        If (PendingIndex(oid) < 0) {
-            ArrayPushBack(PendingIds, oid);
+    Integer MyArrayAdd(ArrayRef<Numeric> arr, Integer v) {
+        If (MyArrayIndex(arr, v) < 0) {
+            ArrayPushBack(arr, v);
         }
         Return 0;
     }
 
-    Integer PendingRemove(Integer oid) {
-        Integer idx = PendingIndex(oid);
+    Integer MyArrayRemove(ArrayRef<Numeric> arr, Integer v) {
+        Integer idx = MyArrayIndex(arr, v);
         If (idx >= 0) {
-            ArrayErase(PendingIds, idx, 1);
+            ArrayErase(arr, idx, 1);
         }
         Return 0;
     }
 
-    Integer PendingClear() {
-        Integer n = GetArraySize(PendingIds);
+    Integer MyArrayClear(ArrayRef<Numeric> arr) {
+        Integer n = GetArraySize(arr);
         Integer i;
         For i = 1 To n {
-            ArrayErase(PendingIds, 0, 1);
+            ArrayErase(arr, 0, 1);
         }
         Return 0;
     }
 
-    String PendingStr() {
+    String MyArrayStr(ArrayRef<Numeric> arr) {
         String s = "";
-        Integer n = GetArraySize(PendingIds);
+        Integer n = GetArraySize(arr);
         Integer i;
         For i = 0 To n - 1 {
             If (s <> "") {
                 s = s + ",";
             }
-            s = s + Text(IntPart(PendingIds[i]));
+            s = s + Text(IntPart(arr[i]));
         }
         Return s;
+    }
+
+    // 平仓前应急撤单：只撤本策略的未完成开仓/加仓委托（id 来自集合登记，逐笔撤），
+    // 跳过平仓单自身；绝不调用账户级全撤。撤销结果由 OnOrder 终态/下一根 PEND_SYNC 校正。
+    Integer CancelEntryPending() {
+        Integer n = GetArraySize(PendingIds);
+        Integer i;
+        Integer oid;
+        For i = 0 To n - 1 {
+            oid = IntPart(PendingIds[i]);
+            If (MyArrayIndex(ClosePendIds, oid) < 0) {
+                A_DeleteOrderEx(oid);
+                WLogW("EMERG_CANCEL oid=" + Text(oid) + "（平仓前撤残余开仓单）");
+            }
+        }
+        Return 0;
+    }
+
+    // 平仓集合防陈旧（终态回调漏报）：连续 2 根新 bar 的同步都查不到任何平仓单 → 视为全部终态。
+    // 只在 OnBarOpen（每根新 bar）调用，不能在逐 tick 的同步里调用——刚发出的平仓单可能
+    // 尚未出现在平台列表，逐 tick 计数会在半秒内误判陈旧、放开重复平仓。
+    Integer PruneStaleClosePend() {
+        Integer n = GetArraySize(ClosePendIds);
+        If (n == 0) {
+            ClosePendMissSyncs = 0;
+            Return 0;
+        }
+        Integer i;
+        Integer hit = 0;
+        For i = 0 To n - 1 {
+            If (MyArrayIndex(PendingIds, IntPart(ClosePendIds[i])) >= 0) {
+                hit = hit + 1;
+            }
+        }
+        If (hit > 0) {
+            ClosePendMissSyncs = 0;
+        }
+        Else {
+            ClosePendMissSyncs = ClosePendMissSyncs + 1;
+            If (ClosePendMissSyncs >= 2) {
+                WLogW("CLOSE_PEND_STALE 连续两根新 bar 同步未见平仓单，清空 closeIds=[" + MyArrayStr(ClosePendIds) + "]");
+                MyArrayClear(ClosePendIds);
+                ClosePendMissSyncs = 0;
+            }
+        }
+        Return 0;
     }
 
     // 挂单同步用的委托落地合约：优先平台层映射表，其次 MainSymbol，最后图表合约。
@@ -733,18 +786,18 @@ Defs
             If (LastSyncWarnYmd <> YMD()) {
                 LastSyncWarnYmd = YMD();
                 WLogW("PEND_SYNC_FAIL 查询未成交委托失败 sym=" + sym
-                    + "，沿用本地集合=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr());
+                    + "，沿用本地集合=" + Text(GetArraySize(PendingIds)) + " ids=" + MyArrayStr(PendingIds));
             }
             Return 0;
         }
-        String before = PendingStr();
-        PendingClear();
+        String before = MyArrayStr(PendingIds);
+        MyArrayClear(PendingIds);
         Integer n = GetArraySize(unfilled);
         Integer i;
         For i = 0 To n - 1 {
-            PendingAdd(unfilled[i]);
+            MyArrayAdd(PendingIds, unfilled[i]);
         }
-        String after = PendingStr();
+        String after = MyArrayStr(PendingIds);
         If (before <> after) {
             WLog("PEND_SYNC sym=" + sym + " before=[" + before + "] after=[" + after + "]");
         }
@@ -973,6 +1026,14 @@ Defs
             }
             Return False;
         }
+        // 开仓/加仓委托加定价缓冲（买+卖-，单位=真实跳数）：盘口跳动/部分成交时提高成交率；平仓/止损不加
+        If (isClose == False And OrderBufTicks > 0) {
+            Numeric basePx = px;
+            px = px + orderDir * OrderBufTicks * RealTick();
+            px = IntPart(px * 1000000 + 0.5) * 0.000001;
+            WLog("ORDER_BUF reason=" + reason + " sym=" + sym + " dir=" + Text(orderDir)
+                + " base=" + Text(basePx, 1) + " buf=" + Text(OrderBufTicks) + " px=" + Text(px, 1));
+        }
         Array<Integer> ids;
         Bool ok = False;
         If (isClose) {
@@ -994,11 +1055,19 @@ Defs
         Integer idCnt = GetArraySize(ids);
         Integer i;
         For i = 0 To idCnt - 1 {
-            PendingAdd(ids[i]);
+            MyArrayAdd(PendingIds, ids[i]);
+            If (isClose) {
+                MyArrayAdd(ClosePendIds, ids[i]);   // 平仓单单独记账：只挡重复平仓，不被开仓挂单阻塞
+            }
         }
         // 平台未返回委托号：挂单门禁无法登记，成交也可能晚于对账 → 延后对账 2 根防台账先归零再重建
         If (ok And idCnt == 0) {
             SyncBlockBars = Max(SyncBlockBars, 2);
+            If (isClose) {
+                CloseNoIdBars = Max(CloseNoIdBars, 2);
+                WLogW("CLOSE_NO_ID via=acct reason=" + reason + " lots=" + Text(lots2)
+                    + "（无委托号，冷却 2 根防重复平仓）");
+            }
             WLogW("ORDER_NO_ID via=acct reason=" + reason + " sym=" + sym
                 + " dir=" + Text(orderDir) + " lots=" + Text(lots2) + "（无委托号，延后对账 2 根）");
         }
@@ -1075,17 +1144,33 @@ Defs
             }
             Return False;
         }
-        // 挂单门禁：存在未完成委托 → 一律不发新单（开/平/加/损同规则；回测集合恒空）。
+        // 挂单门禁分级（平仓/止损优先）：
+        // - 开仓/加仓：存在任何未完成委托 → 禁发（原规则不变）；
+        // - 平仓/止损：只被“平仓未完成委托”挡（防重复平仓）；残余开仓单先逐笔应急撤掉，本 bar 照发平仓。
         // 跨日陈旧集合由日盘收盘清空（PEND_DAYCLOSE）兜底，不再冻结对账。
-        If (GetArraySize(PendingIds) > 0) {
-            If (LastGateYmd <> YMD()) {
-                LastGateYmd = YMD();
-                WLogW("ORDER_GATE 未完成委托=" + Text(GetArraySize(PendingIds))
-                    + " ids=" + PendingStr() + "，禁发新单 reason=" + reason
-                    + " dir=" + Text(orderDir) + " lots=" + Text(lots)
-                    + " close=" + IIFString(isClose, "True", "False"));
+        If (isClose) {
+            If (GetArraySize(ClosePendIds) > 0 Or CloseNoIdBars > 0) {
+                If (LastCloseGateYmd <> YMD()) {
+                    LastCloseGateYmd = YMD();
+                    WLogW("CLOSE_GATE 平仓单未完成，暂缓重复平仓 reason=" + reason
+                        + " closeIds=[" + MyArrayStr(ClosePendIds) + "] noIdBars=" + Text(CloseNoIdBars));
+                }
+                Return False;
             }
-            Return False;
+            // 已过“重复平仓”闸门，确实要发新平仓 → 先逐笔撤掉残余开仓/加仓单
+            CancelEntryPending();
+        }
+        Else {
+            If (GetArraySize(PendingIds) > 0) {
+                If (LastGateYmd <> YMD()) {
+                    LastGateYmd = YMD();
+                    WLogW("ORDER_GATE 未完成委托=" + Text(GetArraySize(PendingIds))
+                        + " ids=" + MyArrayStr(PendingIds) + "，禁发新单 reason=" + reason
+                        + " dir=" + Text(orderDir) + " lots=" + Text(lots)
+                        + " close=" + IIFString(isClose, "True", "False"));
+                }
+                Return False;
+            }
         }
         Bool ok = False;
         If (IsLiveTrade()) {
@@ -1583,7 +1668,7 @@ Defs
         // 已有未完成委托（开/平/加/损）→ 本边沿放弃，不补触发；本 bar 也不再跑常规检查
         // （同聚宽：stall 分支命中后 open_unit 被挂单拦截即 return，不落回突破/加仓判定）
         If (GetArraySize(PendingIds) > 0) {
-            WLog("STALL_MISS side=" + sideTxt + " reason=pending ids=" + PendingStr());
+            WLog("STALL_MISS side=" + sideTxt + " reason=pending ids=" + MyArrayStr(PendingIds));
             Return True;
         }
         // 平台空仓但台账残留：先清再开（与 ManagePosition 空仓分支同口径）
@@ -1692,7 +1777,7 @@ Defs
             }
             If (GetArraySize(PendingIds) > 0) {
                 If (LogLevel >= 3) {
-                    WLogD("NR_MISS side=long reason=pending ids=" + PendingStr());
+                    WLogD("NR_MISS side=long reason=pending ids=" + MyArrayStr(PendingIds));
                 }
                 // 本 bar 仍按 NR 处理（不评估突破，同聚宽 open_unit 被挂单拦截后直接 return）；
                 // 事件不消费，挂单解除后仍可入场
@@ -1721,7 +1806,7 @@ Defs
             }
             If (GetArraySize(PendingIds) > 0) {
                 If (LogLevel >= 3) {
-                    WLogD("NR_MISS side=short reason=pending ids=" + PendingStr());
+                    WLogD("NR_MISS side=short reason=pending ids=" + MyArrayStr(PendingIds));
                 }
                 // 本 bar 仍按 NR 处理（不评估突破，同聚宽 open_unit 被挂单拦截后直接 return）；
                 // 事件不消费，挂单解除后仍可入场
@@ -1895,7 +1980,10 @@ Events
         FinalDone = False;
         FillCnt = 0;
         OrderCnt = 0;
-        PendingClear();                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
+        MyArrayClear(PendingIds);                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
+        MyArrayClear(ClosePendIds);
+        ClosePendMissSyncs = 0;
+        CloseNoIdBars = 0;
         MappingOk = False;
         MappingRecheck = False;
         ParamsOk = False;
@@ -1979,7 +2067,7 @@ Events
                 SetOrderMap2MainSymbol();
             }
         }
-        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111（TB公式版-双图层+STALL+NR）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111-2222（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
         }
@@ -2053,7 +2141,8 @@ Events
             + " NrN=" + Text(NrN) + " win=" + Text(WinSize()) + " data1周期=" + stallFreq);
         WLogInit("参数B: UnitRisk=" + Text(UnitRisk, 4) + " MarginCapPct=" + Text(MarginCapPct, 4)
             + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2)
-            + " S1Skip=" + Text(S1Skip) + " S1Scope=" + S1Scope);
+            + " S1Skip=" + Text(S1Skip) + " S1Scope=" + S1Scope
+            + " OrderBufTicks=" + Text(OrderBufTicks));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
             + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2)
@@ -2076,7 +2165,11 @@ Events
             // 顺序不可反——旧挂单残留会阻塞开盘首根对账（2026-11-11：09:03 才重建台账）
             If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
                 SyncPendingFromAccount();
+                PruneStaleClosePend();   // 只在每根新 bar 判陈旧（逐 tick 会误杀刚发出的平仓单）
                 SyncAcctOnNewBar();
+                If (CloseNoIdBars > 0) {
+                    CloseNoIdBars = CloseNoIdBars - 1;
+                }
             }
         }
     }
@@ -2088,7 +2181,10 @@ Events
 
             // 首 bar 再清一次挂单集合，防上次运行 orderId 残留
             If (BarCnt == 1) {
-                PendingClear();
+                MyArrayClear(PendingIds);
+                MyArrayClear(ClosePendIds);
+                ClosePendMissSyncs = 0;
+                CloseNoIdBars = 0;
             }
             // 每根 bar 按平台未成交列表校正挂单集合（模拟/实盘）
             SyncPendingFromAccount();
@@ -2173,7 +2269,7 @@ Events
                 }
                 // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空）
                 If (GetArraySize(PendingIds) > 0) {
-                    pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr();
+                    pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + MyArrayStr(PendingIds);
                 }
                 // 合约标签：前缀=指标来源 data1（无 data1 时退回 data0）
                 String symseg = Symbol;
@@ -2232,12 +2328,16 @@ Events
             // 清空本地挂单集合，防账户/回报异常时陈旧 orderId 冻结对账与门禁（11-10 事故根因）。
             // 夜盘/次日开盘首根会先按平台真值重建，不受影响。
             If (IsLiveTrade() And Time() >= 0.14589 And Time() < 0.2099) {
-                If (GetArraySize(PendingIds) > 0) {
+                If (GetArraySize(PendingIds) > 0 Or GetArraySize(ClosePendIds) > 0) {
                     If (LastDayClearYmd <> YMD()) {
                         LastDayClearYmd = YMD();
-                        WLogW("PEND_DAYCLOSE 日盘收盘清空未完成集合 ids=" + PendingStr());
+                        WLogW("PEND_DAYCLOSE 日盘收盘清空未完成集合 ids=" + MyArrayStr(PendingIds)
+                            + " closeIds=[" + MyArrayStr(ClosePendIds) + "]");
                     }
-                    PendingClear();
+                    MyArrayClear(PendingIds);
+                    MyArrayClear(ClosePendIds);
+                    ClosePendMissSyncs = 0;
+                    CloseNoIdBars = 0;
                 }
             }
             If (IsStrategyTradeMode()) {
@@ -2277,14 +2377,15 @@ Events
         Integer oid = ord.orderId;
         String ptxt = "";
         If (OrderIsPending(ord.status)) {
-            If (PendingIndex(oid) < 0) {
-                PendingAdd(oid);
+            If (MyArrayIndex(PendingIds, oid) < 0) {
+                MyArrayAdd(PendingIds, oid);
                 ptxt = " PEND_ADD";
             }
         }
         Else {
-            If (PendingIndex(oid) >= 0) {
-                PendingRemove(oid);
+            MyArrayRemove(ClosePendIds, oid);   // 平仓单终态：解除“防重复平仓”锁
+            If (MyArrayIndex(PendingIds, oid) >= 0) {
+                MyArrayRemove(PendingIds, oid);
                 ptxt = " PEND_DEL";
             }
         }
@@ -2304,12 +2405,15 @@ Events
     OnExit() {
         If (StrategyMode() == Enum_Mode_Strategy_Trade()) {
             WLogEvt("EXIT fill=" + Text(FillCnt) + " order=" + Text(OrderCnt)
-                + " pending=" + Text(GetArraySize(PendingIds)) + " ids=" + PendingStr());
+                + " pending=" + Text(GetArraySize(PendingIds)) + " ids=" + MyArrayStr(PendingIds));
         }
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-20261111-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
-//        v3.2-20261111: 挂单集合跨日清理（日盘收盘清空 + 宽限老化 + 开盘先同步后对账）
+// 版本: v3.2-20261111-2222-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+//        v3.2-20261111:  挂单集合跨日清理（日盘收盘清空 + 宽限老化 + 开盘先同步后对账）
+//        v3.2-20261111-2156: 开仓委托定价缓冲（OrderBufTicks 默认 2 跳，买+卖-；平仓/止损不加）
+//        v3.2-20261111-2222: 挂单门禁分级（平仓/止损不被开仓挂单阻塞；平仓前应急撤残余开仓单；
+//                            ClosePendIds 防重复平仓；CLOSE_NO_ID 冷却）
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
 //------------------------------------------------------------------------
