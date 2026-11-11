@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2（TBQuant · 双图层 + STALL / NR 并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2-20261111（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
@@ -127,6 +127,7 @@ Vars
     // ---- 挂单门禁（模拟/实盘；回测不触发）----
     Global Array<Numeric> PendingIds; // 未完成委托 orderId 集合
     Global Integer LastGateYmd;       // ORDER_GATE 日志节流
+    Global Integer LastDayClearYmd;   // PEND_DAYCLOSE 日志节流
     Global Integer LastSyncWarnYmd;   // PEND_SYNC_FAIL 日志节流
     Global Integer LastBadPxYmd;      // ORDER_SKIP 无效委托价日志节流
     Global Integer LastAcctWarnYmd;   // ACCT_NOT_READY 日志节流
@@ -267,6 +268,7 @@ Defs
         LastSkipYmd = 0;
         LastRefreshErrYmd = 0;
         LastGateYmd = 0;
+        LastDayClearYmd = 0;
         LastSyncWarnYmd = 0;
         LastBadPxYmd = 0;
         LastAcctWarnYmd = 0;
@@ -1023,13 +1025,15 @@ Defs
             Return 0;
         }
         LastSyncBarSig = sig;
-        If (GetArraySize(PendingIds) > 0) {
-            WLogD("ACCT_SYNC skip pending=" + Text(GetArraySize(PendingIds)));
-            Return 0;
-        }
+        // 宽限必须随 bar 无条件老化：挂单期间也要递减，否则成交后的宽限会被挂单冻结跨日
+        // （2026-11-11 事故：11-10 13:30 成交置 2，挂单未清 → 宽限冻结，09:03 才对账）
         If (SyncBlockBars > 0) {
             SyncBlockBars = SyncBlockBars - 1;
             WLogD("ACCT_SYNC skip grace remain=" + Text(SyncBlockBars));
+            Return 0;
+        }
+        If (GetArraySize(PendingIds) > 0) {
+            WLogD("ACCT_SYNC skip pending=" + Text(GetArraySize(PendingIds)));
             Return 0;
         }
         RefreshAccountPosition();
@@ -1071,7 +1075,8 @@ Defs
             }
             Return False;
         }
-        // 挂单门禁：存在未完成委托 → 一律不发新单（开/平/加/损同规则；回测集合恒空）
+        // 挂单门禁：存在未完成委托 → 一律不发新单（开/平/加/损同规则；回测集合恒空）。
+        // 跨日陈旧集合由日盘收盘清空（PEND_DAYCLOSE）兜底，不再冻结对账。
         If (GetArraySize(PendingIds) > 0) {
             If (LastGateYmd <> YMD()) {
                 LastGateYmd = YMD();
@@ -1974,7 +1979,7 @@ Events
                 SetOrderMap2MainSymbol();
             }
         }
-        WLogInit("===== OnInit 棕榈油海龟 v3.2（TB公式版-双图层+STALL+NR）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
         }
@@ -2067,8 +2072,10 @@ Events
         Range[0:0] {
             // N/四通道每根新 bar 刷新一次；失败归 0 拒交易，下根自动重试
             RefreshNChannels();
-            // 模拟/实盘实时：按账户真值对账（成交/换月后宽限 2 根）
+            // 模拟/实盘实时：先按平台未成交列表校正挂单集合，再按账户真值对账。
+            // 顺序不可反——旧挂单残留会阻塞开盘首根对账（2026-11-11：09:03 才重建台账）
             If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
+                SyncPendingFromAccount();
                 SyncAcctOnNewBar();
             }
         }
@@ -2221,6 +2228,18 @@ Events
     OnBarClose(ArrayRef<Integer> indexs) {
         // [红线] 只放 Range[0:0]
         Range[0:0] {
+            // 日盘收盘（最后一根 bar=14:59，收盘回调 15:00）：当日未成交委托已全部失效，
+            // 清空本地挂单集合，防账户/回报异常时陈旧 orderId 冻结对账与门禁（11-10 事故根因）。
+            // 夜盘/次日开盘首根会先按平台真值重建，不受影响。
+            If (IsLiveTrade() And Time() >= 0.14589 And Time() < 0.2099) {
+                If (GetArraySize(PendingIds) > 0) {
+                    If (LastDayClearYmd <> YMD()) {
+                        LastDayClearYmd = YMD();
+                        WLogW("PEND_DAYCLOSE 日盘收盘清空未完成集合 ids=" + PendingStr());
+                    }
+                    PendingClear();
+                }
+            }
             If (IsStrategyTradeMode()) {
                 If (QuoteStatus() == Enum_QuoteStatus_RealTime) {
                     If (ArrayFind(indexs, 0)) {
@@ -2290,6 +2309,7 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-TB  2026/10/17  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+// 版本: v3.2-20261111-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+//        v3.2-20261111: 挂单集合跨日清理（日盘收盘清空 + 宽限老化 + 开盘先同步后对账）
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
 //------------------------------------------------------------------------
