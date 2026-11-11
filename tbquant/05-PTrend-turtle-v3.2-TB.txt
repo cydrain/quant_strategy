@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2-20261111-2222（TBQuant · 双图层 + STALL / NR 并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2-20261111-2259（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
@@ -61,6 +61,8 @@ Params
     Numeric SlipTicks(1);         // 回测撮合滑点（跳）
     Numeric RealTickSize(1);      // 真实合约最小变动价（p=1/ru=5/ag=1；主连 MinMove 不可信）
     Integer OrderBufTicks(2);     // 开仓/加仓委托定价缓冲（跳）：买+卖-；平仓/止损不加
+    Integer PendTimeoutBars(3);   // 开仓挂单超时（新 bar 数）→ 撤单+残量重报；0=只拦不撤
+    Integer PendMaxRetry(2);      // 开仓残量重报次数上限；0=只撤不报
     Bool MapToMain(True);         // True=主连图/模拟/实盘（换月+委托映射）；False=单合约切片图
     String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（区分大小写）
     // ---- 日志 ----
@@ -154,6 +156,10 @@ Vars
     Global Integer LastCloseSkipYmd;  // 平仓无可平持仓日志节流
     Global Integer LastSentLots;      // 最近一次成功委托的实际手数
     Global Array<String> AcctSyms;    // 账户持仓合约清单（区分空仓与读取失败）
+    // ---- 开仓挂单超时治理（模拟/实盘；回测不触发）----
+    Global Integer PendBars;          // 开仓/加仓挂单连续存在的新 bar 数
+    Global Bool PendCanceled;         // 本轮超时撤单已发出（挂单清空后算残量）
+    Global Integer PendRetry;         // 残量重报已发次数
 
 Defs
     // ---------- 基础辅助 ----------
@@ -367,6 +373,14 @@ Defs
         }
         If (RealTickSize <= 0) {
             ParamErr("RealTickSize", Text(RealTickSize, 2), ">0（按合约填：p=1、ru=5、ag=1）");
+            ok = False;
+        }
+        If (PendTimeoutBars < 0) {
+            ParamErr("PendTimeoutBars", Text(PendTimeoutBars), ">=0（0=关闭超时撤单/重报）");
+            ok = False;
+        }
+        If (PendMaxRetry < 0) {
+            ParamErr("PendMaxRetry", Text(PendMaxRetry), ">=0（0=只撤不报）");
             ok = False;
         }
         If (TradeStartDate < 19000101 Or TradeStartDate > 21001231) {
@@ -713,8 +727,17 @@ Defs
         Return s;
     }
 
+    // 开仓挂单超时计数复位（OnInit/首 bar/日盘收盘/平仓撤单）
+    Integer ResetPendingWatch() {
+        PendBars = 0;
+        PendCanceled = False;
+        PendRetry = 0;
+        Return 0;
+    }
+
     // 平仓前应急撤单：只撤本策略的未完成开仓/加仓委托（id 来自集合登记，逐笔撤），
     // 跳过平仓单自身；绝不调用账户级全撤。撤销结果由 OnOrder 终态/下一根 PEND_SYNC 校正。
+    // 同时放弃残量重报：已决定平仓，不再补开仓。
     Integer CancelEntryPending() {
         Integer n = GetArraySize(PendingIds);
         Integer i;
@@ -726,6 +749,7 @@ Defs
                 WLogW("EMERG_CANCEL oid=" + Text(oid) + "（平仓前撤残余开仓单）");
             }
         }
+        ResetPendingWatch();
         Return 0;
     }
 
@@ -1009,7 +1033,8 @@ Defs
                     WLogW("OPEN_BLOCK 账户持仓不可读，禁止开仓 reason=" + reason);
                     Return False;
                 }
-                If (AcctLong > 0 Or AcctShort > 0) {
+                // 残量重报（reason=repost）：账户已有同向持仓属正常，放行
+                If ((AcctLong > 0 Or AcctShort > 0) And reason <> "repost") {
                     WLogW("OPEN_BLOCK 账户已有持仓，禁止开仓 reason=" + reason
                         + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort)));
                     RebuildLedgerFromAcct();   // 立即对齐，下一 bar 按持仓管理
@@ -1128,6 +1153,84 @@ Defs
         If (PLots <> acctLots Or PDir <> acctDir Or (acctLots > 0 And StopLine <= 0 And NVal > 0)) {
             RebuildLedgerFromAcct();
         }
+        Return 0;
+    }
+
+    // 开仓挂单超时治理（每根新 bar 由 OnBarOpen 在账户对账前调用；回测不触发）：
+    // 开仓/加仓挂单 PendTimeoutBars 根新 bar 未全成 → 逐笔撤残余开仓/加仓单（绝不账户级全撤）；
+    // 挂单清空后按“台账计划量 − 账户同向真值”算残量，重报至多 PendMaxRetry 次；
+    // 缺口不再补时交给既有账户对账收敛（下一根 SyncAcctOnNewBar 自动重建）。
+    Integer ManagePendingTimeout() {
+        If (IsLiveTrade() == False Or PendTimeoutBars <= 0) {
+            Return 0;
+        }
+        // 未完成开仓/加仓委托数（排除平仓单）
+        Integer n = GetArraySize(PendingIds);
+        Integer i;
+        Integer entPend = 0;
+        For i = 0 To n - 1 {
+            If (MyArrayIndex(ClosePendIds, IntPart(PendingIds[i])) < 0) {
+                entPend = entPend + 1;
+            }
+        }
+        If (entPend == 0) {
+            If (PendCanceled == False) {
+                // 自然全部终态（全成/外部撤单）：计数归零
+                PendBars = 0;
+                PendRetry = 0;
+                Return 0;
+            }
+            // 撤单已生效：按账户真值算残量，决定重报或收尾
+            PendCanceled = False;
+            PendBars = 0;
+            RefreshAccountPosition();
+            If (AcctPosOk == False Or PLots <= 0) {
+                PendRetry = 0;
+                Return 0;
+            }
+            Integer sideNow = IntPart(AcctLong);
+            If (PDir < 0) {
+                sideNow = IntPart(AcctShort);
+            }
+            Integer residual = PLots - sideNow;
+            If (residual <= 0) {
+                PendRetry = 0;
+                WLog("PEND_DONE 撤单后确认足量 plan=" + Text(PLots) + " acct=" + Text(sideNow));
+                Return 0;
+            }
+            If (PendRetry >= PendMaxRetry) {
+                PendRetry = 0;
+                WLogW("PEND_GIVEUP 残量放弃 residual=" + Text(residual) + " plan=" + Text(PLots)
+                    + " acct=" + Text(sideNow) + "（交账户对账收敛）");
+                Return 0;
+            }
+            // 残量重报：跳过开仓位“空仓/同向”校验；台账已是计划量，不重复记账
+            If (SendAcctOrder(PDir, residual, CalcOrderPrice(PDir, Close()), False, "repost")) {
+                PendRetry = PendRetry + 1;
+                WLog("PEND_REPOST 残量重报 residual=" + Text(residual) + " retry=" + Text(PendRetry)
+                    + " plan=" + Text(PLots) + " acct=" + Text(sideNow));
+            }
+            Else {
+                PendRetry = 0;
+                WLogW("PEND_REPOST_FAIL 残量重报失败 residual=" + Text(residual) + "（交账户对账收敛）");
+            }
+            Return 0;
+        }
+        PendBars = PendBars + 1;
+        If (PendCanceled == False And PendBars < PendTimeoutBars) {
+            Return 0;   // 尚未超时：继续等
+        }
+        // 超时或撤单未生效：每根新 bar 至多一轮逐笔撤单，等平台回报终态
+        Integer oid;
+        For i = 0 To n - 1 {
+            oid = IntPart(PendingIds[i]);
+            If (MyArrayIndex(ClosePendIds, oid) < 0) {
+                A_DeleteOrderEx(oid);
+            }
+        }
+        PendCanceled = True;
+        WLog("PEND_CANCEL 开仓挂单超时撤单 bars=" + Text(PendBars)
+            + " pend=" + Text(entPend) + " ids=" + MyArrayStr(PendingIds));
         Return 0;
     }
 
@@ -1984,6 +2087,7 @@ Events
         MyArrayClear(ClosePendIds);
         ClosePendMissSyncs = 0;
         CloseNoIdBars = 0;
+        ResetPendingWatch();
         MappingOk = False;
         MappingRecheck = False;
         ParamsOk = False;
@@ -2067,7 +2171,7 @@ Events
                 SetOrderMap2MainSymbol();
             }
         }
-        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111-2222（TB公式版-双图层+STALL+NR）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111-2259（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
         }
@@ -2142,7 +2246,8 @@ Events
         WLogInit("参数B: UnitRisk=" + Text(UnitRisk, 4) + " MarginCapPct=" + Text(MarginCapPct, 4)
             + " AddStepN=" + Text(AddStepN, 2) + " StopDistN=" + Text(StopDistN, 2)
             + " S1Skip=" + Text(S1Skip) + " S1Scope=" + S1Scope
-            + " OrderBufTicks=" + Text(OrderBufTicks));
+            + " OrderBufTicks=" + Text(OrderBufTicks)
+            + " PendTimeoutBars=" + Text(PendTimeoutBars) + " PendMaxRetry=" + Text(PendMaxRetry));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
             + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2)
@@ -2166,6 +2271,7 @@ Events
             If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
                 SyncPendingFromAccount();
                 PruneStaleClosePend();   // 只在每根新 bar 判陈旧（逐 tick 会误杀刚发出的平仓单）
+                ManagePendingTimeout();   // 先于对账：残量要用台账计划量（对账会改写台账）
                 SyncAcctOnNewBar();
                 If (CloseNoIdBars > 0) {
                     CloseNoIdBars = CloseNoIdBars - 1;
@@ -2185,6 +2291,7 @@ Events
                 MyArrayClear(ClosePendIds);
                 ClosePendMissSyncs = 0;
                 CloseNoIdBars = 0;
+                ResetPendingWatch();
             }
             // 每根 bar 按平台未成交列表校正挂单集合（模拟/实盘）
             SyncPendingFromAccount();
@@ -2339,6 +2446,7 @@ Events
                     ClosePendMissSyncs = 0;
                     CloseNoIdBars = 0;
                 }
+                ResetPendingWatch();   // 当日委托全部失效，超时计数一并作废
             }
             If (IsStrategyTradeMode()) {
                 If (QuoteStatus() == Enum_QuoteStatus_RealTime) {
@@ -2410,10 +2518,7 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-20261111-2222-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
-//        v3.2-20261111:  挂单集合跨日清理（日盘收盘清空 + 宽限老化 + 开盘先同步后对账）
-//        v3.2-20261111-2156: 开仓委托定价缓冲（OrderBufTicks 默认 2 跳，买+卖-；平仓/止损不加）
-//        v3.2-20261111-2222: 挂单门禁分级（平仓/止损不被开仓挂单阻塞；平仓前应急撤残余开仓单；
-//                            ClosePendIds 防重复平仓；CLOSE_NO_ID 冷却）
+// 版本: v3.2-20261111-2259-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+//        v3.2-20261111 系列: 挂单跨日清理 / OrderBufTicks 定价缓冲 / 挂单门禁分级 / 开仓挂单超时撤单+残量重报
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
 //------------------------------------------------------------------------
