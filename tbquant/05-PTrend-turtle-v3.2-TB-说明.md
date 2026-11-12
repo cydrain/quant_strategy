@@ -157,7 +157,7 @@
 4. 1 分钟 K 线加载数量建议 ≥16 万根（分段约 2.7~5 万，整段 18~60 万）。
 5. 回测区间 = 预热起点 ~ 切片终点；`TradeStartDate` = 实际开仓日；
    日线历史须在 `TradeStartDate` 前 ≥61 个交易日。
-6. 回测设置：初始资金 100 万；保证金/手续费/滑点由 OnInit 设置（12% / 0.000023 按金额 / 1 跳）。
+6. 回测设置：初始资金 100 万；保证金/手续费/滑点由 OnInit 设置（12% / 3.5 元每手 / 1 跳）。
    `SetMarginRate/SetCommissionRate/SetSlippage` 显示 False 属正常，设置仍生效。
 7. 跑完读回测报告与日志。
    回测/图表回测仍走图表下单接口（`Buy/SellShort/Sell/BuyToCover`），`RealTickSize`/`OrderBufTicks`
@@ -437,7 +437,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
   - `RealTickSize`：p=1、ru=5、ag=1（按合约手填）；
   - `InitCapital`：该策略分配的风险资金（风险基数 = `Min(InitCapital, 账户权益)`；多个实例都用默认
     100 万会各自按 100 万算，合计可能超出账户承受；保证金上限 `A_FreeMargin` 为共享口径，先到先占）；
-  - `MultiplierP/MarginRateP/CommissionRateP`：按品种；
+  - `MultiplierP/MarginRateP/CommissionPerLot`：按品种；
   - data0/data1 换成该品种主连（1 分钟 + 日线），`MapToMain=True`。
 - **必须遵守**：同一真实合约只能挂一个本策略实例；不要在本策略管理的合约上手工开仓或用其它
   策略交易（会被接管/加仓/平仓）。日志名已含合约（如 `..._p9888.DCE_日志_...`、`..._ru888.SHFE_...`），
@@ -522,7 +522,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | InitCapital | 1000000 | 初始资金（回测）；模拟/实盘兼作风险资金上限 |
 | MultiplierP | 10 | 合约乘数（元/点/手，P=10） |
 | MarginRateP | 0.12 | 保证金率 |
-| CommissionRateP | 0.000023 | 手续费率（按成交金额） |
+| CommissionPerLot | 3.5 | 手续费（元/手，按手固定；开/平/平今同价） |
 | SlipTicks | 1 | 回测撮合滑点（跳；P 一跳=1 元/吨，ru=5、ag=1）；模拟/实盘实际滑点由盘口/柜台决定 |
 | RealTickSize | 1 | 落地真实合约最小变动价，真实委托价取整用；**按合约手填**：p=1（2026-04-10 起）、ru=5、ag=1。主连图 `MinMove` 不可信（p9888=1） |
 | OrderBufTicks | 2 | 开仓/加仓委托定价缓冲（真实跳数）：盘口价按 `RealTickSize` 取整后，买 `+N` 跳、卖 `−N` 跳；提高盘口跳动/部分成交时的成交率。平仓/止损不加；0=关闭；回测/图表回测不生效 |
@@ -533,7 +533,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 | LogLevel | 2 | 日志阈值：0=仅ERROR 1=+WARNING 2=+INFO 3=+DEBUG |
 | PrintToUI | True | True=同步 Print 到 K 线图控制台；无图表单元无界面输出（文件日志不受影响）；长回测/批量优化建议 False |
 | LogDir | C:/Users/MI/work/quant_strategy/tbquant/logs/ | 日志目录（本机绝对路径，换机器/云需改）；留空/相对路径=平台运行目录；末位缺 / 自动补；OnInit 日志打印实际路径 |
-| LogHour / LogMinute | 14 / 45 | 每日定时日志时刻 |
+| LogTime | 1445 | 每日定时日志时刻（HHMM，1445=14:45；分钟 00..59，非法值 OnInit 报 ParamErr） |
 
 ---
 
@@ -657,7 +657,8 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
   交易时段与账户登录；回测不受影响。另外，若回放期恰好达成 STALL/突破，实时不会补做（见 7.3）。
   图表模式（mode=0）开自动交易后同样恒为 `REPLAY_GATE`，属预期——图表交易不发单。
 - **Q：日志里 SetMarginRate 等返回 False，设置没生效？** A：生效；v3.1 切片终值与聚宽按
-  12%/0.000023/1 跳对拍一致可证。返回值语义未明，不代表设置失败。
+  12%/0.000023/1 跳对拍一致可证。返回值语义未明，不代表设置失败。v3.2 起回测手续费改为
+  按手固定 3.5 元（`Enum_Rate_AmountPerHand`），与聚宽的比例口径会有小幅差异。
 - **Q：回测日志里 MainSymbol 显示“未来合约”？** A：平台行为——回测下 `MainSymbol()` 恒为当前
   实盘主力；换月检测/重建仅实盘生效。
 

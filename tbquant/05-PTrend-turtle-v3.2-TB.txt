@@ -37,8 +37,13 @@
 //   窗口越界读数可能仍是有效值 → N 偏高/假突破。两图层数据范围要同步提前。
 //------------------------------------------------------------------------
 Params
-    // ---- 策略参数（对应聚宽 PARAMS）----
+    // ---- 常用参数 ----
     Integer FixedDir(1);          // 固定方向：1=只做多 / -1=只做空 / 0=双向
+    Bool MapToMain(True);         // True=主连图/模拟/实盘（换月+委托映射）；False=单合约切片图
+    Numeric InitCapital(1000000); // 初始资金（回测）；模拟/实盘风险资金上限
+    Integer TradeStartDate(20200101); // 开始交易日期(yyyymmdd)；之前仅预热不交易
+    String LogDir("C:/Users/MI/work/quant_strategy/tbquant/logs/"); // 日志目录（留空=平台运行目录）；末位自动补 /
+    // ---- 策略参数 ----
     Integer NPeriod(20);          // N（ATR）周期
     Integer NSmooth(20);          // N 平滑系数（经典 N=((s-1)*N+TR)/s）
     Integer EntryN(20);           // 突破入场通道周期（系统1=20）
@@ -52,25 +57,20 @@ Params
     Numeric StopDistN(2.0);       // 止损距离（N 倍数）
     Integer S1Skip(1);            // 系统1跳过：上次同类交易盈利则跳过一次同类突破
     String S1Scope("breakout");   // breakout=仅20日突破（默认）/breakout_nr=突破与NR独立/current=任意盈利入场武装
-    Integer TradeStartDate(20200101); // 开始交易日期(yyyymmdd)；之前仅预热不交易
     // ---- 账户/撮合参数 ----
-    Numeric InitCapital(1000000); // 初始资金（回测）；模拟/实盘风险资金上限
     Numeric MultiplierP(10);      // 合约乘数（元/点/手，P=10）
     Numeric MarginRateP(0.12);    // 保证金率
-    Numeric CommissionRateP(0.000023); // 手续费率（按成交金额）
+    Numeric CommissionPerLot(3.5);    // 手续费（元/手，按手固定；开/平/平今同价）
     Numeric SlipTicks(1);         // 回测撮合滑点（跳）
     Numeric RealTickSize(1);      // 真实合约最小变动价（p=1/ru=5/ag=1；主连 MinMove 不可信）
     Integer OrderBufTicks(2);     // 开仓/加仓委托定价缓冲（跳）：买+卖-；平仓/止损不加
     Integer PendTimeoutBars(3);   // 开仓挂单超时（新 bar 数）→ 撤单+残量重报；0=只拦不撤
     Integer PendMaxRetry(2);      // 开仓残量重报次数上限；0=只撤不报
-    Bool MapToMain(True);         // True=主连图/模拟/实盘（换月+委托映射）；False=单合约切片图
     String MainContSymbol("p9888.DCE"); // 模拟/实盘唯一允许的主连合约（区分大小写）
     // ---- 日志 ----
     Integer LogLevel(2);          // 0=ERROR 1=+WARN 2=+INFO 3=+DEBUG
     Bool PrintToUI(True);         // 同步 Print 到图表控制台；长回测/批量优化建议 False
-    String LogDir("C:/Users/MI/work/quant_strategy/tbquant/logs/"); // 日志目录（留空=平台运行目录）；末位自动补 /
-    Integer LogHour(14);          // 每日定时日志时刻
-    Integer LogMinute(45);
+    Integer LogTime(1445);        // 每日定时日志时刻 HHMM（14:45）
 
 Vars
     // ---- N 与四通道（来源 Data1[1..]；OnBarOpen 每根新 bar 刷新）----
@@ -363,8 +363,8 @@ Defs
             ParamErr("MarginRateP", Text(MarginRateP, 4), ">0");
             ok = False;
         }
-        If (CommissionRateP < 0) {
-            ParamErr("CommissionRateP", Text(CommissionRateP, 8), ">=0");
+        If (CommissionPerLot < 0) {
+            ParamErr("CommissionPerLot", Text(CommissionPerLot, 2), ">=0（元/手）");
             ok = False;
         }
         If (SlipTicks < 0) {
@@ -381,6 +381,10 @@ Defs
         }
         If (PendMaxRetry < 0) {
             ParamErr("PendMaxRetry", Text(PendMaxRetry), ">=0（0=只撤不报）");
+            ok = False;
+        }
+        If (LogTime < 0 Or LogTime > 2359 Or LogTime - IntPart(LogTime / 100) * 100 > 59) {
+            ParamErr("LogTime", Text(LogTime), "HHMM（0..2359，分钟 00..59，如 1445=14:45）");
             ok = False;
         }
         If (TradeStartDate < 19000101 Or TradeStartDate > 21001231) {
@@ -2107,7 +2111,7 @@ Events
         // SetInitCapital 无返回值，合法性由 InitCapital>0 校验
         SetInitCapital(InitCapital);
         Bool okMargin = SetMarginRate(MarginRateP);
-        Bool okComm = SetCommissionRate(Enum_Rate_ByFillAmount(), CommissionRateP);
+        Bool okComm = SetCommissionRate(Enum_Rate_AmountPerHand(), CommissionPerLot);
         Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlipTicks);
         SetConsecEntries(-1);          // 平台不限建仓次数，加仓由 UnitCount<MaxUnits 控制
         ParamsOk = ValidateParams();
@@ -2250,7 +2254,7 @@ Events
             + " PendTimeoutBars=" + Text(PendTimeoutBars) + " PendMaxRetry=" + Text(PendMaxRetry));
         WLogInit("参数C: TradeStartDate=" + Text(TradeStartDate) + " InitCapital=" + Text(InitCapital, 0)
             + " MultiplierP=" + Text(MultiplierP, 2) + " MarginRateP=" + Text(MarginRateP, 4)
-            + " CommissionRateP=" + Text(CommissionRateP, 8) + " SlipTicks=" + Text(SlipTicks, 2)
+            + " CommissionPerLot=" + Text(CommissionPerLot, 2) + " SlipTicks=" + Text(SlipTicks, 2)
             + " RealTickSize=" + Text(RealTickSize, 2));
         WLogInit("日志: LogDir=[" + LogDir + "] 实际目录=" + IIFString(LogDir == "", "(空=平台运行目录)", EffectiveLogDir())
             + " 文件=" + LogPath());
@@ -2356,13 +2360,15 @@ Events
                 }
             }
 
-            // ---- 4. 每日定时日志（14:45）----
+            // ---- 4. 每日定时日志（LogTime，默认 14:45）----
             // 回测照写；模拟/实盘仅实时
             Bool dailyLogOk = True;
             If (IsStrategyTradeMode()) {
                 dailyLogOk = (QuoteStatus() == Enum_QuoteStatus_RealTime);
             }
-            If (dailyLogOk And Hour() == LogHour And Minute() == LogMinute And YMD() <> LastLogYmd) {
+            Integer logH = IntPart(LogTime / 100);
+            Integer logM = LogTime - logH * 100;
+            If (dailyLogOk And Hour() == logH And Minute() == logM And YMD() <> LastLogYmd) {
                 LastLogYmd = YMD();
                 String d1s = "na";
                 String d0seg = "";
