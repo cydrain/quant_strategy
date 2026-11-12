@@ -1038,57 +1038,58 @@ Defs
         Return 0;
     }
 
-    // 账户接口下单（模拟/实盘唯一出口）：查询账户持仓 → 发送前门禁 → 真实价委托。
-    // 平仓手数收敛为实际同向持仓；加仓须已有同向持仓；开仓须账户空仓。
-    Bool SendAcctOrder(Integer orderDir, Integer lots, Numeric chartPx, Bool isClose, String reason) {
-        String sym = OrderMapSym();
-        RefreshAccountPosition();
-        Integer lots2 = lots;
-        If (isClose) {
-            Numeric side = AcctLong;
-            If (orderDir > 0) {
-                side = AcctShort;   // 买平 → 可平的是空头
+    // 平仓手数收敛：按账户实际同向持仓裁剪；账户不可读时退回台账手数（止损优先）
+    Integer AcctCloseLots(Integer orderDir, Integer lots, String reason) {
+        Numeric side = AcctLong;
+        If (orderDir > 0) {
+            side = AcctShort;   // 买平 → 可平的是空头
+        }
+        If (AcctPosOk == False) {
+            side = PLots;       // 账户不可读：按台账兜底（止损优先于门禁）
+        }
+        Integer lots2 = IntPart(side);
+        If (lots2 <= 0) {
+            If (LastCloseSkipYmd <> YMD()) {
+                LastCloseSkipYmd = YMD();
+                WLogW("ORDER_SKIP 无可平持仓 reason=" + reason + " dir=" + Text(orderDir)
+                    + " ledgerLots=" + Text(PLots) + AcctOkSeg());
             }
-            If (AcctPosOk == False) {
-                side = PLots;       // 账户不可读：按台账兜底（止损优先于门禁）
-            }
-            lots2 = IntPart(side);
-            If (lots2 <= 0) {
-                If (LastCloseSkipYmd <> YMD()) {
-                    LastCloseSkipYmd = YMD();
-                    WLogW("ORDER_SKIP 无可平持仓 reason=" + reason + " dir=" + Text(orderDir)
-                        + " ledgerLots=" + Text(PLots) + AcctOkSeg());
-                }
+            Return 0;
+        }
+        If (lots2 <> lots) {
+            WLog("CLOSE_CLAMP reason=" + reason + " lots=" + Text(lots) + " -> " + Text(lots2)
+                + AcctLotSeg("acctLong", "acctShort") + AcctOkSeg());
+        }
+        Return lots2;
+    }
+
+    // 开仓/加仓发送前门禁：加仓须同向持仓；开仓须账户空仓（repost 例外）
+    Bool AcctOpenGate(Integer orderDir, String reason) {
+        If (reason == "add") {
+            Bool sameSide = (orderDir > 0 And AcctLong > 0) Or (orderDir < 0 And AcctShort > 0);
+            If (AcctPosOk == False Or sameSide == False) {
+                WLogW("OPEN_BLOCK 加仓需账户已有同向持仓 reason=" + reason + " dir=" + Text(orderDir)
+                    + AcctOkSeg() + AcctLotSeg("acctLong", "acctShort"));
                 Return False;
             }
-            If (lots2 <> lots) {
-                WLog("CLOSE_CLAMP reason=" + reason + " lots=" + Text(lots) + " -> " + Text(lots2)
-                    + AcctLotSeg("acctLong", "acctShort") + AcctOkSeg());
-            }
+            Return True;
         }
-        Else {
-            If (reason == "add") {
-                Bool sameSide = (orderDir > 0 And AcctLong > 0) Or (orderDir < 0 And AcctShort > 0);
-                If (AcctPosOk == False Or sameSide == False) {
-                    WLogW("OPEN_BLOCK 加仓需账户已有同向持仓 reason=" + reason + " dir=" + Text(orderDir)
-                        + AcctOkSeg() + AcctLotSeg("acctLong", "acctShort"));
-                    Return False;
-                }
-            }
-            Else {
-                If (AcctPosOk == False) {
-                    WLogW("OPEN_BLOCK 账户持仓不可读，禁止开仓 reason=" + reason);
-                    Return False;
-                }
-                // 残量重报（reason=repost）：账户已有同向持仓属正常，放行
-                If ((AcctLong > 0 Or AcctShort > 0) And reason <> "repost") {
-                    WLogW("OPEN_BLOCK 账户已有持仓，禁止开仓 reason=" + reason
-                        + AcctLotSeg("acctLong", "acctShort"));
-                    RebuildLedgerFromAcct();   // 立即对齐，下一 bar 按持仓管理
-                    Return False;
-                }
-            }
+        If (AcctPosOk == False) {
+            WLogW("OPEN_BLOCK 账户持仓不可读，禁止开仓 reason=" + reason);
+            Return False;
         }
+        // 残量重报（reason=repost）：账户已有同向持仓属正常，放行
+        If ((AcctLong > 0 Or AcctShort > 0) And reason <> "repost") {
+            WLogW("OPEN_BLOCK 账户已有持仓，禁止开仓 reason=" + reason
+                + AcctLotSeg("acctLong", "acctShort"));
+            RebuildLedgerFromAcct();   // 立即对齐，下一 bar 按持仓管理
+            Return False;
+        }
+        Return True;
+    }
+
+    // 真实委托价解析 + 开仓定价缓冲；无效价返回 0（调用方拒发）
+    Numeric AcctRealPrice(Integer orderDir, Numeric chartPx, Bool isClose, String sym, String reason) {
         Numeric px = RealOrderPrice(chartPx, orderDir);
         If (px == InvalidNumeric Or px <= 0) {
             If (LastBadPxYmd != YMD()) {
@@ -1096,7 +1097,7 @@ Defs
                 WLogW("ORDER_SKIP 真实委托价无效 reason=" + reason + " pxChart=" + Text(chartPx, 1)
                     + " rollover=" + Text(Rollover(), 4));
             }
-            Return False;
+            Return 0;
         }
         // 开仓/加仓委托加定价缓冲（买+卖-，单位=真实跳数）：盘口跳动/部分成交时提高成交率；平仓/止损不加
         If (isClose == False And OrderBufTicks > 0) {
@@ -1106,22 +1107,27 @@ Defs
             WLog("ORDER_BUF reason=" + reason + " sym=" + sym + " dir=" + Text(orderDir)
                 + " base=" + Text(basePx, 1) + " buf=" + Text(OrderBufTicks) + " px=" + Text(px, 1));
         }
+        Return px;
+    }
+
+    // 账户接口实际发单 + 委托号登记 + 发送结果日志
+    Bool AcctSendRaw(String sym, Integer orderDir, Integer lots, Numeric px, Numeric chartPx, Bool isClose, String reason) {
         Array<Integer> ids;
         Bool ok = False;
         If (isClose) {
             If (orderDir > 0) {
-                ok = A_BuyToCover(sym, lots2, px, ids);
+                ok = A_BuyToCover(sym, lots, px, ids);
             }
             Else {
-                ok = A_Sell(sym, lots2, px, ids);
+                ok = A_Sell(sym, lots, px, ids);
             }
         }
         Else {
             If (orderDir > 0) {
-                ok = A_Buy(sym, lots2, px, ids);
+                ok = A_Buy(sym, lots, px, ids);
             }
             Else {
-                ok = A_SellShort(sym, lots2, px, ids);
+                ok = A_SellShort(sym, lots, px, ids);
             }
         }
         Integer idCnt = GetArraySize(ids);
@@ -1137,23 +1143,47 @@ Defs
             SyncBlockBars = Max(SyncBlockBars, 2);
             If (isClose) {
                 CloseNoIdBars = Max(CloseNoIdBars, 2);
-                WLogW("CLOSE_NO_ID via=acct reason=" + reason + " lots=" + Text(lots2)
+                WLogW("CLOSE_NO_ID via=acct reason=" + reason + " lots=" + Text(lots)
                     + "（无委托号，冷却 2 根防重复平仓）");
             }
             WLogW("ORDER_NO_ID via=acct reason=" + reason + " sym=" + sym
-                + " dir=" + Text(orderDir) + " lots=" + Text(lots2) + "（无委托号，延后对账 2 根）");
+                + " dir=" + Text(orderDir) + " lots=" + Text(lots) + "（无委托号，延后对账 2 根）");
         }
-        LastSentLots = lots2;
+        LastSentLots = lots;
         WLog("ORDER_SEND via=acct reason=" + reason + " sym=" + sym
             + " dir=" + Text(orderDir) + " close=" + IIFString(isClose, "True", "False")
-            + " lots=" + Text(lots2) + " pxReal=" + Text(px, 1) + " pxChart=" + Text(chartPx, 1)
+            + " lots=" + Text(lots) + " pxReal=" + Text(px, 1) + " pxChart=" + Text(chartPx, 1)
             + " rollover=" + Text(Rollover(), 4) + " ids=" + Text(idCnt)
             + " ok=" + IIFString(ok, "True", "False"));
         If (ok == False) {
             WLogE("ORDER_REJECT via=acct reason=" + reason + " sym=" + sym
-                + " dir=" + Text(orderDir) + " lots=" + Text(lots2) + " pxReal=" + Text(px, 1));
+                + " dir=" + Text(orderDir) + " lots=" + Text(lots) + " pxReal=" + Text(px, 1));
         }
         Return ok;
+    }
+
+    // 账户接口下单（模拟/实盘唯一出口）：查询账户持仓 → 发送前门禁 → 真实价委托。
+    // 平仓手数收敛为实际同向持仓；加仓须已有同向持仓；开仓须账户空仓。
+    Bool SendAcctOrder(Integer orderDir, Integer lots, Numeric chartPx, Bool isClose, String reason) {
+        String sym = OrderMapSym();
+        RefreshAccountPosition();
+        Integer lots2 = lots;
+        If (isClose) {
+            lots2 = AcctCloseLots(orderDir, lots, reason);
+            If (lots2 <= 0) {
+                Return False;
+            }
+        }
+        Else {
+            If (AcctOpenGate(orderDir, reason) == False) {
+                Return False;
+            }
+        }
+        Numeric px = AcctRealPrice(orderDir, chartPx, isClose, sym, reason);
+        If (px <= 0) {
+            Return False;
+        }
+        Return AcctSendRaw(sym, orderDir, lots2, px, chartPx, isClose, reason);
     }
 
     // 每根新 bar 按账户真值校正台账；有挂单或宽限期内跳过。
