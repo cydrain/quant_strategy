@@ -263,6 +263,14 @@ Defs
         Return (value != InvalidNumeric And value > 0);
     }
 
+    // 入参保证非 0：调用点在 side/dir == 0 时已提前返回
+    String SideTxt(Integer side) {
+        If (side < 0) {
+            Return "short";
+        }
+        Return "long";
+    }
+
     // 刷新失败日志（按交易日节流）：失败态每根新 bar 都会重试——每天只报首条防刷屏
     Integer WLogRefreshErr(String s) {
         If (YMD() <> LastRefreshErrYmd) {
@@ -957,6 +965,15 @@ Defs
         Return 0;
     }
 
+    // 账户真值日志片段：键名按日志口径切换（acctLong/acctShort 或 acctL/acctS）
+    String AcctLotSeg(String longKey, String shortKey) {
+        Return " " + longKey + "=" + Text(IntPart(AcctLong)) + " " + shortKey + "=" + Text(IntPart(AcctShort));
+    }
+
+    String AcctOkSeg() {
+        Return " acctOk=" + IIFString(AcctPosOk, "True", "False");
+    }
+
     // 以账户真值整体重建台账（模拟/实盘唯一重建入口）。均价按 Rollover 折回图口径；
     // 加仓次数/末次入场价无法恢复，止损线按均价重推。不支持同合约多空对锁。
     Integer RebuildLedgerFromAcct() {
@@ -1040,14 +1057,13 @@ Defs
                 If (LastCloseSkipYmd <> YMD()) {
                     LastCloseSkipYmd = YMD();
                     WLogW("ORDER_SKIP 无可平持仓 reason=" + reason + " dir=" + Text(orderDir)
-                        + " ledgerLots=" + Text(PLots) + " acctOk=" + IIFString(AcctPosOk, "True", "False"));
+                        + " ledgerLots=" + Text(PLots) + AcctOkSeg());
                 }
                 Return False;
             }
             If (lots2 <> lots) {
                 WLog("CLOSE_CLAMP reason=" + reason + " lots=" + Text(lots) + " -> " + Text(lots2)
-                    + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort))
-                    + " acctOk=" + IIFString(AcctPosOk, "True", "False"));
+                    + AcctLotSeg("acctLong", "acctShort") + AcctOkSeg());
             }
         }
         Else {
@@ -1055,8 +1071,7 @@ Defs
                 Bool sameSide = (orderDir > 0 And AcctLong > 0) Or (orderDir < 0 And AcctShort > 0);
                 If (AcctPosOk == False Or sameSide == False) {
                     WLogW("OPEN_BLOCK 加仓需账户已有同向持仓 reason=" + reason + " dir=" + Text(orderDir)
-                        + " acctOk=" + IIFString(AcctPosOk, "True", "False")
-                        + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort)));
+                        + AcctOkSeg() + AcctLotSeg("acctLong", "acctShort"));
                     Return False;
                 }
             }
@@ -1068,7 +1083,7 @@ Defs
                 // 残量重报（reason=repost）：账户已有同向持仓属正常，放行
                 If ((AcctLong > 0 Or AcctShort > 0) And reason <> "repost") {
                     WLogW("OPEN_BLOCK 账户已有持仓，禁止开仓 reason=" + reason
-                        + " acctLong=" + Text(IntPart(AcctLong)) + " acctShort=" + Text(IntPart(AcctShort)));
+                        + AcctLotSeg("acctLong", "acctShort"));
                     RebuildLedgerFromAcct();   // 立即对齐，下一 bar 按持仓管理
                     Return False;
                 }
@@ -1458,10 +1473,7 @@ Defs
             If (armNr) {
                 NrSkipNext = True;
             }
-            String sideTxt = "long";
-            If (dir < 0) {
-                sideTxt = "short";
-            }
+            String sideTxt = SideTxt(dir);
             If (armBreak Or armNr) {
                 String armedTxt = "";
                 If (armBreak) {
@@ -1640,10 +1652,7 @@ Defs
         If (side == 0) {
             Return 0;
         }
-        String sideTxt = "long";
-        If (side < 0) {
-            sideTxt = "short";
-        }
+        String sideTxt = SideTxt(side);
         // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
         If (S1Skip > 0 And SkipNextBreakout) {
             SkipNextBreakout = False;
@@ -1684,33 +1693,38 @@ Defs
     // 计数：最新完成 data1 bar 距最近一次“创新低/新高”事件的 bar 数（事件当根=0；无事件=-1）。
     // 事件 := Low(j) < min(Low(j+1..j+n))（多头）/ High(j) > max(High(j+1..j+n))（空头），严格不等。
     // 与聚宽 stall_state 等价：j 对应 i=last-j+1，计数 last-i=j-1；扫描窗口 2n+5 根。
-    Integer CalcStallCounts(Integer n) {
-        StallLongCnt = -1;
-        StallShortCnt = -1;
+    // 单方向停滞计数：dir>0 找创新低，dir<0 找创新高；返回距最新 bar 的根数（无事件=-1）
+    Integer StallCountSince(Integer n, Integer dir) {
         Integer lim = n + 5;
         Integer j;
         Integer k;
         Numeric ext;
         For j = 1 To lim {
-            If (StallLongCnt < 0) {
+            If (dir > 0) {
                 ext = D1Low(j + 1);
                 For k = 1 To n {
                     ext = Min(ext, D1Low(j + k));
                 }
                 If (D1Low(j) < ext) {
-                    StallLongCnt = j - 1;
+                    Return j - 1;
                 }
             }
-            If (StallShortCnt < 0) {
+            Else {
                 ext = D1High(j + 1);
                 For k = 1 To n {
                     ext = Max(ext, D1High(j + k));
                 }
                 If (D1High(j) > ext) {
-                    StallShortCnt = j - 1;
+                    Return j - 1;
                 }
             }
         }
+        Return -1;
+    }
+
+    Integer CalcStallCounts(Integer n) {
+        StallLongCnt = StallCountSince(n, 1);
+        StallShortCnt = StallCountSince(n, -1);
         Return 0;
     }
 
@@ -1790,10 +1804,7 @@ Defs
         If (side == 0) {
             Return False;
         }
-        String sideTxt = "long";
-        If (side < 0) {
-            sideTxt = "short";
-        }
+        String sideTxt = SideTxt(side);
         If (PosLotsNow() <> 0) {
             WLog("STALL_MISS side=" + sideTxt + " reason=holding stall=" + Text(StallPeriod));
             Return False;
@@ -1905,10 +1916,7 @@ Defs
         If (side == 0) {
             Return False;
         }
-        String sideTxt = "long";
-        If (side < 0) {
-            sideTxt = "short";
-        }
+        String sideTxt = SideTxt(side);
         If (S1Skip > 0 And NrSkipNext And (S1Scope == "current" Or S1Scope == "breakout_nr")) {
             NrSkipNext = False;
             NrFired = True;
@@ -1949,9 +1957,7 @@ Defs
         String acctSeg = "";
         If (IsLiveTrade()) {
             RefreshAccountPosition();
-            acctSeg = " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
-                + " acctS=" + Text(IntPart(AcctShort))
-                + " acctOk=" + IIFString(AcctPosOk, "True", "False");
+            acctSeg = " pdir=" + Text(PDir) + AcctLotSeg("acctL", "acctS") + AcctOkSeg();
         }
         WLog("HB " + Symbol + " C=" + Text(Close(), 1)
             + " N=" + Text(NVal, 2)
@@ -2153,10 +2159,9 @@ Defs
                 If (AcctSym <> "" And AcctSym <> symseg) {
                     acctseg = acctseg + " acctSym=" + AcctSym;
                 }
-                acctseg = acctseg + " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
-                    + " acctS=" + Text(IntPart(AcctShort))
+                acctseg = acctseg + " pdir=" + Text(PDir) + AcctLotSeg("acctL", "acctS")
                     + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
-                    + " acctOk=" + IIFString(AcctPosOk, "True", "False");
+                    + AcctOkSeg();
             }
             // NR 事件状态：仅在当日存在收缩事件时附加
             String nrseg = "";
@@ -2192,9 +2197,8 @@ Defs
         Return 0;
     }
 
-Events
-    OnInit() {
-        // 全局状态复位（所有模式日志只追加、不删除）
+    // OnInit 状态复位：运行计数/台账/挂单/节流/账户对账全部归零（跨次运行不残留）
+    Integer ResetRuntimeState() {
         BarCnt = 0;
         MainSymInit = False;
         SkipNextBreakout = False;
@@ -2227,20 +2231,11 @@ Events
         SyncBlockBars = 0;
         LastSyncBarSig = "";
         LastSentLots = 0;
-        // SetInitCapital 无返回值，合法性由 InitCapital>0 校验
-        SetInitCapital(InitCapital);
-        Bool okMargin = SetMarginRate(MarginRateP);
-        Bool okComm = SetCommissionRate(Enum_Rate_AmountPerHand(), CommissionPerLot);
-        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlipTicks);
-        SetConsecEntries(-1);          // 平台不限建仓次数，加仓由 UnitCount<MaxUnits 控制
-        ParamsOk = ValidateParams();
-        If (ParamsOk) {
-            WLogInit("参数校验: OK");
-        }
-        Else {
-            WLogInitE("参数校验失败：禁止开新仓（含加仓）；止损/平仓保留");
-        }
-        // STALL 参数校验：2*StallPeriod+5 必须 <= WinSize()
+        Return 0;
+    }
+
+    // STALL/NR 辅助参数校验（OnInit 一次）：窗口超限/周期非法时停用对应并行入场
+    Integer ValidateAuxParams() {
         If (StallPeriod > 0) {
             If (StallPeriod * 2 + 5 > WinSize()) {
                 WLogInitE("STALL 停用: 2*StallPeriod+5=" + Text(StallPeriod * 2 + 5)
@@ -2250,7 +2245,6 @@ Events
                 StallEnabled = True;
             }
         }
-        // NR 参数校验：NrN<2 或 NrN>WinSize 时停用
         If (NrN > 0) {
             If (NrN < 2) {
                 WLogInitE("NR 停用: NrN=" + Text(NrN) + "（需 >=2；与聚宽 win>=2 守卫一致）");
@@ -2264,36 +2258,10 @@ Events
                 }
             }
         }
-        // 模拟/实盘：data0/data1 必须同为 MainContSymbol 且 MapToMain=True；回测不校验
-        Bool isMainCont = False;
-        Bool layerOk = False;
-        MappingOk = True;
-        If (StrategyMode() == Enum_Mode_Strategy_Trade()) {
-            MappingOk = False;
-            isMainCont = (Symbol == MainContSymbol);
-            If (DataCount() >= 2) {
-                If (D1Sym() == Symbol) {
-                    layerOk = True;
-                }
-            }
-            If (isMainCont And layerOk And MapToMain) {
-                MappingOk = True;
-            }
-            // data1 可能晚于 OnInit 就绪 → 首个数据齐备的 bar 复核一次（仅解锁，不重设映射标志）
-            If (MappingOk == False) {
-                MappingRecheck = True;
-            }
-        }
-        // 换月全套只在主连图/模拟/实盘（MapToMain=True）开启；单合约切片保持不复权
-        Range[0:DataCount-1] {
-            If (MapToMain And (StrategyMode() <> Enum_Mode_Strategy_Trade() Or isMainCont)) {
-                AddDataFlag(Enum_Data_RolloverBackWard());
-                AddDataFlag(Enum_Data_RolloverRealPrice());
-                AddDataFlag(Enum_Data_AutoSwapPosition());
-                SetSwapPosVolType(2);
-                SetOrderMap2MainSymbol();
-            }
-        }
+        Return 0;
+    }
+
+    Integer LogInitHeader() {
         WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111-2259（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
@@ -2320,6 +2288,10 @@ Events
             + " BigPointValue=" + Text(BigPointValue(), 1)
             + " MinMove=" + Text(MinMove()) + " PriceScale=" + Text(PriceScale(), 2)
             + " MarginRatio=" + Text(MarginRatio(), 3));
+        Return 0;
+    }
+
+    Integer LogInitMapping(Bool isMainCont, Bool layerOk) {
         If (StrategyMode() == Enum_Mode_Strategy_Trade()) {
             WLogInit("MAPPING: data0=" + Symbol + " layers=" + Text(DataCount())
                 + " data1Same=" + IIFString(layerOk, "True", "False")
@@ -2347,6 +2319,10 @@ Events
         Else {
             WLogInit("MAPPING: 回测模式不校验（主连回测建议 MapToMain=True）");
         }
+        Return 0;
+    }
+
+    Integer LogInitParams(Bool okMargin, Bool okComm, Bool okSlip) {
         WLogInit("模式: StrategyMode=" + Text(StrategyMode())
             + " IsLiveTrade=" + IIFString(IsLiveTrade(), "True", "False")
             + " AutoTrade=" + IIFString(IsTradeEnabled(), "True", "False")
@@ -2381,6 +2357,60 @@ Events
             + " SetCommissionRate=" + IIFString(okComm, "True", "False")
             + " SetSlippage=" + IIFString(okSlip, "True", "False")
             + " MapToMain=" + IIFString(MapToMain, "True(OrderMap2Main,RolloverOn)", "False(OrderMapOff,RolloverOff)"));
+        Return 0;
+    }
+
+Events
+    OnInit() {
+        // 全局状态复位（所有模式日志只追加、不删除）
+        ResetRuntimeState();
+        // SetInitCapital 无返回值，合法性由 InitCapital>0 校验
+        SetInitCapital(InitCapital);
+        Bool okMargin = SetMarginRate(MarginRateP);
+        Bool okComm = SetCommissionRate(Enum_Rate_AmountPerHand(), CommissionPerLot);
+        Bool okSlip = SetSlippage(Enum_Rate_PointPerHand(), SlipTicks);
+        SetConsecEntries(-1);          // 平台不限建仓次数，加仓由 UnitCount<MaxUnits 控制
+        ParamsOk = ValidateParams();
+        If (ParamsOk) {
+            WLogInit("参数校验: OK");
+        }
+        Else {
+            WLogInitE("参数校验失败：禁止开新仓（含加仓）；止损/平仓保留");
+        }
+        ValidateAuxParams();
+        // 模拟/实盘：data0/data1 必须同为 MainContSymbol 且 MapToMain=True；回测不校验
+        Bool isMainCont = False;
+        Bool layerOk = False;
+        MappingOk = True;
+        If (StrategyMode() == Enum_Mode_Strategy_Trade()) {
+            MappingOk = False;
+            isMainCont = (Symbol == MainContSymbol);
+            If (DataCount() >= 2) {
+                If (D1Sym() == Symbol) {
+                    layerOk = True;
+                }
+            }
+            If (isMainCont And layerOk And MapToMain) {
+                MappingOk = True;
+            }
+            // data1 可能晚于 OnInit 就绪 → 首个数据齐备的 bar 复核一次（仅解锁，不重设映射标志）
+            If (MappingOk == False) {
+                MappingRecheck = True;
+            }
+        }
+        // 换月全套只在主连图/模拟/实盘（MapToMain=True）开启；单合约切片保持不复权
+        Range[0:DataCount-1] {
+            If (MapToMain And (StrategyMode() <> Enum_Mode_Strategy_Trade() Or isMainCont)) {
+                AddDataFlag(Enum_Data_RolloverBackWard());
+                AddDataFlag(Enum_Data_RolloverRealPrice());
+                AddDataFlag(Enum_Data_AutoSwapPosition());
+                SetSwapPosVolType(2);
+                SetOrderMap2MainSymbol();
+            }
+        }
+        LogInitHeader();
+        LogInitMapping(isMainCont, layerOk);
+        LogInitParams(okMargin, okComm, okSlip);
     }
 
     // 新 bar 生成时驱动（历史回放与实盘均驱动）
