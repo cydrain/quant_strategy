@@ -666,10 +666,14 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 
 ## 12. 验证状态
 
-- **2026-11-11（v3.2-20261111-2259 开仓挂单超时治理，未验证）**：开仓/加仓挂单 `PendTimeoutBars=3`
+- **2026-11-13（代码精简 657ab80，纯结构整理）**：`TryEntry/TryNrEntry` 多空对称分支合并；
+  新增 `D1Ready/D1BarSig/CleanFlatLedger/ResetPendingState/StopHit` 公共辅助。参数/版本号/日志格式
+  未改；唯一语义对齐：日盘收盘复位同时清 `CloseNoIdBars`。**TB 编译通过；切片 5/6 回测与旧结果一致**。
+
+- **2026-11-11（v3.2-20261111-2259 开仓挂单超时治理，待模拟验证）**：开仓/加仓挂单 `PendTimeoutBars=3`
   根新 bar 未全成 → 逐笔撤残余开仓单（`PEND_CANCEL`）；挂单清空后按“台账计划量 − 账户同向真值”
   重报至多 `PendMaxRetry=2` 次（`PEND_REPOST`）；缺口不再补时 `PEND_GIVEUP`，交既有账户对账收敛。
-  **尚未在 TB 编译/模拟验证**。验证要点：
+  **TB 编译通过（2026-11-13，含代码精简 657ab80）；切片 5/6 回测与旧结果一致；模拟超时路径 a–g 仍待验证**。验证要点：
   a) 模拟开仓挂单故意不成交（价远离盘口）→ 3 根新 bar 后出现 `PEND_CANCEL`，平台挂单被逐笔撤销，
   其它策略委托不受影响（仍未用 `A_DeleteAccountOrder`）；
   b) 部分成交后撤单 → 下一根 `PEND_REPOST residual=... plan=... acct=...`，重报成交后账户持仓

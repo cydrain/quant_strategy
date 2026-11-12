@@ -429,6 +429,24 @@ Defs
         Return Data1.Close[0];
     }
 
+    // data1 已就绪且最新完成 bar 四价有效（DataCount/OHLC 校验三处共用）
+    Bool D1Ready() {
+        If (DataCount() < 2) {
+            Return False;
+        }
+        If (NumValid(D1Open(1)) == False Or NumValid(D1High(1)) == False Or
+            NumValid(D1Low(1)) == False Or NumValid(D1Close(1)) == False) {
+            Return False;
+        }
+        Return True;
+    }
+
+    // data1 bar 指纹（合约|OHLC）：同一根 bar 只处理/记录一次
+    String D1BarSig(Numeric o, Numeric h, Numeric l, Numeric c) {
+        Return D1Sym() + "|" + MainSymbol() + "|" + Text(o, 4) + "|" + Text(h, 4)
+            + "|" + Text(l, 4) + "|" + Text(c, 4);
+    }
+
     // 日线第 idx 根的真实波幅（idx>=1；用 idx 与 idx+1 两根，后者作前收盘锚点）；禁 GetBar。
     Numeric D1TR(Integer idx) {
         Numeric t1 = D1High(idx) - D1Low(idx);
@@ -736,6 +754,16 @@ Defs
         PendBars = 0;
         PendCanceled = False;
         PendRetry = 0;
+        Return 0;
+    }
+
+    // 挂单集合与超时计数一起复位（OnInit/首 bar/日盘收盘共用）
+    Integer ResetPendingState() {
+        MyArrayClear(PendingIds);
+        MyArrayClear(ClosePendIds);
+        ClosePendMissSyncs = 0;
+        CloseNoIdBars = 0;
+        ResetPendingWatch();
         Return 0;
     }
 
@@ -1377,6 +1405,15 @@ Defs
         Return 0;
     }
 
+    // 平台空仓但台账残留：清台账（持仓管理/STALL/NR 三处共用）
+    Integer CleanFlatLedger() {
+        If (PLots <> 0 Or UnitCount <> 0) {
+            WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
+            ResetLedger();
+        }
+        Return 0;
+    }
+
     // 全部平仓；盈利时按 S1Scope × TradeReason 武装 skip，再清台账。
     Integer DoCloseAll(Integer dir, Numeric refPrice, String reason) {
         If (PLots <= 0) {
@@ -1589,49 +1626,42 @@ Defs
         // FixedDir 方向开关（对齐聚宽 fixed_dir）：0=双向 / 1=仅多 / -1=仅空
         Bool allowLong = (FixedDir == 0 Or FixedDir == 1);
         Bool allowShort = (FixedDir == 0 Or FixedDir == -1);
-        // 多头突破
+        // 触发方向与通道沿：多头优先（每 bar 单动作）
+        Integer side = 0;
+        Numeric lvl = 0;
         If (allowLong And High() >= EntryLongLv) {
-            // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
-            If (S1Skip > 0 And SkipNextBreakout) {
-                SkipNextBreakout = False;
-                SkipLevel = EntryLongLv;
-                SkipDir = 1;
-                WLog("BREAKOUT_SKIP long level=" + Text(EntryLongLv, 1));
-                Return 0;
-            }
-            If (S1Skip > 0 And SkipDir == 1 And SkipLevel > 0) {
-                If (EntryLongLv == SkipLevel) {
-                    Return 0;
-                }
-                WLog("SKIP_RELEASED long old=" + Text(SkipLevel, 1) + " new=" + Text(EntryLongLv, 1));
-                SkipLevel = 0;
-                SkipDir = 0;
-            }
-            // 触发价=通道上沿；实际委托价/手数在 DoOpenUnit 内解析
-            DoOpenUnit(1, EntryLongLv, "entry");
+            side = 1;
+            lvl = EntryLongLv;
+        }
+        Else If (allowShort And Low() <= EntryShortLv) {
+            side = -1;
+            lvl = EntryShortLv;
+        }
+        If (side == 0) {
             Return 0;
         }
-        // 空头突破（多头已触发则上面已 Return——每 bar 单动作）
-        If (allowShort And Low() <= EntryShortLv) {
-            // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
-            If (S1Skip > 0 And SkipNextBreakout) {
-                SkipNextBreakout = False;
-                SkipLevel = EntryShortLv;
-                SkipDir = -1;
-                WLog("BREAKOUT_SKIP short level=" + Text(EntryShortLv, 1));
+        String sideTxt = "long";
+        If (side < 0) {
+            sideTxt = "short";
+        }
+        // 系统1 跳过：记录被跳过价位，同价位不再入场（同聚宽 skip_level）
+        If (S1Skip > 0 And SkipNextBreakout) {
+            SkipNextBreakout = False;
+            SkipLevel = lvl;
+            SkipDir = side;
+            WLog("BREAKOUT_SKIP " + sideTxt + " level=" + Text(lvl, 1));
+            Return 0;
+        }
+        If (S1Skip > 0 And SkipDir == side And SkipLevel > 0) {
+            If (lvl == SkipLevel) {
                 Return 0;
             }
-            If (S1Skip > 0 And SkipDir == -1 And SkipLevel > 0) {
-                If (EntryShortLv == SkipLevel) {
-                    Return 0;
-                }
-                WLog("SKIP_RELEASED short old=" + Text(SkipLevel, 1) + " new=" + Text(EntryShortLv, 1));
-                SkipLevel = 0;
-                SkipDir = 0;
-            }
-            // 触发价=通道下沿；实际委托价/手数在 DoOpenUnit 内解析
-            DoOpenUnit(-1, EntryShortLv, "entry");
+            WLog("SKIP_RELEASED " + sideTxt + " old=" + Text(SkipLevel, 1) + " new=" + Text(lvl, 1));
+            SkipLevel = 0;
+            SkipDir = 0;
         }
+        // 触发价=通道沿；实际委托价/手数在 DoOpenUnit 内解析
+        DoOpenUnit(side, lvl, "entry");
         Return 0;
     }
 
@@ -1695,12 +1725,8 @@ Defs
         If (StallEnabled == False) {
             Return False;
         }
-        If (DataCount() < 2) {
-            Return False;
-        }
-        // Data1[1] 四价有效性逐项校验（NumValid：无效值或 <=0 均拒绝；Or 不依赖短路）
-        If (NumValid(D1Open(1)) == False Or NumValid(D1High(1)) == False Or
-            NumValid(D1Low(1)) == False Or NumValid(D1Close(1)) == False) {
+        // data1 就绪且 Data1[1] 四价有效（无效值或 <=0 均拒绝）
+        If (D1Ready() == False) {
             Return False;
         }
         Numeric so = D1Open(1);
@@ -1779,10 +1805,7 @@ Defs
             Return True;
         }
         // 平台空仓但台账残留：先清再开（与 ManagePosition 空仓分支同口径）
-        If (PLots <> 0 Or UnitCount <> 0) {
-            WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
-            ResetLedger();
-        }
+        CleanFlatLedger();
         WLog("STALL_FIRE side=" + sideTxt + " stall=" + Text(StallPeriod)
             + " long=" + Text(StallLongCnt) + " short=" + Text(StallShortCnt)
             + " N=" + Text(NVal, 1));
@@ -1809,12 +1832,7 @@ Defs
     // 事件 := 该 bar 振幅（High-Low）为近 NrN 根最小（含等号，同聚宽）；触发沿 = 该 bar High/Low。
     // 事件在下一根 data1 bar 期间有效；NrFired 每根新 data1 bar 复位。
     Integer RefreshNrEvent() {
-        If (NrEnabled == False Or DataCount() < 2) {
-            NrHasEvent = False;
-            Return 0;
-        }
-        If (NumValid(D1Open(1)) == False Or NumValid(D1High(1)) == False Or
-            NumValid(D1Low(1)) == False Or NumValid(D1Close(1)) == False) {
+        If (NrEnabled == False Or D1Ready() == False) {
             NrHasEvent = False;
             Return 0;
         }
@@ -1822,8 +1840,7 @@ Defs
         Numeric h = D1High(1);
         Numeric l = D1Low(1);
         Numeric c = D1Close(1);
-        String sig = D1Sym() + "|" + MainSymbol() + "|" + Text(o, 4) + "|" + Text(h, 4)
-            + "|" + Text(l, 4) + "|" + Text(c, 4);
+        String sig = D1BarSig(o, h, l, c);
         If (sig == NrD1Sig) {
             Return 0;
         }
@@ -1874,65 +1891,47 @@ Defs
         }
         Bool allowLong = (FixedDir == 0 Or FixedDir == 1);
         Bool allowShort = (FixedDir == 0 Or FixedDir == -1);
-        // 多头
+        // 触发方向与事件沿：多头优先（每 bar 单动作）
+        Integer side = 0;
+        Numeric lvl = 0;
         If (allowLong And High() >= NrHighLv) {
-            If (S1Skip > 0 And NrSkipNext And (S1Scope == "current" Or S1Scope == "breakout_nr")) {
-                NrSkipNext = False;
-                NrFired = True;
-                WLog("NR_SKIP side=long level=" + Text(NrHighLv, 1) + "（系统1：上次交易盈利）");
-                Return True;
-            }
-            If (GetArraySize(PendingIds) > 0) {
-                If (LogLevel >= 3) {
-                    WLogD("NR_MISS side=long reason=pending ids=" + MyArrayStr(PendingIds));
-                }
-                // 本 bar 仍按 NR 处理（不评估突破，同聚宽 open_unit 被挂单拦截后直接 return）；
-                // 事件不消费，挂单解除后仍可入场
-                Return True;
-            }
-            If (PLots <> 0 Or UnitCount <> 0) {
-                WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
-                ResetLedger();
-            }
-            prevLots = PLots;
-            DoOpenUnitMarket(1, "entry_nr");
-            If (PLots > prevLots) {
-                NrFired = True;
-                WLog("NR_FIRE side=long n=" + Text(NrN) + " level=" + Text(NrHighLv, 1)
-                    + " N=" + Text(NVal, 1));
-            }
+            side = 1;
+            lvl = NrHighLv;
+        }
+        Else If (allowShort And Low() <= NrLowLv) {
+            side = -1;
+            lvl = NrLowLv;
+        }
+        If (side == 0) {
+            Return False;
+        }
+        String sideTxt = "long";
+        If (side < 0) {
+            sideTxt = "short";
+        }
+        If (S1Skip > 0 And NrSkipNext And (S1Scope == "current" Or S1Scope == "breakout_nr")) {
+            NrSkipNext = False;
+            NrFired = True;
+            WLog("NR_SKIP side=" + sideTxt + " level=" + Text(lvl, 1) + "（系统1：上次交易盈利）");
             Return True;
         }
-        // 空头
-        If (allowShort And Low() <= NrLowLv) {
-            If (S1Skip > 0 And NrSkipNext And (S1Scope == "current" Or S1Scope == "breakout_nr")) {
-                NrSkipNext = False;
-                NrFired = True;
-                WLog("NR_SKIP side=short level=" + Text(NrLowLv, 1) + "（系统1：上次交易盈利）");
-                Return True;
+        If (GetArraySize(PendingIds) > 0) {
+            If (LogLevel >= 3) {
+                WLogD("NR_MISS side=" + sideTxt + " reason=pending ids=" + MyArrayStr(PendingIds));
             }
-            If (GetArraySize(PendingIds) > 0) {
-                If (LogLevel >= 3) {
-                    WLogD("NR_MISS side=short reason=pending ids=" + MyArrayStr(PendingIds));
-                }
-                // 本 bar 仍按 NR 处理（不评估突破，同聚宽 open_unit 被挂单拦截后直接 return）；
-                // 事件不消费，挂单解除后仍可入场
-                Return True;
-            }
-            If (PLots <> 0 Or UnitCount <> 0) {
-                WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
-                ResetLedger();
-            }
-            prevLots = PLots;
-            DoOpenUnitMarket(-1, "entry_nr");
-            If (PLots > prevLots) {
-                NrFired = True;
-                WLog("NR_FIRE side=short n=" + Text(NrN) + " level=" + Text(NrLowLv, 1)
-                    + " N=" + Text(NVal, 1));
-            }
+            // 本 bar 仍按 NR 处理（不评估突破，同聚宽 open_unit 被挂单拦截后直接 return）；
+            // 事件不消费，挂单解除后仍可入场
             Return True;
         }
-        Return False;
+        CleanFlatLedger();
+        prevLots = PLots;
+        DoOpenUnitMarket(side, "entry_nr");
+        If (PLots > prevLots) {
+            NrFired = True;
+            WLog("NR_FIRE side=" + sideTxt + " n=" + Text(NrN) + " level=" + Text(lvl, 1)
+                + " N=" + Text(NVal, 1));
+        }
+        Return True;
     }
 
     // data0 心跳（仅实时 OnBarClose，每根一行）：证明事件循环在跑，并留下价格/仓位/N 状态。
@@ -1965,20 +1964,15 @@ Defs
     // 含 data1 OHLC + N/四通道 + STALL 计数 + 持仓台账。
     // 用单一字符串指纹去重（合约|OHLC）：同一根 data1 bar 只打印一次。
     Integer LogData1Bar() {
-        If (DataCount() < 2) {
-            Return 0;
-        }
-        // 四价有效性逐项校验（NumValid：无效值或 <=0 均拒绝；Or 不依赖短路）
-        If (NumValid(D1Open(1)) == False Or NumValid(D1High(1)) == False Or
-            NumValid(D1Low(1)) == False Or NumValid(D1Close(1)) == False) {
+        // data1 就绪且 Data1[1] 四价有效（无效值或 <=0 均拒绝）
+        If (D1Ready() == False) {
             Return 0;
         }
         Numeric o = D1Open(1);
         Numeric h = D1High(1);
         Numeric l = D1Low(1);
         Numeric c = D1Close(1);
-        String sig = D1Sym() + "|" + MainSymbol() + "|" + Text(o, 4) + "|" + Text(h, 4)
-            + "|" + Text(l, 4) + "|" + Text(c, 4);
+        String sig = D1BarSig(o, h, l, c);
         If (sig == D1LogSig) {
             Return 0;
         }
@@ -1993,15 +1987,26 @@ Defs
         Return 0;
     }
 
+    // 共享止损命中：多单 Low ≤ StopLine、空单 High ≥ StopLine
+    Bool StopHit(Integer dir) {
+        If (StopLine <= 0) {
+            Return False;
+        }
+        If (dir > 0 And Low() <= StopLine) {
+            Return True;
+        }
+        If (dir < 0 And High() >= StopLine) {
+            Return True;
+        }
+        Return False;
+    }
+
     // 交易主流程：每 bar 至多一个动作。空仓→突破入场；
     // 持仓→止损 > 反向突破出场 > 加仓，任一动作后立即返回。
     Integer ManagePosition() {
         // 空仓分支：先清残留台账（手工平仓/异常后可能残留），再尝试入场
         If (PosLotsNow() == 0) {
-            If (PLots <> 0 Or UnitCount <> 0) {
-                WLogW("LEDGER_CLEAN 空仓残留台账清理 prevLots=" + Text(PLots));
-                ResetLedger();
-            }
+            CleanFlatLedger();
             TryEntry();
             Return 0;
         }
@@ -2015,15 +2020,9 @@ Defs
             Return 0;
         }
         // 1) 共享止损：多单 Low ≤ StopLine、空单 High ≥ StopLine（2N 距离，加仓后随末 unit 上移）
-        If (StopLine > 0) {
-            If (dir > 0 And Low() <= StopLine) {
-                DoCloseAll(dir, StopLine, "stop");
-                Return 0;
-            }
-            If (dir < 0 And High() >= StopLine) {
-                DoCloseAll(dir, StopLine, "stop");
-                Return 0;
-            }
+        If (StopHit(dir)) {
+            DoCloseAll(dir, StopLine, "stop");
+            Return 0;
         }
         // 2) 反向突破出场：多单跌破 ExitLongLv、空单涨破 ExitShortLv（ExitN 通道反向沿）
         If (dir > 0 And Low() <= ExitLongLv) {
@@ -2050,22 +2049,20 @@ Defs
 
     // data1 失效时的仅止损兜底（模拟/实盘）：只用最后有效 StopLine 保护持仓。
     Integer ManageStopOnly() {
-        If (PosLotsNow() == 0 Or PLots <= 0 Or StopLine <= 0) {
+        If (PosLotsNow() == 0 Or PLots <= 0) {
             Return 0;
         }
         Integer dir = PosDirNow();
         If (dir == 0) {
             Return 0;
         }
-        If (dir > 0 And Low() <= StopLine) {
-            WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平多");
+        If (StopHit(dir)) {
+            String sideTxt = "多";
+            If (dir < 0) {
+                sideTxt = "空";
+            }
+            WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平" + sideTxt);
             DoCloseAll(dir, StopLine, "stop");
-            Return 0;
-        }
-        If (dir < 0 And High() >= StopLine) {
-            WLogW("STOP_ONLY data1无效，按最后有效止损线 " + Text(StopLine, 1) + " 平空");
-            DoCloseAll(dir, StopLine, "stop");
-            Return 0;
         }
         Return 0;
     }
@@ -2087,11 +2084,8 @@ Events
         FinalDone = False;
         FillCnt = 0;
         OrderCnt = 0;
-        MyArrayClear(PendingIds);                // 挂单门禁集合不能跨次运行残留（orderId 会复用）
-        MyArrayClear(ClosePendIds);
-        ClosePendMissSyncs = 0;
-        CloseNoIdBars = 0;
-        ResetPendingWatch();
+        // 挂单门禁集合不能跨次运行残留（orderId 会复用）
+        ResetPendingState();
         MappingOk = False;
         MappingRecheck = False;
         ParamsOk = False;
@@ -2291,11 +2285,7 @@ Events
 
             // 首 bar 再清一次挂单集合，防上次运行 orderId 残留
             If (BarCnt == 1) {
-                MyArrayClear(PendingIds);
-                MyArrayClear(ClosePendIds);
-                ClosePendMissSyncs = 0;
-                CloseNoIdBars = 0;
-                ResetPendingWatch();
+                ResetPendingState();
             }
             // 每根 bar 按平台未成交列表校正挂单集合（模拟/实盘）
             SyncPendingFromAccount();
@@ -2447,12 +2437,8 @@ Events
                         WLogW("PEND_DAYCLOSE 日盘收盘清空未完成集合 ids=" + MyArrayStr(PendingIds)
                             + " closeIds=[" + MyArrayStr(ClosePendIds) + "]");
                     }
-                    MyArrayClear(PendingIds);
-                    MyArrayClear(ClosePendIds);
-                    ClosePendMissSyncs = 0;
-                    CloseNoIdBars = 0;
                 }
-                ResetPendingWatch();   // 当日委托全部失效，超时计数一并作废
+                ResetPendingState();   // 当日委托全部失效，集合/超时计数一并作废
             }
             If (IsStrategyTradeMode()) {
                 If (QuoteStatus() == Enum_QuoteStatus_RealTime) {
