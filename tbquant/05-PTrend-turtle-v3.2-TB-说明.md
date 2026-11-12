@@ -326,6 +326,7 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
   `A_GetUnFillOrderIDs(委托落地合约, ids)` 按平台未成交列表重建集合，变化时记 `PEND_SYNC`；
   查询失败保持原集合不动并记 `PEND_SYNC_FAIL`（每日首条）。OnOrder 漏报终态不会再永久锁死；
   自 v3.2-20261111 起在 `OnBarOpen` **先同步、后对账**（旧挂单残留不再阻塞开盘首根对账）；
+  当前实现每根新 bar 只在 `OnBarOpen` 同步一次，`OnBar` 首根复位后再补一次，不再逐 tick；
 - **日盘收盘清空（v3.2-20261111）**：最后一根 data0 bar（14:59，收盘回调 15:00）清空本地两个集合
   （`PEND_DAYCLOSE`，非空时每交易日一条）。当日委托 15:00 全部失效，清空不会误删活单；夜盘/次日
   开盘首根仍按平台真值重建。此前若当日无夜盘运行，陈旧 orderId 会跨日冻结对账（11-10 事故：
@@ -665,6 +666,31 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
 ---
 
 ## 12. 验证状态
+
+- **2026-11-13（挂单同步降频，行为调整，待模拟验证）**：`SyncPendingFromAccount` 不再在 `OnBar`
+  逐 tick 调用，改为 `OnBarOpen` 每根新 bar 一次；`OnBar` 只在首根 `ResetPendingState()` 后补一次
+  同步，防止复位把平台真值清空。`OnOrder` 仍是 bar 内终态主通道；若漏报，解锁窗口由下一 tick
+  延后到下一根 bar。查询失败仍保持原集合并每日一条 `PEND_SYNC_FAIL`。**TB 编译与模拟验证待完成**。
+  验证要点：
+  a) 启动时平台已有本策略未完成委托 → 首根 `OnBarOpen` 出现 `PEND_SYNC`（before 为空、after 非空），
+  首根 `OnBar` 复位后再同步仍非空；开仓被 `ORDER_GATE` 挡住，不重复下单；
+  b) 成交/撤单且 `OnOrder` 正常 → bar 内即解锁，不必等下一根；
+  c) 人为漏报终态或断线重连 → 最迟下一根新 bar 由 `PEND_SYNC` 解锁，bar 内保持阻塞；
+  d) 查询失败 → `PEND_SYNC_FAIL` 当日仅一条，集合与失败前一致，不误放行；
+  e) 回测/图表路径不调用、无 `PEND_SYNC*` 日志，成交与止损行为不变。
+
+- **2026-11-13（SendAcctOrder 拆分 b0652b7，纯结构整理）**：主函数只保留“刷新账户 → 平仓收敛/
+  开仓门禁 → 委托价 → 发单登记”编排；新增 `AcctCloseLots`（平仓手数夹取，保留 `ORDER_SKIP`/
+  `CLOSE_CLAMP`）、`AcctOpenGate`（加仓须同向持仓、开仓须空仓，repost 例外，保留 `OPEN_BLOCK`）、
+  `AcctRealPrice`（真实价 + 开仓缓冲，无效价返回 0）、`AcctSendRaw`（`A_*` 发单、委托号登记、
+  `ORDER_NO_ID`/`ORDER_SEND`/`ORDER_REJECT`）。门禁、价格、手数、日志字段与顺序不变。
+  **TB 编译通过；切片 5/6 回测与旧结果一致**。
+
+- **2026-11-13（代码精简 87bf534，纯结构整理）**：`OnInit` 拆为 `ResetRuntimeState/
+  ValidateAuxParams/LogInitHeader/LogInitMapping/LogInitParams`；新增
+  `SideTxt/AcctLotSeg/AcctOkSeg` 统一方向与账户日志片段；`CalcStallCounts` 改为
+  `StallCountSince` 单方向调用两次，多空判定等价。参数/版本号/日志格式未改。
+  **TB 编译通过；切片 5/6 回测与旧结果一致（随后续 b0652b7 一并验证）**。
 
 - **2026-11-13（代码精简 657ab80，纯结构整理）**：`TryEntry/TryNrEntry` 多空对称分支合并；
   新增 `D1Ready/D1BarSig/CleanFlatLedger/ResetPendingState/StopHit` 公共辅助。参数/版本号/日志格式

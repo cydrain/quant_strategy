@@ -839,6 +839,7 @@ Defs
 
     // 每根 bar 按平台未成交委托列表校正挂单集合：OnOrder 漏报终态时下一根 bar 自动解锁；
     // 查询失败保持原集合不动（防误放行）。仅模拟/实盘执行，回测/图表不调用。
+    // 调用时机：OnBarOpen 每根新 bar 一次；OnBar 首根复位后再补一次（不再逐 tick）。
     Integer SyncPendingFromAccount() {
         If (IsLiveTrade() == False) {
             Return 0;
@@ -2449,7 +2450,7 @@ Events
         Range[0:0] {
             // N/四通道每根新 bar 刷新一次；失败归 0 拒交易，下根自动重试
             RefreshNChannels();
-            // 模拟/实盘实时：先按平台未成交列表校正挂单集合，再按账户真值对账。
+            // 模拟/实盘实时：每根新 bar 先按平台未成交列表校正挂单集合，再按账户真值对账。
             // 顺序不可反——旧挂单残留会阻塞开盘首根对账（2026-11-11：09:03 才重建台账）
             If (IsLiveTrade() And QuoteStatus() == Enum_QuoteStatus_RealTime) {
                 SyncPendingFromAccount();
@@ -2468,12 +2469,11 @@ Events
         Range[0:0] {
             BarCnt = BarCnt + 1;
 
-            // 首 bar 再清一次挂单集合，防上次运行 orderId 残留
+            // 首 bar 再清一次挂单集合，防上次运行 orderId 残留；清完立即按平台真值重建
             If (BarCnt == 1) {
                 ResetPendingState();
+                SyncPendingFromAccount();
             }
-            // 每根 bar 按平台未成交列表校正挂单集合（模拟/实盘）
-            SyncPendingFromAccount();
 
             // 首 bar 警告：实盘未到 TradeStartDate
             If (BarCnt == 1 And IsLiveTrade() And YMD() < TradeStartDate) {
