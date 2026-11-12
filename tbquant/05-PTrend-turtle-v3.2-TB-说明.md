@@ -670,6 +670,10 @@ data1 推进后的首根 1m 对 P（有夜盘）通常是完成日线当天的 *
   新增 `D1Ready/D1BarSig/CleanFlatLedger/ResetPendingState/StopHit` 公共辅助。参数/版本号/日志格式
   未改；唯一语义对齐：日盘收盘复位同时清 `CloseNoIdBars`。**TB 编译通过；切片 5/6 回测与旧结果一致**。
 
+- **2026-11-13（OnBar 主流程拆分，纯结构整理）**：新增 `RunTradeFlow/LogDailyIfDue/LogFinalSummary`，
+  `OnBar` 从 ~146 行缩至 ~34 行，只保留首 bar 复位、挂单同步、移仓/映射复核、NR 刷新与函数调用。
+  逻辑/参数/日志内容未改。**TB 编译通过；切片 5/6 回测与旧结果一致**。
+
 - **2026-11-11（v3.2-20261111-2259 开仓挂单超时治理，待模拟验证）**：开仓/加仓挂单 `PendTimeoutBars=3`
   根新 bar 未全成 → 逐笔撤残余开仓单（`PEND_CANCEL`）；挂单清空后按“台账计划量 − 账户同向真值”
   重报至多 `PendMaxRetry=2` 次（`PEND_REPOST`）；缺口不再补时 `PEND_GIVEUP`，交既有账户对账收敛。

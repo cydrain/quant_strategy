@@ -2067,6 +2067,131 @@ Defs
         Return 0;
     }
 
+    // 交易门控：回放期只推进 STALL/NR 基线；实时按 STALL → NR → 常规海龟顺序，每 bar 至多一个动作。
+    Integer RunTradeFlow() {
+        // 非实时 bar（历史回放）只推进基线与通道，不下单；回测不受影响。
+        If (IsTradablePhase() == False) {
+            If (ReplayGateLogged == False) {
+                ReplayGateLogged = True;
+                WLog("REPLAY_GATE 跳过交易：只更新通道/STALL/NR 基线（mode=" + Text(StrategyMode())
+                    + " QuoteStatus=" + Text(QuoteStatus()) + "）");
+            }
+            TryStallEntry(False);
+            Return 0;
+        }
+        If (IsStrategyTradeMode()) {
+            If (RealtimeLogged == False) {
+                RealtimeLogged = True;
+                WLog("REALTIME_BAR QuoteStatus=" + Text(QuoteStatus()) + " 恢复交易");
+            }
+        }
+        // True=边沿命中，STALL 分支已占用；否则再判 NR，最后走常规检查
+        If (TryStallEntry(True) == False) {
+            // NR 已处理（触发/跳过/挂单暂缓）→ 本 bar 不再走 ManagePosition
+            If (TryNrEntry() == False) {
+                // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
+                If (CanTradeNow()) {
+                    ManagePosition();
+                }
+                Else {
+                    // 交易模式但账户数据未就绪：暂停一切委托（CanTradeNow 已拦），每交易日首条告警
+                    If (IsStrategyTradeMode()) {
+                        If (IsLiveTrade() == False) {
+                            If (YMD() >= TradeStartDate) {
+                                If (LastAcctWarnYmd <> YMD()) {
+                                    LastAcctWarnYmd = YMD();
+                                    WLogW("ACCT_NOT_READY 交易模式但账户数据未就绪，暂停交易（检查账户连接/绑定）");
+                                }
+                            }
+                        }
+                    }
+                    // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
+                    // 回测保持原语义，TradeStartDate 之前也不动作。
+                    If (IsLiveTrade() And YMD() >= TradeStartDate) {
+                        ManageStopOnly();
+                    }
+                }
+            }
+        }
+        Return 0;
+    }
+
+    // 每日定时日志（LogTime，默认 14:45）：回测照写，模拟/实盘仅实时。
+    Integer LogDailyIfDue() {
+        Bool dailyLogOk = True;
+        If (IsStrategyTradeMode()) {
+            dailyLogOk = (QuoteStatus() == Enum_QuoteStatus_RealTime);
+        }
+        Integer logH = IntPart(LogTime / 100);
+        Integer logM = LogTime - logH * 100;
+        If (dailyLogOk And Hour() == logH And Minute() == logM And YMD() <> LastLogYmd) {
+            LastLogYmd = YMD();
+            String d1s = "na";
+            String d0seg = "";
+            String pendseg = "";
+            If (DataCount() >= 2) {
+                d1s = Text(D1Close(1), 1);
+                // d0diag 仅 DEBUG 级：读 Data1[0] 禁区仅供诊断，禁入判断
+                If (LogLevel >= 3) {
+                    d0seg = " d0diag=" + Text(D1Close0Diag(), 1);
+                }
+            }
+            // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空）
+            If (GetArraySize(PendingIds) > 0) {
+                pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + MyArrayStr(PendingIds);
+            }
+            // 合约标签：前缀=指标来源 data1（无 data1 时退回 data0）
+            String symseg = Symbol;
+            If (DataCount() >= 2) {
+                symseg = D1Sym();
+            }
+            // 账户真值（模拟/实盘）：每天一行，供事后核对台账 vs 账户；
+            // 落地合约与 data1 不同（连续图→真实主力）时附 acctSym，避免把连续合约当成可交易合约
+            String acctseg = "";
+            If (IsLiveTrade()) {
+                RefreshAccountPosition();
+                If (AcctSym <> "" And AcctSym <> symseg) {
+                    acctseg = acctseg + " acctSym=" + AcctSym;
+                }
+                acctseg = acctseg + " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
+                    + " acctS=" + Text(IntPart(AcctShort))
+                    + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
+                    + " acctOk=" + IIFString(AcctPosOk, "True", "False");
+            }
+            // NR 事件状态：仅在当日存在收缩事件时附加
+            String nrseg = "";
+            If (NrHasEvent) {
+                nrseg = " NRH=" + Text(NrHighLv, 1) + " NRL=" + Text(NrLowLv, 1)
+                    + " nrF=" + IIFString(NrFired, "True", "False");
+            }
+            WLog("DAILY " + symseg
+                + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
+                + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
+                + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
+                + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
+                + " d1=" + d1s + d0seg + pendseg + acctseg + nrseg);
+        }
+        Return 0;
+    }
+
+    // 回测结束摘要：整段跑完的单行对账（只回测输出）。
+    Integer LogFinalSummary() {
+        If (IsBacktestMode()) {
+            If (BarStatus() == 2 And FinalDone == False) {
+                FinalDone = True;          // 幂等守卫：只打一次，OnInit 复位
+                // 与 DAILY 同守卫：无日线图层时不碰 Data1（访问非法）→ d1e 保持空、字段自然省略
+                String d1e = "";
+                If (DataCount() >= 2) {
+                    d1e = " d1=" + Text(D1Close(1), 1);
+                }
+                WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " win=" + Text(WinSize()) + " DataCount=" + Text(DataCount())
+                    + " N=" + Text(NVal, 1) + " pos=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
+                    + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
+            }
+        }
+        Return 0;
+    }
+
 Events
     OnInit() {
         // 全局状态复位（所有模式日志只追加、不删除）
@@ -2303,123 +2428,12 @@ Events
             // ---- 2. NR 事件刷新（只更新事件状态；入场在 STALL 之后判定）----
             RefreshNrEvent();
 
-            // ---- 3. STALL / NR 并行入场（先于常规海龟检查）----
-            // 非实时 bar（历史回放）只推进基线与通道，不下单；回测不受影响。
-            If (IsTradablePhase() == False) {
-                If (ReplayGateLogged == False) {
-                    ReplayGateLogged = True;
-                    WLog("REPLAY_GATE 跳过交易：只更新通道/STALL/NR 基线（mode=" + Text(StrategyMode())
-                        + " QuoteStatus=" + Text(QuoteStatus()) + "）");
-                }
-                TryStallEntry(False);
-            }
-            Else {
-                If (IsStrategyTradeMode()) {
-                    If (RealtimeLogged == False) {
-                        RealtimeLogged = True;
-                        WLog("REALTIME_BAR QuoteStatus=" + Text(QuoteStatus()) + " 恢复交易");
-                    }
-                }
-                // True=边沿命中，STALL 分支已占用；否则再判 NR，最后走常规检查
-                If (TryStallEntry(True) == False) {
-                    // NR 已处理（触发/跳过/挂单暂缓）→ 本 bar 不再走 ManagePosition
-                    If (TryNrEntry() == False) {
-                        // 风控与信号（N/四通道无效期 levels=0 → CanTradeNow=False，不下单）
-                        If (CanTradeNow()) {
-                            ManagePosition();
-                        }
-                        Else {
-                            // 交易模式但账户数据未就绪：暂停一切委托（CanTradeNow 已拦），每交易日首条告警
-                            If (IsStrategyTradeMode()) {
-                                If (IsLiveTrade() == False) {
-                                    If (YMD() >= TradeStartDate) {
-                                        If (LastAcctWarnYmd <> YMD()) {
-                                            LastAcctWarnYmd = YMD();
-                                            WLogW("ACCT_NOT_READY 交易模式但账户数据未就绪，暂停交易（检查账户连接/绑定）");
-                                        }
-                                    }
-                                }
-                            }
-                            // data1 失效期：实盘/模拟仍用最后有效止损线保护持仓；
-                            // 回测保持原语义，TradeStartDate 之前也不动作。
-                            If (IsLiveTrade() And YMD() >= TradeStartDate) {
-                                ManageStopOnly();
-                            }
-                        }
-                    }
-                }
-            }
+            // ---- 3. 交易主流程（回放期只推进基线；实时 STALL → NR → 常规海龟）----
+            RunTradeFlow();
 
-            // ---- 4. 每日定时日志（LogTime，默认 14:45）----
-            // 回测照写；模拟/实盘仅实时
-            Bool dailyLogOk = True;
-            If (IsStrategyTradeMode()) {
-                dailyLogOk = (QuoteStatus() == Enum_QuoteStatus_RealTime);
-            }
-            Integer logH = IntPart(LogTime / 100);
-            Integer logM = LogTime - logH * 100;
-            If (dailyLogOk And Hour() == logH And Minute() == logM And YMD() <> LastLogYmd) {
-                LastLogYmd = YMD();
-                String d1s = "na";
-                String d0seg = "";
-                String pendseg = "";
-                If (DataCount() >= 2) {
-                    d1s = Text(D1Close(1), 1);
-                    // d0diag 仅 DEBUG 级：读 Data1[0] 禁区仅供诊断，禁入判断
-                    If (LogLevel >= 3) {
-                        d0seg = " d0diag=" + Text(D1Close0Diag(), 1);
-                    }
-                }
-                // 挂单门禁状态：仅在存在未完成委托时附加（回测集合恒空）
-                If (GetArraySize(PendingIds) > 0) {
-                    pendseg = " pend=" + Text(GetArraySize(PendingIds)) + " ids=" + MyArrayStr(PendingIds);
-                }
-                // 合约标签：前缀=指标来源 data1（无 data1 时退回 data0）
-                String symseg = Symbol;
-                If (DataCount() >= 2) {
-                    symseg = D1Sym();
-                }
-                // 账户真值（模拟/实盘）：每天一行，供事后核对台账 vs 账户；
-                // 落地合约与 data1 不同（连续图→真实主力）时附 acctSym，避免把连续合约当成可交易合约
-                String acctseg = "";
-                If (IsLiveTrade()) {
-                    RefreshAccountPosition();
-                    If (AcctSym <> "" And AcctSym <> symseg) {
-                        acctseg = acctseg + " acctSym=" + AcctSym;
-                    }
-                    acctseg = acctseg + " pdir=" + Text(PDir) + " acctL=" + Text(IntPart(AcctLong))
-                        + " acctS=" + Text(IntPart(AcctShort))
-                        + " acctAvgL=" + Text(AcctLongAvg, 1) + " acctAvgS=" + Text(AcctShortAvg, 1)
-                        + " acctOk=" + IIFString(AcctPosOk, "True", "False");
-                }
-                // NR 事件状态：仅在当日存在收缩事件时附加
-                String nrseg = "";
-                If (NrHasEvent) {
-                    nrseg = " NRH=" + Text(NrHighLv, 1) + " NRL=" + Text(NrLowLv, 1)
-                        + " nrF=" + IIFString(NrFired, "True", "False");
-                }
-                WLog("DAILY " + symseg
-                    + " N=" + Text(NVal, 1) + " EL=" + Text(EntryLongLv, 1) + " XL=" + Text(ExitLongLv, 1)
-                    + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
-                    + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
-                    + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
-                    + " d1=" + d1s + d0seg + pendseg + acctseg + nrseg);
-            }
-
-            // ---- 5. 结束摘要：回测整段跑完的单行对账（只回测输出）----
-            If (IsBacktestMode()) {
-                If (BarStatus() == 2 And FinalDone == False) {
-                    FinalDone = True;          // 幂等守卫：只打一次，OnInit 复位
-                    // 与 DAILY 同守卫：无日线图层时不碰 Data1（访问非法）→ d1e 保持空、字段自然省略
-                    String d1e = "";
-                    If (DataCount() >= 2) {
-                        d1e = " d1=" + Text(D1Close(1), 1);
-                    }
-                    WLog("=== 运行结束 BarCnt=" + Text(BarCnt) + " win=" + Text(WinSize()) + " DataCount=" + Text(DataCount())
-                        + " N=" + Text(NVal, 1) + " pos=" + Text(MarketPosition()) + " contracts=" + Text(CurrentContracts())
-                        + " lots=" + Text(PLots) + " equity=" + Text(CurEquity(), 0) + d1e + " ===");
-                }
-            }
+            // ---- 4. 每日定时日志与回测结束摘要 ----
+            LogDailyIfDue();
+            LogFinalSummary();
         }
     }
 
