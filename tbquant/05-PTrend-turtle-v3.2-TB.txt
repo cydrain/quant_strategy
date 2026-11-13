@@ -735,15 +735,6 @@ Defs
         Return 0;
     }
 
-    Integer MyArrayClear(ArrayRef<Numeric> arr) {
-        Integer n = GetArraySize(arr);
-        Integer i;
-        For i = 1 To n {
-            ArrayErase(arr, 0, 1);
-        }
-        Return 0;
-    }
-
     String MyArrayStr(ArrayRef<Numeric> arr) {
         String s = "";
         Integer n = GetArraySize(arr);
@@ -767,8 +758,8 @@ Defs
 
     // 挂单集合与超时计数一起复位（OnInit/首 bar/日盘收盘共用）
     Integer ResetPendingState() {
-        MyArrayClear(PendingIds);
-        MyArrayClear(ClosePendIds);
+        ArrayClear(PendingIds);
+        ArrayClear(ClosePendIds);
         ClosePendMissSyncs = 0;
         CloseNoIdBars = 0;
         ResetPendingWatch();
@@ -816,7 +807,7 @@ Defs
             ClosePendMissSyncs = ClosePendMissSyncs + 1;
             If (ClosePendMissSyncs >= 2) {
                 WLogW("CLOSE_PEND_STALE 连续两根新 bar 同步未见平仓单，清空 closeIds=[" + MyArrayStr(ClosePendIds) + "]");
-                MyArrayClear(ClosePendIds);
+                ArrayClear(ClosePendIds);
                 ClosePendMissSyncs = 0;
             }
         }
@@ -856,7 +847,7 @@ Defs
             Return 0;
         }
         String before = MyArrayStr(PendingIds);
-        MyArrayClear(PendingIds);
+        ArrayClear(PendingIds);
         Integer n = GetArraySize(unfilled);
         Integer i;
         For i = 0 To n - 1 {
@@ -887,6 +878,11 @@ Defs
         Return t;
     }
 
+    // 消浮点尾差（1e-6 缩放取整；用乘法缩放，避免整数/整数除法语义差异）
+    Numeric RndPx(Numeric px) {
+        Return IntPart(px * 1000000 + 0.5) * 0.000001;
+    }
+
     // 图价 → 真实价，并按委托方向取整（买向上/卖向下）。真实价 = 图价 / Rollover()。
     Numeric RealOrderPrice(Numeric chartPx, Integer orderDir) {
         If (NumValid(chartPx) == False) {
@@ -913,8 +909,7 @@ Defs
             }
         }
         Numeric px = n * t;
-        // 消浮点尾差（用乘法缩放，避免整数/整数除法语义差异）
-        px = IntPart(px * 1000000 + 0.5) * 0.000001;
+        px = RndPx(px);
         If (px <= 0) {
             Return InvalidNumeric;
         }
@@ -1104,7 +1099,7 @@ Defs
         If (isClose == False And OrderBufTicks > 0) {
             Numeric basePx = px;
             px = px + orderDir * OrderBufTicks * RealTick();
-            px = IntPart(px * 1000000 + 0.5) * 0.000001;
+            px = RndPx(px);
             WLog("ORDER_BUF reason=" + reason + " sym=" + sym + " dir=" + Text(orderDir)
                 + " base=" + Text(basePx, 1) + " buf=" + Text(OrderBufTicks) + " px=" + Text(px, 1));
         }
@@ -1468,9 +1463,6 @@ Defs
         // 委托方向 = 持仓方向取反（多平=卖、空平=买）
         Numeric orderPrice = CalcOrderPrice(dir * -1, refPrice);
         Numeric avg = PosAvgChart();
-        If (avg <= 0 And PLots > 0) {
-            avg = PCost / PLots;
-        }
         Integer lots = PLots;
         If (DoSendOrder(dir * -1, lots, orderPrice, True, reason) == False) {
             Return 0;
