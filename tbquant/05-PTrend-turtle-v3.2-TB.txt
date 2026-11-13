@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2-20261111-2259（TBQuant · 双图层 + STALL / NR 并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2-20261114-0021（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
@@ -33,8 +33,10 @@
 //   4) 信号体只放 Range[0:0]，Range[0:1] 会每图层各跑一遍。
 //   5) Data1 仅出现在「数据源约定」访问器段。
 //
-// 预热：首个目标信号日前 data1 须已有 >=61 根日线（WinSize=61，约 3 个月）；不足时
-//   窗口越界读数可能仍是有效值 → N 偏高/假突破。两图层数据范围要同步提前。
+// 预热：首个目标信号日前 data1 须已有 >=61 根已完成日线（WinSize=61，约 3 个月）。不足时
+//   越界读数会被相邻 bar 填充且 NumValid 仍为 True（P2709 首日实测 N=442/四通道坍缩），
+//   守卫用 Data1.CurrentBar（已完成根数）；BarCount 含未来、GetBar 在 data1 上不可用。
+//   两图层数据范围要同步提前。
 //------------------------------------------------------------------------
 Params
     // ---- 常用参数 ----
@@ -416,6 +418,14 @@ Defs
         Return Data1.Frequency();
     }
 
+    // data1 已完成K线根数（不含正在形成的当前根）：预热守卫用。
+    // 实测（P2709 首日，2026-11-13 探针）：历史不足时越界读数被相邻 bar 填充且 NumValid 仍为 True
+    // （Close[1..100] 全等、N=442）；Data1.BarCount 是区间加载总数（含未来）；Data1.GetBar 在
+    // data1 上返回全 0。仅 CurrentBar 能如实反映"已走完"的根数。
+    Integer D1HistoryDepth() {
+        Return Data1.CurrentBar;
+    }
+
     Numeric D1Open(Integer idx) {
         Return Data1.Open[idx];
     }
@@ -533,14 +543,21 @@ Defs
             WLogRefreshErr("N/四通道刷新失败 data1.Symbol≠data0.Symbol, data1=" + D1Sym() + " data0=" + Symbol + "（图层顺序/合约不符，检查图表数据源）");
             Return 0;
         }
-        // 历史深度守卫：根数不足时序列读取返回无效值（官方：数据不足→无效值）。
-        // NumValid 同时排除 InvalidNumeric 与 <=0，不依赖 And 短路。
+        // 历史深度守卫：data1 越界读数会被相邻 bar 填充且 NumValid 仍为 True（P2709 首日实测），
+        // 故先用 CurrentBar（已完成根数）判预热；BarCount 含未来、GetBar 在 data1 上不可用。
+        Integer depth = D1HistoryDepth();
+        If (depth < win) {
+            WLogRefreshErr("N/四通道刷新失败 data1 历史不足 depth=" + Text(depth)
+                + " < win=" + Text(win) + "（预热需 data1 已完成 " + Text(win) + " 根K线）");
+            Return 0;
+        }
+        // 数值有效性兜底：排除 InvalidNumeric 与 <=0，不依赖 And 短路
         Bool valid = NumValid(D1Close(1)) And NumValid(D1Close(win));
         If (valid == False) {
-            WLogRefreshErr("N/四通道刷新失败 D1 history too short, win=" + Text(win)
+            WLogRefreshErr("N/四通道刷新失败 D1 OHLC 无效, win=" + Text(win)
                 + " Close[1]=" + IIFString(D1Close(1) != InvalidNumeric, "ok", "invalid")
                 + " Close[win]=" + IIFString(D1Close(win) != InvalidNumeric, "ok", "invalid")
-                + "（data1 历史不足或缺失）");
+                + "（data1 数据缺失）");
             Return 0;
         }
         // 前置守卫已通过 → 窗口内各 bar 有效，交计算函数
@@ -2156,10 +2173,12 @@ Defs
         If (dailyLogOk And Hour() == logH And Minute() == logM And YMD() <> LastLogYmd) {
             LastLogYmd = YMD();
             String d1s = "na";
+            String d1cb = "";
             String d0seg = "";
             String pendseg = "";
             If (DataCount() >= 2) {
                 d1s = Text(D1Close(1), 1);
+                d1cb = " d1cb=" + Text(D1HistoryDepth());
                 // d0diag 仅 DEBUG 级：读 Data1[0] 禁区仅供诊断，禁入判断
                 If (LogLevel >= 3) {
                     d0seg = " d0diag=" + Text(D1Close0Diag(), 1);
@@ -2197,7 +2216,7 @@ Defs
                 + " ES=" + Text(EntryShortLv, 1) + " XS=" + Text(ExitShortLv, 1)
                 + " units=" + Text(UnitCount) + " lots=" + Text(PLots) + " stop=" + Text(StopLine, 1)
                 + " equity=" + Text(CurEquity(), 0) + " win=" + Text(WinSize())
-                + " d1=" + d1s + d0seg + pendseg + acctseg + nrseg);
+                + " d1=" + d1s + d1cb + d0seg + pendseg + acctseg + nrseg);
         }
         Return 0;
     }
@@ -2285,7 +2304,7 @@ Defs
     }
 
     Integer LogInitHeader() {
-        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261111-2259（TB公式版-双图层+STALL+NR）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261114-0021（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
         }
@@ -2576,7 +2595,8 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-20261111-2259-TB  2026/11/11  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+// 版本: v3.2-20261114-0021-TB  2026/11/14  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+//        v3.2-20261114 系列: data1 预热守卫改用 CurrentBar（已完成根数；不足时 N/通道=0 禁开仓）
 //        v3.2-20261111 系列: 挂单跨日清理 / OrderBufTicks 定价缓冲 / 挂单门禁分级 / 开仓挂单超时撤单+残量重报
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
 //------------------------------------------------------------------------

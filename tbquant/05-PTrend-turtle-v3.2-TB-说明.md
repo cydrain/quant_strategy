@@ -36,6 +36,10 @@
 > 仍未全成 → 每根新 bar 逐笔 `A_DeleteOrderEx` 撤残余开仓单（`PEND_CANCEL`，仍不用账户级全撤）；
 > 挂单清空后按“台账计划量 − 账户同向真值”算残量，重报至多 `PendMaxRetry`（默认 2）次（`PEND_REPOST`）；
 > 缺口不再补（`PEND_GIVEUP`）时交给既有账户对账收敛。`PendTimeoutBars=0` 关闭（只拦不撤）。
+> 2026-11-14 **v3.2-20261114-0021 data1 预热守卫修正**：历史不足时越界读数被相邻 bar 填充且 `NumValid` 仍为 True
+> （P2709 首日实测 `N=442`、四通道坍缩为 10680/10238），原守卫形同虚设。改用
+> `Data1.CurrentBar >= WinSize()`（已完成日线根数，不含正在形成的当前根）；`Data1.BarCount`
+> 含未来数据不可用，`Data1.GetBar` 在 data1 上返回全 0。`DAILY` 日志新增 `d1cb=` 字段。
 
 ---
 
@@ -111,9 +115,12 @@
    实时 OnBar 在形成中 bar 上逐 tick 驱动，价格越过通道即触发并下单，**不是等 K 线收盘**；
    `OnBarClose` 只写 `HB`/`D1BAR` 日志，不下单。回测按 1 分钟 bar 的 High/Low 判定。
 3. **数据历史深度**
-   - N 计算硬要求：`data1` 在首个目标信号日前已有 **≥61 根日线**（WinSize=61，约 3 个月）；
+   - N 计算硬要求：`data1` 在首个目标信号日前已有 **≥61 根已完成日线**（WinSize=61，约 3 个月）；
    - STALL 扫描要求：`2*StallPeriod+5` 根；NR 要求 `NrN` 根（默认 6，须 >=2 且 ≤ WinSize）。默认 `StallPeriod=10` → 25 根，61 根已覆盖；
-   - 历史不足的后果见 v3.1 说明第 3/9 节（N 静默偏高、假突破）。
+   - 脚本以 `Data1.CurrentBar`（已完成日线根数，不含正在形成的当前根）判 `>= WinSize()`，未达标时
+     N/四通道保持 0、禁止开新仓（止损/平仓不受影响）。**不能用 `NumValid` 或 `Data1.BarCount` 判断**：
+     历史不足时越界读数会被相邻 bar 填充且数值有效（P2709 首日实测 N=442、四通道坍缩）；BarCount 是
+     区间加载总数（含未来）；`Data1.GetBar` 在 data1 上返回全 0。
 4. **data1 周期**
    - 标准 = 日线；也支持 30 分钟等日内周期（实验）。
    - N/四通道与 STALL/NR 事件都**随 data1 周期推进**：挂 30 分钟 data1 就是 30 分钟口径，
