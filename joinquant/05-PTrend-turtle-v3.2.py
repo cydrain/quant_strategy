@@ -16,6 +16,8 @@
 #     上次交易盈利后跳过一次 NR 突破（该事件作废，等新 NR 事件再入场）。
 #   - 出场: 盘中触及"前 exit_n 根 bar 反向极值"（多头跌破最低价）→ 全部平仓；初始止损 = 入场价 ∓ stop_dist_n×N
 #   - 加仓: 顺向每 add_step_n×N 加 1 unit，最多 max_units 个；加仓后整仓止损移至最新 unit 入场价 ∓ 2N
+#   - 加仓追价护栏: 实际成交价偏离理论触发价超过 add_chase_n×N → 本档不加（不移动梯子，
+#     逐 bar 重试，成交后才前进）；add_chase_n=0 关闭
 #   - 仓位: 1 unit = 风险资金 × unit_risk ÷ (N × 合约乘数)，向下取整（最低 1 手）；
 #     风险资金 = Min(起始资金, 当前权益)（与 TB 版同口径：盈利不放大手数，亏损按权益缩小）
 #   - 保证金占用上限: 整仓保证金 ≤ 风险资金 × margin_cap_pct（默认 10%，按剩余额度开满；0 = 不限）
@@ -49,6 +51,7 @@ PARAMS = {
     'margin_cap_pct': 0.10,       # 保证金占用上限（风险资金比例；0=不限，每档按剩余额度开满）
     'max_units': 4,               # 最大 unit 数（含首仓）
     'add_step_n': 0.5,            # 顺向每 N×该值 加 1 unit
+    'add_chase_n': 1.0,           # 加仓追价上限（N 倍数）：实际成交价偏离触发价超过该值→本档不加；0=不限
     'stop_dist_n': 2.0,           # 初始/加仓后止损距离（N 倍数）
     's1_skip': 1,                 # 系统1 跳过规则开关（默认开启；上次突破盈利则跳过一次同类突破，等新极值再入场）
     's1_scope': 'breakout',       # skip 参与范围：'breakout'=仅 20 日突破武装与消费（默认，2026-11-02 起）/'breakout_nr'=突破与 NR 各自独立/'current'=任意盈利入场都武装突破+NR（旧行为）；STALL 任何 scope 都不参与
@@ -304,6 +307,18 @@ def open_unit(ctx, direction, n_val, reason):
     if lots < 1:
         warn_once('open_skip_' + c, f"{log_pfx()} ❌ WARN open skip margin insufficient/cap {c}")
         return False
+    # 加仓追价护栏：实际价偏离理论触发价超过 add_chase_n×N（不利方向）→ 本档不加，
+    # 台账/止损不动，下一 bar 重试；成交后才前进梯子。0=关闭
+    if reason == 'add' and g.legs and p['add_chase_n'] > 0 and n_val > 0:
+        trig = g.legs[-1]['entry_price'] + direction * p['add_step_n'] * n_val
+        dev = (price - trig) * direction          # 正 = 不利偏差（买贵/卖低）
+        if dev > p['add_chase_n'] * n_val:
+            key = ('add_chase', c, ctx.current_dt.date())
+            if key not in g.warned:
+                g.warned[key] = True
+                log.warn(f"{log_pfx()} ⚠️ WARN ADD_SKIP chase dev={dev / n_val:.2f}N "
+                         f"trig={trig:.1f} price={price:.1f} {side}")
+            return False
     o = order(c, lots, side=side)
     if o is None or o.filled < lots:
         if o is not None and o.filled > 0:

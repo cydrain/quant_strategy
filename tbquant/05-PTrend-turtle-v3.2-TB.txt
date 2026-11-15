@@ -1,6 +1,6 @@
 //------------------------------------------------------------------------
 // 简称: PTrendTurtle_v32
-// 名称: 棕榈油海龟趋势策略 v3.2-20261114-0021（TBQuant · 双图层 + STALL / NR 并行入场）
+// 名称: 棕榈油海龟趋势策略 v3.2-20261115-2139（TBQuant · 双图层 + STALL / NR 并行入场）
 // 类别: 趋势跟踪
 // 类型: 用户应用
 // 输出: Void
@@ -18,6 +18,8 @@
 //   开仓失败下一分钟重试；事件在下一根 data1 bar 内有效（1d 从夜盘 21:01 起）。
 // 系统1 跳过（S1Skip>0）：S1Scope='breakout'（默认）仅 20 日突破首仓盈利武装并消费；
 //   'breakout_nr' 突破/NR 各自独立；'current' 任意盈利首仓都武装突破+NR。STALL 不参与。
+// 加仓追价护栏（AddChaseN>0）：实际可成交价偏离触发价超过 AddChaseN×N → 本档不加
+//   （节流日志 ADD_SKIP；不移动梯子，逐 bar 重试，成交后才前进）。0=关闭。
 //
 // 挂载（两图层缺一不可；K线收盘模型）：
 //   data0=1分钟（信号/执行）；data1=同合约日线（只读指标源）。
@@ -56,6 +58,7 @@ Params
     Numeric MarginCapPct(0.10);   // 保证金占用上限（占风险资金比例，0=不限）
     Integer MaxUnits(4);          // 最大 unit 数（含首仓）
     Numeric AddStepN(0.5);        // 顺向每 N*该值 加 1 unit
+    Numeric AddChaseN(1.0);       // 加仓追价上限（N 倍数）：实际可成交价偏离触发价超过该值→本档不加；0=不限
     Numeric StopDistN(2.0);       // 止损距离（N 倍数）
     Integer S1Skip(1);            // 系统1跳过：上次同类交易盈利则跳过一次同类突破
     String S1Scope("breakout");   // breakout=仅20日突破（默认）/breakout_nr=突破与NR独立/current=任意盈利入场武装
@@ -119,6 +122,7 @@ Vars
     Global Integer LastLogYmd;
     Global Integer LastLicenseWarnYmd; // LICENSE 日志节流（每天首条）
     Global Integer LastSkipYmd;   // OPEN_SKIP 日志节流（每交易日首条）
+    Global Integer LastAddChaseYmd; // ADD_SKIP 追价日志节流（每交易日首条）
     Global Integer LastRefreshErrYmd; // N/通道刷新失败日志节流（每交易日首条）
     Global Bool FinalDone;
     Global Bool ParamsOk;         // False=禁开新仓/加仓（止损/平仓保留）
@@ -287,6 +291,7 @@ Defs
         LastLogYmd = 0;
         LastLicenseWarnYmd = 0;
         LastSkipYmd = 0;
+        LastAddChaseYmd = 0;
         LastRefreshErrYmd = 0;
         LastGateYmd = 0;
         LastCloseGateYmd = 0;
@@ -355,6 +360,10 @@ Defs
         }
         If (AddStepN <= 0) {
             ParamErr("AddStepN", Text(AddStepN, 2), ">0");
+            ok = False;
+        }
+        If (AddChaseN < 0) {
+            ParamErr("AddChaseN", Text(AddChaseN, 2), ">=0（0=不限）");
             ok = False;
         }
         If (StopDistN <= 0) {
@@ -717,6 +726,25 @@ Defs
             Return Open();
         }
         Return refPrice;   // 无跳空：按触发价
+    }
+
+    // 加仓追价护栏：实际可成交价偏离理论触发价超过 AddChaseN×N（不利方向）→ 本档不加。
+    // 不移动梯子：LastUnitPrice/UnitCount/StopLine 不动，逐 bar 重试；成交后才前进。0=关闭。
+    Bool AddChaseOk(Integer dir, Numeric trig) {
+        If (AddChaseN <= 0 Or NVal <= 0) {
+            Return True;
+        }
+        Numeric fillP = CalcOrderPrice(dir, trig);
+        Numeric dev = IIF(dir > 0, fillP - trig, trig - fillP);   // 正=不利偏差
+        If (dev <= AddChaseN * NVal) {
+            Return True;
+        }
+        If (YMD() <> LastAddChaseYmd) {
+            LastAddChaseYmd = YMD();
+            WLogW("ADD_SKIP 追价过远 reason=chase dev=" + Text(dev / NVal, 2) + "N"
+                + " trig=" + Text(trig, 1) + " fill=" + Text(fillP, 1) + " dir=" + Text(dir));
+        }
+        Return False;
     }
 
     // ---------- 挂单门禁（模拟/实盘）----------
@@ -2080,16 +2108,30 @@ Defs
             Return 0;
         }
         // 3) 加仓：顺向每 AddStepN*N 加 1 unit；UnitCount < MaxUnits 封顶
+        //    追价护栏：手数够但实际可成交价离触发价超过 AddChaseN×N → 本档不加（不移动梯子）
         If (UnitCount < MaxUnits) {
             If (dir > 0 And High() >= LastUnitPrice + AddStepN * NVal) {
-                DoOpenUnit(dir, LastUnitPrice + AddStepN * NVal, "add");
+                If (CalcLots(Close()) < 1) {
+                    DoOpenUnit(dir, LastUnitPrice + AddStepN * NVal, "add");   // 老路径：OPEN_SKIP 节流
+                } Else {
+                    If (AddChaseOk(dir, LastUnitPrice + AddStepN * NVal)) {
+                        DoOpenUnit(dir, LastUnitPrice + AddStepN * NVal, "add");
+                    }
+                }
                 Return 0;
             }
             If (dir < 0 And Low() <= LastUnitPrice - AddStepN * NVal) {
-                DoOpenUnit(dir, LastUnitPrice - AddStepN * NVal, "add");
+                If (CalcLots(Close()) < 1) {
+                    DoOpenUnit(dir, LastUnitPrice - AddStepN * NVal, "add");
+                } Else {
+                    If (AddChaseOk(dir, LastUnitPrice - AddStepN * NVal)) {
+                        DoOpenUnit(dir, LastUnitPrice - AddStepN * NVal, "add");
+                    }
+                }
                 Return 0;
             }
         }
+
         Return 0;
     }
 
@@ -2304,7 +2346,7 @@ Defs
     }
 
     Integer LogInitHeader() {
-        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261114-0021（TB公式版-双图层+STALL+NR）=====");
+        WLogInit("===== OnInit 棕榈油海龟 v3.2-20261115-2139（TB公式版-双图层+STALL+NR）=====");
         If (StrategyMode() <> Enum_Mode_Strategy_Trade()) {
             WLogInit("LICENSE 非模拟/实盘模式不校验（模拟/实盘有效至 " + Text(LicenseEndYmd()) + "）");
         }
@@ -2595,7 +2637,8 @@ Events
     }
 
 //------------------------------------------------------------------------
-// 版本: v3.2-20261114-0021-TB  2026/11/14  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+// 版本: v3.2-20261115-2139-TB  2026/11/15  PTrendTurtle_v32  TBQuant 公式版（双图层 + STALL / NR）
+//        v3.2-20261115 系列: 加仓追价护栏 AddChaseN（偏离触发价超过 N 倍上限→本档不加，梯子不动）
 //        v3.2-20261114 系列: data1 预热守卫改用 CurrentBar（已完成根数；不足时 N/通道=0 禁开仓）
 //        v3.2-20261111 系列: 挂单跨日清理 / OrderBufTicks 定价缓冲 / 挂单门禁分级 / 开仓挂单超时撤单+残量重报
 // 对应聚宽: joinquant/05-PTrend-turtle-v3.2.py
