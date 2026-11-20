@@ -22,7 +22,7 @@ steps = 5           #
 api = TqApi(web_gui=True,
             backtest=TqBacktest(start_dt=date(2025, 4, 16),
                                 end_dt=date(2025, 5, 9)),
-            auth=TqAuth("cydrain", "7ujmko)P"))
+            auth=TqAuth("cydrain", "xxxxxx"))
 
 # 获得5分钟K线的引用
 symbol = "SHFE.ru2509"
